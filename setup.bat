@@ -22,7 +22,7 @@ if not exist "models" mkdir "models"
 rem Voice pack (optional, never blocks setup): microphone/speaker
 rem for the live voice, plus the local 'Jarvis' wake word.
 echo Installing the voice pack (sounddevice + openwakeword)...
-python -m pip install --user sounddevice openwakeword >nul 2>nul
+python -m pip install --user sounddevice openwakeword faster-whisper >nul 2>nul
 if errorlevel 1 echo Voice pack could not be installed now - JARVIS still works in text; run setup.bat again later for voice.
 echo.
 

@@ -1382,6 +1382,9 @@ class ChatApp:
                                               True)),
             "input_device": self.config.get("voice", "input_device"),
             "output_device": self.config.get("voice", "output_device"),
+            "engine": self.config.get("voice", "engine", "live"),
+            "whisper_model": self.config.get("voice", "whisper_model",
+                                             "base"),
         }
         models = self.config.get("voice", "live_models")
         if isinstance(models, list) and models:
@@ -1422,6 +1425,18 @@ class ChatApp:
         owner's filed Gemini key, the same gated tools the chat
         brain advertises, and a system instruction assembled the
         Mark-LVI way (time, identity, memory, persona)."""
+        cfg0 = getattr(self, "_voice_cfg", {}) or {}
+        if str(cfg0.get("engine", "live")).lower() == "local":
+            # The offline engine: faster-whisper hears, the chat
+            # brain answers, the OS voice speaks. No key needed.
+            from .local_voice import (LocalPipelineSession, SystemTTS,
+                                      WhisperSTT)
+            return LocalPipelineSession(
+                events,
+                stt=WhisperSTT(
+                    model=str(cfg0.get("whisper_model", "base"))),
+                tts=SystemTTS(),
+                respond=self.turn)
         from .prompt import PERSONA
         from .voice import LIVE_MODELS, LiveSession
         keys_mod = _load_keys_module()
