@@ -26,6 +26,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
@@ -330,6 +331,68 @@ def op_write_file(path: str, text: str):
     return {"written": str(target), "chars": len(str(text))}
 
 
+_ENV_ALLOW = ("PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP",
+              "USERPROFILE", "HOME", "LANG", "PATHEXT", "COMSPEC")
+
+
+def _scrubbed_env() -> dict:
+    """Only the variables a program needs to run — never the owner's
+    API keys or session secrets. (The v2 lesson, kept: code JARVIS
+    runs must not be able to read the keyring's environment.)"""
+    return {k: os.environ[k] for k in _ENV_ALLOW if k in os.environ}
+
+
+def op_run_code(code: str, timeout: int = 30, cwd: str = ""):
+    """Run Python code and report honestly what happened: exit code,
+    stdout, stderr. Sandboxed working folder, scrubbed environment,
+    hard timeout — real execution, bounded blast radius."""
+    if str(cwd).strip():
+        workdir = Path(str(cwd)).expanduser()
+    else:
+        workdir = Path(tempfile.mkdtemp(prefix="jarvis-code-"))
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+        script = workdir / "_run.py"
+        script.write_text(str(code), encoding="utf-8")
+    except OSError as exc:
+        return {"error": f"run_code failed: {type(exc).__name__}: {exc}"}
+    limit = max(1, min(int(timeout), 120))
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script)], capture_output=True,
+            text=True, timeout=limit, env=_scrubbed_env(),
+            cwd=str(workdir))
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "cwd": str(workdir),
+                "error": f"run_code timed out after {limit}s — "
+                         "the code was stopped"}
+    return {"ok": proc.returncode == 0, "exit_code": proc.returncode,
+            "stdout": proc.stdout[-6000:],
+            "stderr": proc.stderr[-3000:], "cwd": str(workdir)}
+
+
+def op_create_project(path: str, files: list):
+    """Create a project folder from [{path, content}, ...] — the
+    'build it' half of the code skill. Paths may not escape the
+    project folder."""
+    base = Path(str(path)).expanduser()
+    written = []
+    try:
+        for item in files or []:
+            rel = Path(str(item["path"]))
+            if rel.is_absolute() or ".." in rel.parts:
+                return {"error": "create_project refused an unsafe "
+                                 f"path: {item['path']}"}
+            target = base / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(str(item["content"]), encoding="utf-8")
+            written.append(str(target))
+    except (OSError, KeyError, TypeError) as exc:
+        return {"error": f"create_project failed: "
+                         f"{type(exc).__name__}: {exc}"}
+    return {"project": str(base), "written": written}
+
+
 def op_open_app(name: str):
     """Launch an application by name. Real on Windows; honest refusal
     (as a result, not an exception) where no driver exists."""
@@ -499,6 +562,44 @@ FILES_MANIFEST = {
     ],
 }
 
+CODE_MANIFEST = {
+    "name": "core.code",
+    "version": "1.0.0",
+    "tools": [
+        {
+            "name": "run_code",
+            "op": "run_code",
+            "permission": "code.run",
+            "schema": {"type": "object",
+                       "properties": {"code": {"type": "string",
+                                               "minLength": 1},
+                                      "timeout": {"type": "integer",
+                                                  "minimum": 1,
+                                                  "maximum": 120},
+                                      "cwd": {"type": "string"}},
+                       "required": ["code"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "create_project",
+            "op": "create_project",
+            "permission": "files.write",
+            "schema": {"type": "object",
+                       "properties": {
+                           "path": {"type": "string", "minLength": 1},
+                           "files": {"type": "array",
+                                     "items": {"type": "object",
+                                               "properties": {
+                                                   "path": {"type": "string"},
+                                                   "content": {"type": "string"}},
+                                               "required": ["path",
+                                                            "content"]}}},
+                       "required": ["path", "files"],
+                       "additionalProperties": False},
+        },
+    ],
+}
+
 PC_MANIFEST = {
     "name": "core.pc",
     "version": "1.0.0",
@@ -515,13 +616,15 @@ PC_MANIFEST = {
 }
 
 ALL_MANIFESTS = (TIME_MANIFEST, MEMORY_MANIFEST, WEB_MANIFEST,
-                 KNOWLEDGE_MANIFEST, FILES_MANIFEST, PC_MANIFEST)
+                 KNOWLEDGE_MANIFEST, FILES_MANIFEST, CODE_MANIFEST,
+                 PC_MANIFEST)
 
 # Every capability the first-party skills can ask for — the sample
 # allowances a fully-permitted owner turn would carry.
 ALL_PERMISSIONS = frozenset({
     "clock.read", "memory.read", "memory.write", "net.outbound",
     "pc.control", "knowledge.read", "files.read", "files.write",
+    "code.run",
 })
 
 
@@ -541,6 +644,9 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
                            "read_file": op_read_file,
                            "search_files": op_search_files,
                            "write_file": op_write_file})
+    registry.register(CODE_MANIFEST,
+                      ops={"run_code": op_run_code,
+                           "create_project": op_create_project})
     registry.register(PC_MANIFEST, ops={"open_app": op_open_app})
     for manifest in ALL_MANIFESTS:
         registry.approve(manifest["name"])

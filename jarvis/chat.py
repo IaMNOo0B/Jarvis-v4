@@ -76,6 +76,7 @@ DEFAULT_ALLOWANCES = frozenset({
     "files.read",
     "files.write",
     "system.diagnose",
+    "code.run",
 })
 
 
@@ -220,6 +221,87 @@ def _diagnose_op(data_dir: Path, secrets):
                 "recent_errors": recent_errors, "findings": findings}
 
     return diagnose
+
+
+RESEARCH_MANIFEST = {
+    "name": "core.research",
+    "version": "1.0.0",
+    "tools": [{
+        "name": "deep_research",
+        "op": "deep_research",
+        "permission": "net.outbound",
+        "schema": {"type": "object",
+                   "properties": {"topic": {"type": "string",
+                                            "minLength": 1},
+                                  "depth": {"type": "integer",
+                                            "minimum": 1, "maximum": 2}},
+                   "required": ["topic"],
+                   "additionalProperties": False},
+    }],
+}
+
+
+def _research_op(learned: LearnedStore):
+    """Deep research the way the owner taught it: several angles,
+    multiple sources, READ the pages (not just the snippets), keep
+    the receipts — and save the study into the inbox, where the
+    auto-learn system turns it into knowledge JARVIS keeps."""
+    def deep_research(topic: str, depth: int = 1):
+        from . import builtin_skills as bs
+        topic = str(topic).strip()
+        angles = [topic, f"{topic} how it works",
+                  f"{topic} best practices examples"]
+        if int(depth) >= 2:
+            angles += [f"{topic} tutorial step by step",
+                       f"{topic} common mistakes"]
+        seen, sources = set(), []
+        search_errors = []
+        for query in angles:
+            found = bs.op_web_search(query, limit=5)
+            if "error" in found:
+                search_errors.append(found["error"])
+            for hit in found.get("results", []):
+                if hit["url"] not in seen:
+                    seen.add(hit["url"])
+                    sources.append(hit)
+        if not sources and search_errors:
+            return {"error": "deep_research failed: search hi nahi "
+                             f"ho paya — {search_errors[0]}",
+                    "sources_found": 0, "fetch_failed": 0}
+        page_cap = 4 if int(depth) <= 1 else 8
+        read, failed = [], 0
+        for src in sources[:page_cap]:
+            page = bs.op_web_fetch(src["url"], max_chars=6000)
+            if "error" in page:
+                failed += 1
+                continue
+            read.append({"title": src["title"], "url": src["url"],
+                         "text": page["text"]})
+        if not read:
+            return {"error": "deep_research failed: sources mile "
+                             f"{len(sources)}, lekin ek bhi page "
+                             "padha nahi ja saka",
+                    "sources_found": len(sources),
+                    "fetch_failed": failed}
+        note = [f"# Research: {topic}", "", "## Sources"]
+        for item in read:
+            note.append(f"- {item['title']} — {item['url']}")
+        for item in read:
+            note += ["", f"## {item['title']}", item["url"], "",
+                     item["text"][:4000]]
+        saved = learned.add_document("\n".join(note),
+                                     title=f"research-{topic}")
+        return {"topic": topic, "sources_found": len(sources),
+                "pages_read": len(read), "fetch_failed": failed,
+                "saved_to": saved["learned_from"],
+                "note": "ye research inbox me save ho gayi hai — "
+                        "JARVIS ne ise seekh liya hai aur aage ke "
+                        "jawabon me ye istemal hogi",
+                "excerpts": [{"title": it["title"], "url": it["url"],
+                              "excerpt": it["text"][:400]}
+                             for it in read]}
+
+    return deep_research
 
 
 def _reminder_ops(data_dir: Path):
@@ -693,6 +775,15 @@ def build_app(data_dir, *, chain=None, modules=None,
             registry.approve(DIAGNOSE_MANIFEST["name"])
         except Exception as exc:  # a sibling got there first, etc.
             journal.append("chat.diagnose_skill_skipped",
+                           {"error": f"{type(exc).__name__}: {exc}"})
+    if hasattr(registry, "register") and hasattr(registry, "approve"):
+        try:
+            registry.register(RESEARCH_MANIFEST,
+                              ops={"deep_research":
+                                   _research_op(learned)})
+            registry.approve(RESEARCH_MANIFEST["name"])
+        except Exception as exc:  # a sibling got there first, etc.
+            journal.append("chat.research_skill_skipped",
                            {"error": f"{type(exc).__name__}: {exc}"})
 
     goodput = GoodputLedger()
