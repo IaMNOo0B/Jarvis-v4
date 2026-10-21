@@ -70,7 +70,18 @@ def _memory_ops(memory):
         result = store.recall(query)
         return result if isinstance(result, dict) else {"facts": result}
 
-    return {"remember_fact": remember_fact, "recall_memory": recall_memory}
+    def learn_text(text: str, title: str = "pasted"):
+        fn = getattr(store, "learn_text", None)
+        if callable(fn):
+            result = fn(text, title)
+            return result if isinstance(result, dict) else {"stored": text}
+        store.remember(text)
+        return {"stored": text,
+                "note": "no document store attached; kept as a fact"}
+
+    return {"remember_fact": remember_fact,
+            "recall_memory": recall_memory,
+            "learn_text": learn_text}
 
 
 _DDG_HTML = "https://html.duckduckgo.com/html/?q="
@@ -269,7 +280,7 @@ TIME_MANIFEST = {
 
 MEMORY_MANIFEST = {
     "name": "core.memory",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "tools": [
         {
             "name": "remember_fact",
@@ -288,6 +299,17 @@ MEMORY_MANIFEST = {
             "permission": "memory.read",
             "schema": {"type": "object",
                        "properties": {"query": {"type": "string"}},
+                       "additionalProperties": False},
+        },
+        {
+            "name": "learn_text",
+            "op": "learn_text",
+            "permission": "memory.write",
+            "schema": {"type": "object",
+                       "properties": {"text": {"type": "string",
+                                               "minLength": 1},
+                                      "title": {"type": "string"}},
+                       "required": ["text"],
                        "additionalProperties": False},
         },
     ],

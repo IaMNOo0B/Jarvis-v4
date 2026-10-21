@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from . import _defaults, ifc
+from . import _defaults, ifc, rag
 from .goodput import GoodputLedger
 from .journal import Journal
 from .memory import Memory
@@ -335,6 +335,188 @@ def make_dispatch(gate, registry, journal, allowances,
     return dispatch
 
 
+# --------------------------------------------------------------------------- #
+# Learned documents — the owner's own study material.
+#
+# The owner drops .txt/.md files into data/inbox (or pastes long text in
+# chat and says "learn this" — the learn_text tool writes it into the
+# same inbox). scan() ingests anything new or changed AUTOMATICALLY:
+# no command, no ceremony. Content is chunked with the repo's own
+# parent-child chunker, persisted to data/learned.jsonl, and served to
+# the brain through the memory facade below as owner-trust excerpts —
+# so what he teaches JARVIS is actually present when JARVIS answers.
+# --------------------------------------------------------------------------- #
+
+class LearnedStore:
+    """Inbox watcher + chunk store + BM25 search over learned text."""
+
+    def __init__(self, data_dir, journal=None):
+        self.data_dir = Path(data_dir)
+        self.inbox = self.data_dir / "inbox"
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        self.store_path = self.data_dir / "learned.jsonl"
+        self.journal = journal
+        self._records = {}   # filename -> {"stamp": [size, mtime],
+                             #              "chunks": [text, ...]}
+        self._index = None
+        self._index_len = -1
+        self._load()
+
+    # -- persistence ----------------------------------------------------
+
+    def _load(self):
+        if not self.store_path.exists():
+            return
+        try:
+            for line in self.store_path.read_text(
+                    encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                row = json.loads(line)
+                self._records[str(row["file"])] = {
+                    "stamp": list(row["stamp"]),
+                    "chunks": [str(c) for c in row["chunks"]],
+                }
+        except Exception:
+            self._records = {}
+
+    def _save(self):
+        try:
+            with self.store_path.open("w", encoding="utf-8") as fh:
+                for name in sorted(self._records):
+                    rec = self._records[name]
+                    fh.write(json.dumps({
+                        "file": name, "stamp": rec["stamp"],
+                        "chunks": rec["chunks"]}) + "\n")
+        except Exception:
+            pass  # persistence must never break the conversation
+
+    # -- ingest -----------------------------------------------------------
+
+    def scan(self) -> int:
+        """Ingest new/changed inbox files. Returns files ingested."""
+        ingested = 0
+        seen = set()
+        for path in sorted(self.inbox.iterdir()):
+            if not path.is_file() or \
+                    path.suffix.lower() not in (".txt", ".md"):
+                continue
+            stat = path.stat()
+            stamp = [stat.st_size, int(stat.st_mtime)]
+            seen.add(path.name)
+            known = self._records.get(path.name)
+            if known is not None and known["stamp"] == stamp:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8",
+                                      errors="replace")
+            except OSError:
+                continue
+            chunks = [parent.text for parent in
+                      rag.chunk_parent_child(text) if parent.text.strip()]
+            if not chunks:
+                continue
+            self._records[path.name] = {"stamp": stamp,
+                                        "chunks": chunks}
+            ingested += 1
+            if self.journal is not None:
+                self.journal.append("learn.ingest", {
+                    "file": path.name, "chunks": len(chunks),
+                    "chars": len(text)})
+        for name in list(self._records):
+            if name not in seen and not (self.inbox / name).exists():
+                del self._records[name]   # owner removed the file
+                ingested += 1
+        if ingested:
+            self._save()
+        return ingested
+
+    # -- retrieval --------------------------------------------------------
+
+    def _docs(self):
+        docs = []
+        for name in sorted(self._records):
+            for chunk in self._records[name]["chunks"]:
+                docs.append((name, chunk))
+        return docs
+
+    def search(self, query: str, k: int = 4):
+        """Top learned chunks for a query: [{file, text, score}]."""
+        docs = self._docs()
+        if not docs:
+            return []
+        if self._index is None or self._index_len != len(docs):
+            self._index = rag.BM25Index([text for _n, text in docs])
+            self._index_len = len(docs)
+        out = []
+        for idx, score in self._index.search(str(query),
+                                             top_k=int(k)):
+            if score <= 0:
+                continue
+            name, text = docs[idx]
+            out.append({"file": name, "text": text,
+                        "score": round(float(score), 4)})
+        return out
+
+    def add_document(self, text: str, title: str = "pasted") -> dict:
+        """Write pasted text into the inbox and ingest it at once."""
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "-", str(title)).strip("-")
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        name = f"{safe[:40] or 'pasted'}-{stamp}.txt"
+        (self.inbox / name).write_text(str(text), encoding="utf-8")
+        self.scan()
+        rec = self._records.get(name, {"chunks": []})
+        return {"learned_from": name, "chunks": len(rec["chunks"]),
+                "stored": True}
+
+
+class _LearnedMemory:
+    """Memory facade: facts (Memory) + learned documents (LearnedStore)
+    behind the one interface the brain, the registry ops and the CLI
+    commands already use. Learned chunks arrive from the owner himself,
+    so they carry owner trust and are labelled with their source file."""
+
+    def __init__(self, memory, learned: LearnedStore):
+        self._memory = memory
+        self._learned = learned
+
+    def __getattr__(self, name):
+        return getattr(self._memory, name)
+
+    def scan_learned(self) -> int:
+        return self._learned.scan()
+
+    def learn_text(self, text: str, title: str = "pasted") -> dict:
+        return self._learned.add_document(text, title)
+
+    def remember(self, text: str) -> dict:
+        return self._memory.remember(text)
+
+    def recall(self, query: str, k: int = 5):
+        facts = self._memory.recall(query, k=k)
+        out = list(facts)
+        for hit in self._learned.search(query, k=max(0, k - len(out))):
+            out.append({
+                "text": hit["text"], "claim": hit["text"],
+                "source": f"learned:{hit['file']}",
+                "source_trust": "owner",
+                "score": hit["score"], "id": f"learned:{hit['file']}",
+            })
+        return out
+
+    def excerpts(self, query: str, k: int = 5):
+        lines = self._memory.excerpts(query, k=k)
+        seen = set(lines)
+        for hit in self._learned.search(query, k=k):
+            line = f"[{hit['file']}] {hit['text']}"
+            if line not in seen:
+                lines.append(line)
+                seen.add(line)
+            if len(lines) >= 8:
+                break
+        return lines[:8]
+
+
 @dataclass
 class AppParts:
     journal: Journal
@@ -377,6 +559,9 @@ def build_app(data_dir, *, chain=None, modules=None,
         gate = gate_mod.Gate(journal, str(gate_key).encode("utf-8"))
 
     memory = Memory(data_dir, journal=journal)
+    learned = LearnedStore(data_dir, journal=journal)
+    memory = _LearnedMemory(memory, learned)
+    learned.scan()   # ingest anything he dropped in while JARVIS was off
 
     registry = _build_registry(modules, gate, journal, memory, data_dir)
     # The app's own reminder skill (see the manifest's note above).
@@ -400,6 +585,7 @@ def build_app(data_dir, *, chain=None, modules=None,
     if chain is None:
         chain = _build_chain(_resolve_module(modules, "providers"),
                              config, _ChainSecrets(secrets), goodput)
+
     chain = _BrainChainAdapter(chain)
 
     skills_mod = _resolve_module(modules, "skills")
@@ -524,6 +710,12 @@ class ChatApp:
 
     def turn(self, user_text: str) -> str:
         text = str(user_text)
+        # Automatic learning: anything new in data/inbox is ingested
+        # before this turn is answered — no command, no ceremony.
+        try:
+            self.memory.scan_learned()
+        except Exception:
+            pass
         labeled = ifc.label_content(text, origin=ifc.OWNER_ORIGIN)
         self.journal.append("user.message", {
             "text": text, "origin": labeled.origin,
