@@ -60,6 +60,8 @@ from typing import Optional
 
 from . import _defaults, ifc, rag
 from .goodput import GoodputLedger
+from .idempotency import IdempotencyConflictError, IdempotencyLedger
+from .idempotency import business_key as _idem_business_key
 from .journal import Journal
 from .memory import Memory
 
@@ -598,14 +600,76 @@ def _result_ok(result) -> bool:
     return True
 
 
+def _run_guarded(ledger, session_id, name, args, execute, journal):
+    """Run one destructive effect through the idempotency ledger.
+
+    Returns (result_dict, replayed). The Dodaios audit found v4's
+    ledger built but wired to nothing; this is the wiring. Semantics:
+    - a COMMITTED key returns its recorded result WITHOUT
+      re-executing (a duplicate effect is refused by design);
+    - a FAILED key refuses a blind repeat of the identical action;
+    - a key left PENDING (the app stopped mid-effect) is an UNKNOWN
+      OUTCOME: never auto-retried — the owner is told it may already
+      have happened and must decide;
+    - exceptions from the effect propagate with the key left PENDING,
+      exactly the state a real crash would leave.
+    """
+    payload = {"tool": name, "args": args}
+    try:
+        key = _idem_business_key(session_id or "session", payload)
+        prior = ledger.lookup(key, payload)
+    except IdempotencyConflictError as exc:
+        return {"ok": False, "error": str(exc)}, False
+    if prior is not None:
+        if prior["status"] == "committed":
+            return prior["result"], True
+        if prior["status"] == "failed":
+            return {"ok": False,
+                    "error": f"{name} already failed once with these "
+                             f"exact details ({prior.get('error')}); "
+                             f"I won't repeat it blindly, sir."}, False
+        return {"ok": False, "needs_decision": True,
+                "error": f"{name} was started earlier but its outcome "
+                         f"is unknown — the app stopped mid-way, sir. "
+                         f"It may already have happened; ask me to "
+                         f"run it again only if you want it "
+                         f"repeated."}, False
+    ledger.begin(key, payload)
+    result = execute()
+    try:
+        stored = json.loads(json.dumps(result, default=str))
+    except Exception:
+        stored = {"ok": bool(_result_ok(result)),
+                  "result": "result could not be recorded verbatim"}
+    try:
+        ledger.commit(key, stored)
+    except Exception as exc:  # never lose the effect's real result
+        journal.append("idem.commit_failed", {
+            "tool": name,
+            "error": f"{type(exc).__name__}: {exc}"})
+    return result, False
+
+
 def make_dispatch(gate, registry, journal, allowances,
-                  pass_decision=False, refused_exc=()):
+                  pass_decision=False, refused_exc=(), ledger=None,
+                  session_id=""):
     """The gate-mediated dispatch every tool call flows through.
 
     Journals tool.call (with the gate verdict) and tool.result — the
     journal is how behaviour is OBSERVED (the eval harness scores
-    these events, never the model's claims).
+    these events, never the model's claims). When a ledger is given,
+    destructive-class tools run through it (see _run_guarded), so the
+    same side effect can never happen twice in one session.
     """
+    guarded = set()
+    if ledger is not None:
+        try:
+            guarded = {t.get("name") for t in
+                       registry.advertised_tools(allowances)
+                       if t.get("destructive")}
+        except Exception:
+            guarded = set()
+
     def dispatch(name, args=None, origin="owner"):
         args = dict(args or {})
         decision = gate.evaluate(name, args, origin, allowances)
@@ -613,15 +677,23 @@ def make_dispatch(gate, registry, journal, allowances,
         journal.append("tool.call", {
             "tool": name, "args": args, "gate_verdict": verdict,
             "origin": origin})
+        replayed = False
         if verdict in ("allow", "allow_with_undo"):
-            try:
-                if pass_decision:
-                    result = registry.dispatch(name, args,
-                                               decision=decision)
-                else:
-                    result = registry.dispatch(name, args)
-            except refused_exc as exc:
-                result = {"ok": False, "error": str(exc)}
+
+            def _execute():
+                try:
+                    if pass_decision:
+                        return registry.dispatch(name, args,
+                                                 decision=decision)
+                    return registry.dispatch(name, args)
+                except refused_exc as exc:
+                    return {"ok": False, "error": str(exc)}
+
+            if ledger is not None and name in guarded:
+                result, replayed = _run_guarded(
+                    ledger, session_id, name, args, _execute, journal)
+            else:
+                result = _execute()
         elif verdict == "require_approval":
             result = {"ok": False, "needs_approval": True,
                       "error": f"{name} needs your approval before I "
@@ -632,9 +704,11 @@ def make_dispatch(gate, registry, journal, allowances,
                                f"{getattr(decision, 'reason', '')}"}
         if not isinstance(result, dict):
             result = {"ok": True, "result": result}
-        journal.append("tool.result", {
-            "tool": name, "ok": _result_ok(result),
-            "needs_approval": bool(result.get("needs_approval"))})
+        entry = {"tool": name, "ok": _result_ok(result),
+                 "needs_approval": bool(result.get("needs_approval"))}
+        if replayed:
+            entry["idempotent_replay"] = True
+        journal.append("tool.result", entry)
         return result
     return dispatch
 
@@ -1204,6 +1278,19 @@ def build_app(data_dir, *, chain=None, modules=None,
         else DEFAULT_ALLOWANCES
 
     journal = Journal(str(data_dir / "journal.jsonl"))
+    ledger = IdempotencyLedger(journal)
+    session_id = "s-" + uuid.uuid4().hex[:12]
+    try:
+        _idem_unknowns = ledger.unknown_outcomes()
+    except Exception:
+        _idem_unknowns = []
+    if _idem_unknowns:
+        journal.append("chat.idem_unknown",
+                       {"count": len(_idem_unknowns)})
+        _notify(data_dir, "An earlier action's outcome is unknown",
+                f"{len(_idem_unknowns)} action(s) were interrupted "
+                f"mid-way earlier and may or may not have completed. "
+                f"I have not repeated them.", kind="warning")
     config = _resolve_module(modules, "config").load(data_dir)
     secrets = _resolve_module(modules, "secrets").SecretStore(data_dir)
 
@@ -1302,7 +1389,8 @@ def build_app(data_dir, *, chain=None, modules=None,
     dispatch = _activity_dispatch(
         make_dispatch(gate, registry, journal, allowances,
                       pass_decision=pass_decision,
-                      refused_exc=refused_exc),
+                      refused_exc=refused_exc, ledger=ledger,
+                      session_id=session_id),
         activity)
     tool_schemas = registry.advertised_tools(allowances)
     brain = _resolve_module(modules, "brain").Brain(
