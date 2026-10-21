@@ -267,14 +267,16 @@ def test_urllib_transport_timeout_maps_to_provider_timeout(monkeypatch):
         raise socket.timeout("timed out")
     monkeypatch.setattr("urllib.request.urlopen", boom)
     with pytest.raises(ProviderTimeout):
-        urllib_transport("http://127.0.0.1:1/x", b"{}", {}, 3.0)
+        # Non-loopback: loopback traffic bypasses proxies AND the
+        # patched urlopen by design (it uses a direct opener).
+        urllib_transport("http://192.0.2.1:1/x", b"{}", {}, 3.0)
 
 def test_urllib_transport_refused_maps_to_provider_down(monkeypatch):
     def boom(req, timeout=None):
         raise urllib.error.URLError("connection refused")
     monkeypatch.setattr("urllib.request.urlopen", boom)
     with pytest.raises(ProviderDown):
-        urllib_transport("http://127.0.0.1:1/x", b"{}", {}, 3.0)
+        urllib_transport("http://192.0.2.1:1/x", b"{}", {}, 3.0)
 
 def test_urllib_transport_http_error_returns_status(monkeypatch):
     err = urllib.error.HTTPError("http://x", 404, "nf", {},

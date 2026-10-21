@@ -37,6 +37,10 @@ class RequestRecord:
     ok: bool          # the provider call itself succeeded (a reply was produced)
     quality_ok: bool  # the reply passed the quality bar (not a deflection/error)
     ts: float = 0.0   # epoch seconds
+    error: str = ""   # WHY it failed, verbatim — a failure without its
+                      # reason is undiagnosable (the Ollama mystery of
+                      # 2026-10-21: counts said "failed", nobody could
+                      # say why, and the owner cannot run diagnostics)
 
     def meets_slo(self, slo_ms: float) -> bool:
         return bool(self.ok and self.quality_ok and self.latency_ms <= slo_ms)
@@ -62,11 +66,13 @@ class GoodputLedger:
     # -- recording ------------------------------------------------------
 
     def record(self, provider: str, latency_ms: float, ok: bool,
-               quality_ok: bool, ts: Optional[float] = None) -> RequestRecord:
+               quality_ok: bool, ts: Optional[float] = None,
+               error: str = "") -> RequestRecord:
         rec = RequestRecord(provider=str(provider),
                             latency_ms=float(latency_ms),
                             ok=bool(ok), quality_ok=bool(quality_ok),
-                            ts=float(ts) if ts is not None else time.time())
+                            ts=float(ts) if ts is not None else time.time(),
+                            error=str(error or ""))
         self._records.append(rec)
         return rec
 
@@ -174,7 +180,8 @@ class GoodputLedger:
                                  latency_ms=float(r["latency_ms"]),
                                  ok=bool(r["ok"]),
                                  quality_ok=bool(r["quality_ok"]),
-                                 ts=float(r.get("ts", 0.0)))
+                                 ts=float(r.get("ts", 0.0)),
+                                 error=str(r.get("error", "")))
                    for r in rows)
 
     def save_jsonl(self, path) -> Path:

@@ -159,10 +159,13 @@ def _diagnose_op(data_dir: Path, secrets):
                     row = json.loads(line)
                     slot = providers.setdefault(
                         str(row["provider"]),
-                        {"attempts": 0, "answered": 0})
+                        {"attempts": 0, "answered": 0,
+                         "last_error": ""})
                     slot["attempts"] += 1
                     if row.get("ok"):
                         slot["answered"] += 1
+                    if row.get("error"):
+                        slot["last_error"] = str(row["error"])[:200]
             except Exception:
                 providers = {}
 
@@ -201,6 +204,9 @@ def _diagnose_op(data_dir: Path, secrets):
                     f"{name} ko {slot['attempts']} baar bulaya gaya, "
                     "ek bhi jawab nahi aaya — ye dimag abhi kaam nahi "
                     "kar raha (model/server/key ki kharabi ho sakti hai).")
+            if slot.get("last_error"):
+                findings.append(
+                    f"{name} ki aakhri galti: {slot['last_error']}")
         if providers.get("stub", {}).get("answered", 0) > 0 and \
                 not any(s["answered"] for n, s in providers.items()
                         if n != "stub"):
@@ -1384,6 +1390,23 @@ class ChatApp:
             _mark_notifications_read(self.data_dir)
             return "\n".join(f"🔔 {r['title']} — {r['body']}"
                              for r in rows[-10:])
+        if text == "/diagnose":
+            # Brain-free on purpose: when every brain is down, the
+            # owner still needs the diagnosis — this runs on records
+            # alone and names each provider's last recorded error.
+            report = _diagnose_op(self.data_dir, self.secrets)()
+            lines = ["Diagnosis, sir — apne records se:"]
+            lines += [f"- {f}" for f in report["findings"]]
+            for name, slot in sorted(report["providers"].items()):
+                line = (f"- {name}: {slot['answered']}/"
+                        f"{slot['attempts']} jawab")
+                if slot.get("last_error"):
+                    line += f"; aakhri galti: {slot['last_error']}"
+                lines.append(line)
+            for item in report["checks_failed"][:3]:
+                lines.append(f"- Check fail: {item['check']} — "
+                             f"{item['detail']}")
+            return "\n".join(lines)
         if text == "/keys":
             keys_mod = _load_keys_module()
             if keys_mod is None:

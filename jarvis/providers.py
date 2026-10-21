@@ -49,6 +49,7 @@ import json
 import socket
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence
@@ -127,14 +128,31 @@ Transport = Callable[[str, bytes, Dict[str, str], float], Any]
 """transport(url, body, headers, timeout) -> (status: int, payload: bytes)"""
 
 
+def _is_loopback(url: str) -> bool:
+    host = urllib.parse.urlparse(url).hostname or ""
+    return host == "localhost" or host == "::1" or host.startswith("127.")
+
+
 def urllib_transport(url: str, body: bytes, headers: Dict[str, str],
                      timeout: float):
     """Default transport. Returns (status, bytes) for any HTTP status;
-    raises ProviderTimeout / ProviderDown for network-level failures."""
+    raises ProviderTimeout / ProviderDown for network-level failures.
+
+    Loopback URLs (the local Ollama) are opened DIRECTLY, never via a
+    proxy: urllib's urlopen honours the system/env proxy, browsers
+    bypass proxies for localhost but urllib does not — a PC with any
+    proxy configured would silently route 127.0.0.1:11434 into the
+    proxy and the local brain would look dead while Ollama is fine."""
     req = urllib.request.Request(url, data=body, headers=dict(headers),
                                  method="POST")
+    if _is_loopback(url):
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+        open_fn = opener.open
+    else:
+        open_fn = urllib.request.urlopen
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with open_fn(req, timeout=timeout) as resp:
             return int(resp.status), resp.read()
     except urllib.error.HTTPError as e:  # an answer, not a network failure
         try:
@@ -482,12 +500,14 @@ class FallbackChain:
             try:
                 reply = provider.complete(messages, tools=tools)
             except ProviderError as e:
-                self._record(provider.name, t0, ok=False, quality_ok=False)
+                self._record(provider.name, t0, ok=False, quality_ok=False,
+                             error=str(e))
                 last_error = f"{provider.name}: {e}"
                 continue
             if reply.is_empty():
                 # The "goes silent" lesson: an empty success is a failure.
-                self._record(provider.name, t0, ok=True, quality_ok=False)
+                self._record(provider.name, t0, ok=True, quality_ok=False,
+                             error="empty reply")
                 last_error = f"{provider.name}: empty reply"
                 continue
             self._record(provider.name, t0, ok=True, quality_ok=True)
@@ -496,10 +516,11 @@ class FallbackChain:
         raise ChainExhaustedError(attempts, last_error)
 
     def _record(self, provider: str, t0: float, ok: bool,
-                quality_ok: bool) -> None:
+                quality_ok: bool, error: str = "") -> None:
         if self.ledger is not None:
             latency_ms = max(0.0, (self._clock() - t0) * 1000.0)
-            self.ledger.record(provider, latency_ms, ok, quality_ok)
+            self.ledger.record(provider, latency_ms, ok, quality_ok,
+                               error=error)
 
 
 # ---------------------------------------------------------------------------
