@@ -134,7 +134,7 @@ PAGE = """<!DOCTYPE html>
     </div>
   </div>
   <div id="npanel"></div>
-  <div class="icons"><span>◉ CHAT</span><span>▣ TOOLS</span><span>◎ MEMORY</span><span id="bell">🔔 <span id="ncount">0</span></span><span>♪ VOICE · SOON</span></div>
+  <div class="icons"><span>◉ CHAT</span><span>▣ TOOLS</span><span>◎ MEMORY</span><span id="bell">🔔 <span id="ncount">0</span></span><span id="voiceBtn" style="cursor:pointer">♪ VOICE · OFF</span><span id="muteBtn" style="cursor:pointer;display:none">🎙 MIC</span><span id="cutBtn" style="cursor:pointer;display:none">✋ CUT</span></div>
 <script>
   const log = document.getElementById('log');
   const input = document.getElementById('text');
@@ -144,7 +144,8 @@ PAGE = """<!DOCTYPE html>
   // runs — never a rotating script (owner's order, 2026-10-21).
   const stateLabels = { standby: 'Standby', thinking: 'Thinking…',
     researching: 'Researching…', creating: 'Creating…',
-    working: 'Working…' };
+    working: 'Working…', listening: 'Listening…',
+    speaking: 'Speaking…' };
   let timer = null;
   function showState(s) {
     stateEl.textContent = stateLabels[s] || 'Standby';
@@ -187,6 +188,12 @@ PAGE = """<!DOCTYPE html>
       const s = await r.json();
       providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned) : '';
       setBadge(s.notifications || 0);
+      const v = s.voice || {};
+      voiceBtn.textContent = v.active
+        ? ('♪ VOICE · ' + (v.connected ? 'ON' : '…')) : '♪ VOICE · OFF';
+      muteBtn.style.display = v.active ? '' : 'none';
+      muteBtn.textContent = v.muted ? '🔇 MUTED' : '🎙 MIC';
+      cutBtn.style.display = v.speaking ? '' : 'none';
     } catch (e) { /* state line is decoration; never break chat */ }
   }
   bell.addEventListener('click', async () => {
@@ -205,6 +212,22 @@ PAGE = """<!DOCTYPE html>
       setBadge(0);
     } catch (e) { /* panel is decoration; never break chat */ }
   });
+  const voiceBtn = document.getElementById('voiceBtn');
+  const muteBtn = document.getElementById('muteBtn');
+  const cutBtn = document.getElementById('cutBtn');
+  async function voiceAction(action) {
+    try {
+      const r = await fetch('/api/voice', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action }) });
+      const s = await r.json();
+      if (s.message) addMsg(s.message, 'jarvis');
+      refreshState();
+    } catch (e) { /* voice controls are additive; never break chat */ }
+  }
+  voiceBtn.addEventListener('click', () => voiceAction('toggle'));
+  muteBtn.addEventListener('click', () => voiceAction('mute'));
+  cutBtn.addEventListener('click', () => voiceAction('interrupt'));
   setInterval(refreshState, 20000);
   async function send() {
     const text = input.value.trim();
@@ -280,10 +303,16 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                     _due_reminder_notifications(app.data_dir)
                 except Exception:
                     pass
+                voice = {"active": False}
+                try:
+                    voice = app.voice_status()
+                except Exception:
+                    pass
                 self._json(200, {"provider": app.last_provider,
                                  "tools": tools, "learned": learned,
                                  "activity": app.activity.state,
                                  "tool": app.activity.tool,
+                                 "voice": voice,
                                  "notifications":
                                      _unread_count(app.data_dir)})
                 return
@@ -298,6 +327,28 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             if self.path == "/api/notifications/read":
                 _mark_notifications_read(app.data_dir)
                 self._json(200, {"ok": True})
+                return
+            if self.path == "/api/voice":
+                try:
+                    size = int(self.headers.get("Content-Length", 0))
+                    action = str(json.loads(
+                        self.rfile.read(size).decode("utf-8")
+                    ).get("action", "toggle")).lower()
+                except Exception:
+                    action = "toggle"
+                with lock:
+                    if action == "mute":
+                        message = app.handle_command("/voice mute")
+                    elif action == "interrupt":
+                        message = app.handle_command(
+                            "/voice interrupt")
+                    else:
+                        status = app.voice_status()
+                        message = (app.stop_voice()
+                                   if status.get("active")
+                                   else app.start_voice())
+                self._json(200, {"message": message,
+                                 "voice": app.voice_status()})
                 return
             if self.path != "/api/chat":
                 self._json(404, {"error": "not found"})
@@ -322,7 +373,14 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                     else:
                         reply = app.turn(text)
                 finally:
-                    app.activity.set("standby")
+                    # With voice on, the resting word is the voice's
+                    # own truth (listening/speaking), not standby.
+                    v = app.voice_status()
+                    if v.get("active"):
+                        app.activity.set("speaking" if v.get(
+                            "speaking") else "listening")
+                    else:
+                        app.activity.set("standby")
             self._json(200, {"reply": reply,
                              "provider": app.last_provider})
 

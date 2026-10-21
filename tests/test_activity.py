@@ -76,5 +76,9 @@ def test_state_endpoint_reports_real_activity(ui):
 
 def test_page_has_no_fake_rotating_states():
     assert "busyWords" not in PAGE
-    assert "Listening" not in PAGE
     assert "Standby" in PAGE
+    # Listening/Speaking exist as labels now because the voice loop
+    # makes them REAL (polled from the app's activity) — what must
+    # never return is a timer rotating words nobody earned.
+    assert "listening: 'Listening…'" in PAGE
+    assert "speaking: 'Speaking…'" in PAGE

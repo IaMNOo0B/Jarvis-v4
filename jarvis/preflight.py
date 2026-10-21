@@ -68,6 +68,14 @@ FIX_KOKORO = (
     "Optional — for the Kokoro voice: double-click setup.bat and let it "
     "install the voice pack (kokoro)."
 )
+FIX_SOUNDDEVICE = (
+    "Optional — for the live voice: double-click setup.bat and let it "
+    "install the voice pack (sounddevice)."
+)
+FIX_WAKEWORD = (
+    "Optional — for the 'Jarvis' wake word: double-click setup.bat and "
+    "let it install the voice pack (openwakeword)."
+)
 
 
 def _result(name, level, ok, detail, why, next_fix=""):
@@ -290,6 +298,23 @@ def run_checks(root=None, data_dir=None, models_dir=None, *,
             "Kokoro is JARVIS's natural speaking voice. Without it, JARVIS "
             "can still reply in text (and other voices arrive in later steps).",
             FIX_KOKORO,
+            spec_finder,
+        ),
+        check_optional_package(
+            "Live voice pack (sounddevice)",
+            "sounddevice",
+            "sounddevice is the microphone and speaker for the live "
+            "Gemini voice. Without it, the VOICE button cannot start.",
+            FIX_SOUNDDEVICE,
+            spec_finder,
+        ),
+        check_optional_package(
+            "Wake word pack (openwakeword)",
+            "openwakeword",
+            "openwakeword listens locally for 'Jarvis' so the mic can "
+            "sleep until called. Without it, voice still works — it "
+            "just stays awake while on.",
+            FIX_WAKEWORD,
             spec_finder,
         ),
     ]

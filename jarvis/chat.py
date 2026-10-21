@@ -1356,6 +1356,7 @@ class ChatApp:
         self.brain = parts.brain
         self.allowances = parts.allowances
         self.activity = parts.activity or Activity()
+        self.voice_manager = None
         self.history: list = []
         self.last_provider = "none"
 
@@ -1364,6 +1365,141 @@ class ChatApp:
     def execute_tool(self, name: str, args: Optional[dict] = None,
                      origin: str = "owner") -> dict:
         return self.parts.dispatch(name, args or {}, origin=origin)
+
+    # -- voice (Gemini Live — the Mark-LVI design) ----------------------
+
+    def start_voice(self) -> str:
+        if self.voice_manager is not None \
+                and self.voice_manager.active:
+            return "Voice is already on, sir."
+        from .voice_manager import VoiceManager
+        cfg = {
+            "voice_name": self.config.get("voice", "voice_name",
+                                          "Charon"),
+            "wake_word": bool(self.config.get("voice", "wake_word",
+                                              False)),
+            "proactive": bool(self.config.get("voice", "proactive",
+                                              True)),
+            "input_device": self.config.get("voice", "input_device"),
+            "output_device": self.config.get("voice", "output_device"),
+        }
+        models = self.config.get("voice", "live_models")
+        if isinstance(models, list) and models:
+            cfg["live_models"] = [str(m) for m in models]
+        self._voice_cfg = cfg
+        manager = VoiceManager(
+            session_factory=self._make_voice_session,
+            activity=self.activity,
+            on_transcript=self._voice_transcript,
+            notify=lambda text: _notify(self.data_dir, "Voice", text,
+                                        kind="voice"),
+            config=cfg)
+        ok, message = manager.start()
+        if ok:
+            self.voice_manager = manager
+            self.journal.append("voice.start",
+                                {"voice": cfg["voice_name"]})
+        return message
+
+    def stop_voice(self) -> str:
+        if self.voice_manager is None \
+                or not self.voice_manager.active:
+            return "Voice is not on, sir."
+        self.voice_manager.stop()
+        self.journal.append("voice.stop", {})
+        return "Voice is off, sir."
+
+    def voice_status(self) -> dict:
+        if self.voice_manager is None:
+            return {"active": False, "connected": False,
+                    "speaking": False, "muted": False,
+                    "awake": True, "wake_word": False,
+                    "voice": "Charon"}
+        return self.voice_manager.status()
+
+    def _make_voice_session(self, events):
+        """The Live session factory the VoiceManager calls: the
+        owner's filed Gemini key, the same gated tools the chat
+        brain advertises, and a system instruction assembled the
+        Mark-LVI way (time, identity, memory, persona)."""
+        from .prompt import PERSONA
+        from .voice import LIVE_MODELS, LiveSession
+        keys_mod = _load_keys_module()
+        values = []
+        if keys_mod is not None:
+            try:
+                values = keys_mod.get_keys(self.secrets, "gemini")
+            except Exception:
+                values = []
+        if not values:
+            raise RuntimeError(
+                "Voice needs a Gemini key, sir — file one with /key "
+                "first, then start voice.")
+        cfg = getattr(self, "_voice_cfg", {}) or {}
+        now = datetime.now()
+        parts = [
+            "[CURRENT DATE & TIME]\nRight now it is: "
+            f"{now:%A, %B %d, %Y — %I:%M %p}\nUse this to calculate "
+            "exact times for reminders.",
+            "[IDENTITY]\nYour name is JARVIS. Always refer to "
+            "yourself as JARVIS. Address the user as 'sir'.",
+        ]
+        try:
+            facts = self.memory.facts.current_facts()
+        except Exception:
+            facts = []
+        if facts:
+            lines = []
+            for fact in facts[:20]:
+                text = fact.get("text") if isinstance(fact, dict) \
+                    else str(fact)
+                if text:
+                    lines.append(f"- {text}")
+            if lines:
+                parts.append("[MEMORY]\n" + "\n".join(lines))
+        parts.append(PERSONA)
+        parts.append(
+            "[SPEAKING]\nYou are speaking aloud, not writing. Keep "
+            "answers short, natural and conversational. When a tool "
+            "is needed, call it — do not describe calling it.")
+        return LiveSession(
+            api_key=values[0],
+            dispatch=lambda name, args: self.execute_tool(name, args),
+            events=events,
+            system_instruction="\n\n".join(parts),
+            tools=self.registry.advertised_tools(self.allowances),
+            voice=cfg.get("voice_name", "Charon"),
+            models=cfg.get("live_models") or LIVE_MODELS,
+            proactive=cfg.get("proactive", True),
+            on_session_end=self._voice_session_end)
+
+    def _voice_transcript(self, role: str, text: str):
+        """Voice turns join the same history the chat brain reads —
+        one conversation, two mouths."""
+        self.history.append({"role": role, "content": text})
+        self.journal.append("voice.turn",
+                            {"role": role, "text": text[:500]})
+        try:
+            self.memory.note_turn(role, text)
+        except Exception:
+            pass
+
+    def _voice_session_end(self, turns: list):
+        """Mark-LVI's closing ritual: a session of >= 3 turns is
+        summarised into long-term memory, so tomorrow remembers
+        that the conversation happened."""
+        try:
+            convo = "\n".join(f"{r}: {t}" for r, t in turns[-40:])
+            reply = self.chain.complete(
+                [{"role": "user",
+                  "content": "Summarize this voice conversation in "
+                             "one or two sentences for long-term "
+                             f"memory:\n{convo}"}], [])
+            summary = getattr(reply, "content", "") or ""
+            if summary and not getattr(reply, "error", None):
+                self.memory.learn(f"Voice session: {summary.strip()}")
+        except Exception:
+            pass
 
     # -- commands ---------------------------------------------------------
 
@@ -1438,6 +1574,22 @@ class ChatApp:
                 return f"That key was not stored, sir: {exc}"
             return (f"Key stored for {saved}, sir. Restart JARVIS and "
                     "it joins the brain chain.")
+        if text == "/voice" or text.startswith("/voice "):
+            arg = text[len("/voice"):].strip().lower()
+            if arg in ("off", "stop"):
+                return self.stop_voice()
+            if arg == "mute":
+                if self.voice_manager is None \
+                        or not self.voice_manager.active:
+                    return "Voice is not on, sir."
+                muted = self.voice_manager.toggle_mute()
+                return ("Microphone muted, sir." if muted
+                        else "Microphone live, sir.")
+            if arg == "interrupt":
+                if self.voice_manager is not None:
+                    self.voice_manager.interrupt()
+                return "Interrupted, sir."
+            return self.start_voice()
         return f"Unknown command, sir: {text.split()[0] if text else ''}"
 
     # -- the turn -----------------------------------------------------------
