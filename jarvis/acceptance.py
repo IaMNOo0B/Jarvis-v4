@@ -223,9 +223,9 @@ def build_acceptance_report(root: Optional[Path] = None) -> str:
 
     # -- 2. Behaviour-eval baseline (Step 14) --------------------------------
     lines.append("## 2. Behaviour eval baseline (Step 14, stub mode)")
-    baseline = _parse_baseline(root / "evals" / "BASELINE.md")
+    baseline = _parse_baseline(root / "evals" / "BASELINE-V4.md")
     if baseline is None:
-        lines.append(f"- {NOT_MEASURED} — evals/BASELINE.md not found or "
+        lines.append(f"- {NOT_MEASURED} — evals/BASELINE-V4.md not found or "
                      "unparseable; run `python -m jarvis.behaviour_eval "
                      "--mode stub`.")
         not_measured.append("eval baseline")

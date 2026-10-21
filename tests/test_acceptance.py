@@ -92,13 +92,15 @@ def test_deflection_only_counts_when_nothing_was_done():
 
 
 def test_acceptance_report_real_values_and_honest_gaps(tmp_path):
-    # A tmp root carrying the repo's real eval baseline.
+    # A tmp root carrying the repo's real eval baseline — the v4 one
+    # (BASELINE-V4.md); the runner must read it, never the stale ported
+    # v2-staging file.
     (tmp_path / "evals").mkdir()
-    shutil.copy(ROOT / "evals" / "BASELINE.md", tmp_path / "evals" /
-                "BASELINE.md")
+    shutil.copy(ROOT / "evals" / "BASELINE-V4.md", tmp_path / "evals" /
+                "BASELINE-V4.md")
     report = build_acceptance_report(tmp_path)
-    # Real baseline numbers parsed from the repo's file (10/11 today).
-    assert "10/11 passed" in report
+    # Real baseline numbers parsed from the repo's v4 file (11/11 today).
+    assert "11/11 passed" in report
     # Honest gaps are marked, not faked: goodput + live over-refusal rate
     # + live journal cannot exist in a bare checkout.
     assert "NOT-MEASURED" in report

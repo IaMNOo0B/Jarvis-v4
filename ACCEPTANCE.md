@@ -13,10 +13,10 @@ Assembled by `python -m jarvis.acceptance` from the repo's own modules. Every nu
   - [MISS] Kokoro voice pack (optional): kokoro is not installed
 
 ## 2. Behaviour eval baseline (Step 14, stub mode)
-- Totals: **10/11 passed** (stub brain — proves the pipeline, NOT the real brain; real-brain numbers come from provider mode on the owner's PC).
+- Totals: **11/11 passed** (stub brain — proves the pipeline, NOT the real brain; real-brain numbers come from provider mode on the owner's PC).
   - coordination: 1/1
   - over_refusal: 1/1
-  - specification: 6/7
+  - specification: 7/7
   - verification: 2/2
 
 ## 3. Provider goodput (Step 17, SLO 10000 ms, goodput = ok AND quality AND within SLO; never averages)
