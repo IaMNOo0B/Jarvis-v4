@@ -393,6 +393,36 @@ def op_create_project(path: str, files: list):
     return {"project": str(base), "written": written}
 
 
+def op_browser_launch():
+    from jarvis.browser_cdp import op_browser_launch as _launch
+    return _launch()
+
+
+def op_browser_open(url: str):
+    from jarvis.browser_cdp import op_browser_open as _open
+    return _open(url)
+
+
+def op_browser_text(max_chars: int = 12000):
+    from jarvis.browser_cdp import op_browser_text as _text
+    return _text(max_chars)
+
+
+def op_browser_click(text: str):
+    from jarvis.browser_cdp import op_browser_click as _click
+    return _click(text)
+
+
+def op_browser_type(text: str, into: str = ""):
+    from jarvis.browser_cdp import op_browser_type as _type
+    return _type(text, into)
+
+
+def op_browser_status():
+    from jarvis.browser_cdp import op_browser_status as _status
+    return _status()
+
+
 def op_open_app(name: str):
     """Launch an application by name. Real on Windows; honest refusal
     (as a result, not an exception) where no driver exists."""
@@ -600,6 +630,67 @@ CODE_MANIFEST = {
     ],
 }
 
+BROWSER_MANIFEST = {
+    "name": "core.browser",
+    "version": "1.0.0",
+    "tools": [
+        {
+            "name": "browser_launch",
+            "op": "browser_launch",
+            "permission": "browser.control",
+            "schema": {"type": "object", "properties": {},
+                       "additionalProperties": False},
+        },
+        {
+            "name": "browser_open",
+            "op": "browser_open",
+            "permission": "browser.control",
+            "schema": {"type": "object",
+                       "properties": {"url": {"type": "string",
+                                              "minLength": 1}},
+                       "required": ["url"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "browser_text",
+            "op": "browser_text",
+            "permission": "browser.control",
+            "schema": {"type": "object",
+                       "properties": {"max_chars": {"type": "integer",
+                                                    "minimum": 500,
+                                                    "maximum": 40000}},
+                       "additionalProperties": False},
+        },
+        {
+            "name": "browser_click",
+            "op": "browser_click",
+            "permission": "browser.control",
+            "schema": {"type": "object",
+                       "properties": {"text": {"type": "string",
+                                               "minLength": 1}},
+                       "required": ["text"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "browser_type",
+            "op": "browser_type",
+            "permission": "browser.control",
+            "schema": {"type": "object",
+                       "properties": {"text": {"type": "string"},
+                                      "into": {"type": "string"}},
+                       "required": ["text"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "browser_status",
+            "op": "browser_status",
+            "permission": "browser.control",
+            "schema": {"type": "object", "properties": {},
+                       "additionalProperties": False},
+        },
+    ],
+}
+
 PC_MANIFEST = {
     "name": "core.pc",
     "version": "1.0.0",
@@ -617,14 +708,14 @@ PC_MANIFEST = {
 
 ALL_MANIFESTS = (TIME_MANIFEST, MEMORY_MANIFEST, WEB_MANIFEST,
                  KNOWLEDGE_MANIFEST, FILES_MANIFEST, CODE_MANIFEST,
-                 PC_MANIFEST)
+                 BROWSER_MANIFEST, PC_MANIFEST)
 
 # Every capability the first-party skills can ask for — the sample
 # allowances a fully-permitted owner turn would carry.
 ALL_PERMISSIONS = frozenset({
     "clock.read", "memory.read", "memory.write", "net.outbound",
     "pc.control", "knowledge.read", "files.read", "files.write",
-    "code.run",
+    "code.run", "browser.control",
 })
 
 
@@ -647,6 +738,13 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
     registry.register(CODE_MANIFEST,
                       ops={"run_code": op_run_code,
                            "create_project": op_create_project})
+    registry.register(BROWSER_MANIFEST,
+                      ops={"browser_launch": op_browser_launch,
+                           "browser_open": op_browser_open,
+                           "browser_text": op_browser_text,
+                           "browser_click": op_browser_click,
+                           "browser_type": op_browser_type,
+                           "browser_status": op_browser_status})
     registry.register(PC_MANIFEST, ops={"open_app": op_open_app})
     for manifest in ALL_MANIFESTS:
         registry.approve(manifest["name"])

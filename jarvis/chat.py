@@ -81,6 +81,7 @@ DEFAULT_ALLOWANCES = frozenset({
     "code.run",
     "self.upgrade",
     "notify.send",
+    "browser.control",
 })
 
 
