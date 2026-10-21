@@ -21,7 +21,9 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .chat import DEFAULT_DATA_DIR, ChatApp, _maybe_auto_watch
+from .chat import (DEFAULT_DATA_DIR, ChatApp, _due_reminder_notifications,
+                   _mark_notifications_read, _maybe_auto_watch,
+                   _read_notifications, _unread_count)
 
 PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -97,6 +99,16 @@ PAGE = """<!DOCTYPE html>
   #send:hover { background:rgba(30,100,175,.65); color:#fff; }
   .icons { flex:0 0 auto; display:flex; gap:26px; padding-bottom:14px;
     color:rgba(150,200,245,.4); font-size:13px; letter-spacing:2px; }
+  #bell { cursor:pointer; }
+  #bell.hot { color:#ffd479; text-shadow:0 0 12px rgba(255,200,90,.8); }
+  #npanel { display:none; width:min(760px, 94vw); max-height:30vh;
+    overflow-y:auto; margin-bottom:8px; padding:10px 14px;
+    background:rgba(10,22,42,.85); border:1px solid rgba(255,205,110,.35);
+    border-radius:10px; font-size:13.5px; }
+  #npanel .nitem { padding:7px 2px; border-bottom:1px solid rgba(120,200,255,.1); }
+  #npanel .nitem:last-child { border-bottom:none; }
+  #npanel .ntitle { color:#ffe1a1; }
+  #npanel .nempty { color:rgba(180,210,245,.55); }
 </style>
 </head>
 <body>
@@ -120,7 +132,8 @@ PAGE = """<!DOCTYPE html>
       <button id="send">SEND</button>
     </div>
   </div>
-  <div class="icons"><span>◉ CHAT</span><span>▣ TOOLS</span><span>◎ MEMORY</span><span>♪ VOICE · SOON</span></div>
+  <div id="npanel"></div>
+  <div class="icons"><span>◉ CHAT</span><span>▣ TOOLS</span><span>◎ MEMORY</span><span id="bell">🔔 <span id="ncount">0</span></span><span>♪ VOICE · SOON</span></div>
 <script>
   const log = document.getElementById('log');
   const input = document.getElementById('text');
@@ -148,13 +161,38 @@ PAGE = """<!DOCTYPE html>
       stateEl.textContent = 'Ready';
     }
   }
+  const bell = document.getElementById('bell');
+  const ncount = document.getElementById('ncount');
+  const npanel = document.getElementById('npanel');
+  function setBadge(n) {
+    ncount.textContent = n;
+    bell.classList.toggle('hot', n > 0);
+  }
   async function refreshState() {
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
       providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned) : '';
+      setBadge(s.notifications || 0);
     } catch (e) { /* state line is decoration; never break chat */ }
   }
+  bell.addEventListener('click', async () => {
+    if (npanel.style.display === 'block') { npanel.style.display = 'none'; return; }
+    try {
+      const r = await fetch('/api/notifications');
+      const s = await r.json();
+      const esc = t => { const d = document.createElement('div');
+        d.textContent = t || ''; return d.innerHTML; };
+      npanel.innerHTML = s.items.length
+        ? s.items.map(n => '<div class="nitem"><span class="ntitle">' +
+            esc(n.title) + '</span> — ' + esc(n.body) + '</div>').join('')
+        : '<div class="nempty">No notifications, sir.</div>';
+      npanel.style.display = 'block';
+      await fetch('/api/notifications/read', { method: 'POST' });
+      setBadge(0);
+    } catch (e) { /* panel is decoration; never break chat */ }
+  });
+  setInterval(refreshState, 20000);
   async function send() {
     const text = input.value.trim();
     if (!text) return;
@@ -204,6 +242,16 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.wfile.write(body)
 
         def do_GET(self):
+            if self.path == "/api/notifications":
+                try:
+                    _due_reminder_notifications(app.data_dir)
+                except Exception:
+                    pass
+                items = _read_notifications(app.data_dir)[-20:]
+                self._json(200, {
+                    "items": list(reversed(items)),
+                    "unread": _unread_count(app.data_dir)})
+                return
             if self.path == "/api/state":
                 learned = 0
                 store = getattr(app.memory, "_learned", None)
@@ -215,8 +263,14 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                         app.allowances))
                 except Exception:
                     pass
+                try:
+                    _due_reminder_notifications(app.data_dir)
+                except Exception:
+                    pass
                 self._json(200, {"provider": app.last_provider,
-                                 "tools": tools, "learned": learned})
+                                 "tools": tools, "learned": learned,
+                                 "notifications":
+                                     _unread_count(app.data_dir)})
                 return
             body = PAGE.encode()
             self.send_response(200)
@@ -226,6 +280,10 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.wfile.write(body)
 
         def do_POST(self):
+            if self.path == "/api/notifications/read":
+                _mark_notifications_read(app.data_dir)
+                self._json(200, {"ok": True})
+                return
             if self.path != "/api/chat":
                 self._json(404, {"error": "not found"})
                 return

@@ -80,6 +80,7 @@ DEFAULT_ALLOWANCES = frozenset({
     "system.diagnose",
     "code.run",
     "self.upgrade",
+    "notify.send",
 })
 
 
@@ -305,6 +306,105 @@ def _research_op(learned: LearnedStore):
                              for it in read]}
 
     return deep_research
+
+
+NOTIFY_MANIFEST = {
+    "name": "core.notify",
+    "version": "1.0.0",
+    "tools": [{
+        "name": "notify",
+        "op": "notify",
+        "permission": "notify.send",
+        "schema": {"type": "object",
+                   "properties": {"title": {"type": "string",
+                                            "minLength": 1},
+                                  "body": {"type": "string"}},
+                   "required": ["title"],
+                   "additionalProperties": False},
+    }],
+}
+
+
+def _notify(data_dir, title, body="", kind="info") -> dict:
+    """Append one notification — the channel everything important
+    uses to reach the owner (reminders coming due, upgrade watch
+    findings, skills promoted, the brain flagging something). The
+    UI badge and the CLI both read this one file."""
+    row = {"id": uuid.uuid4().hex[:8], "ts": time.time(),
+           "title": str(title)[:200], "body": str(body)[:1000],
+           "kind": str(kind), "read": False}
+    try:
+        Path(data_dir).mkdir(parents=True, exist_ok=True)
+        with (Path(data_dir) / "notifications.jsonl").open(
+                "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return row
+
+
+def _read_notifications(data_dir, limit: int = 50) -> list:
+    path = Path(data_dir) / "notifications.jsonl"
+    rows = []
+    if path.exists():
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rows.append(json.loads(line))
+        except Exception:
+            return []
+    return rows[-limit:]
+
+
+def _unread_count(data_dir) -> int:
+    return sum(1 for r in _read_notifications(data_dir, limit=500)
+               if not r.get("read"))
+
+
+def _mark_notifications_read(data_dir) -> None:
+    path = Path(data_dir) / "notifications.jsonl"
+    rows = _read_notifications(data_dir, limit=1000)
+    try:
+        with path.open("w", encoding="utf-8") as fh:
+            for row in rows:
+                row["read"] = True
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _due_reminder_notifications(data_dir) -> int:
+    """Reminders whose time has come become notifications — once
+    each (a `notified` flag on the reminder row prevents repeats)."""
+    path = Path(data_dir) / "reminders.json"
+    if not path.exists():
+        return 0
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    now = datetime.now(timezone.utc)
+    created, changed = 0, False
+    for row in rows:
+        if row.get("done") or row.get("notified"):
+            continue
+        try:
+            due = datetime.fromisoformat(str(row["due"]))
+        except Exception:
+            continue
+        if due <= now:
+            _notify(data_dir, "Reminder",
+                    str(row.get("text", "")), kind="reminder")
+            row["notified"] = True
+            created += 1
+            changed = True
+    if changed:
+        try:
+            path.write_text(json.dumps(rows, ensure_ascii=False),
+                            encoding="utf-8")
+        except Exception:
+            pass
+    return created
 
 
 def _reminder_ops(data_dir: Path):
@@ -834,6 +934,9 @@ def _watch_cycle(learned: LearnedStore, data_dir, topics=None) -> dict:
                          f"{item['url']}")
         learned_as = learned.add_document(
             "\n".join(lines), title="upgrade-watch")["learned_from"]
+        _notify(data_dir, "Upgrade watch",
+                f"{len(new)} nayi cheezein mili — pehli: "
+                f"{new[0]['title']}", kind="upgrade")
     return {"new_findings": new, "count": len(new),
             "topics_checked": len(topics),
             "search_errors": errors[:1], "learned_as": learned_as,
@@ -927,6 +1030,9 @@ def _upgrade_ops(learned: LearnedStore, data_dir, journal, registry,
         journal.append("upgrade.promoted", {
             "skill": manifest.get("name"), "slug": slug,
             "tools": tool_names})
+        _notify(data, "Naya skill taiyaar",
+                f"{manifest.get('name')} agle start se live hoga "
+                f"(tools: {', '.join(tool_names)})", kind="upgrade")
         _append_upgrade_log(data, {
             "type": "promoted", "ts": time.time(),
             "skill": manifest.get("name"), "tools": tool_names})
@@ -1093,6 +1199,16 @@ def build_app(data_dir, *, chain=None, modules=None,
         except Exception as exc:  # a sibling got there first, etc.
             journal.append("chat.upgrade_skill_skipped",
                            {"error": f"{type(exc).__name__}: {exc}"})
+    if hasattr(registry, "register") and hasattr(registry, "approve"):
+        try:
+            def _notify_op(title: str, body: str = ""):
+                return _notify(data_dir, title, body, kind="brain")
+            registry.register(NOTIFY_MANIFEST,
+                              ops={"notify": _notify_op})
+            registry.approve(NOTIFY_MANIFEST["name"])
+        except Exception as exc:  # a sibling got there first, etc.
+            journal.append("chat.notify_skill_skipped",
+                           {"error": f"{type(exc).__name__}: {exc}"})
 
     goodput = GoodputLedger()
     goodput_path = data_dir / "goodput.jsonl"
@@ -1194,6 +1310,14 @@ class ChatApp:
                 return "Nothing to store, sir."
             self.memory.learn(fact, source="owner")
             return f"Yaad rakh liya, sir: {fact}"
+        if text == "/notifications":
+            rows = [r for r in _read_notifications(self.data_dir)
+                    if not r.get("read")]
+            if not rows:
+                return "No new notifications, sir."
+            _mark_notifications_read(self.data_dir)
+            return "\n".join(f"🔔 {r['title']} — {r['body']}"
+                             for r in rows[-10:])
         if text == "/keys":
             keys_mod = _load_keys_module()
             if keys_mod is None:
@@ -1260,6 +1384,11 @@ class ChatApp:
                     getattr(self.chain, "last_provider", None)
                     or getattr(self.chain, "name", None) or "unknown")
 
+        # Reminders whose time has come surface as notifications.
+        try:
+            _due_reminder_notifications(self.data_dir)
+        except Exception:
+            pass
         self.journal.append("assistant.reply", {
             "text": reply, "via": via, "provider": self.last_provider})
         # The goodput ledger is the diagnostic record (which brain
