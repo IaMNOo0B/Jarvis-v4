@@ -245,6 +245,91 @@ def op_knowledge_search(query: str, limit: int = 4):
     return {"results": results}
 
 
+_SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+
+
+def op_list_files(path: str = ""):
+    """List one folder on the owner's PC (his standing order: full
+    access — JARVIS may look anywhere he could look himself)."""
+    target = Path(path).expanduser() if str(path).strip() \
+        else Path.home()
+    if not target.exists():
+        return {"error": f"list_files failed: no such folder: {target}"}
+    if not target.is_dir():
+        return {"error": f"list_files failed: not a folder: {target}"}
+    entries = []
+    try:
+        children = sorted(target.iterdir(),
+                          key=lambda p: (not p.is_dir(), p.name.lower()))
+    except OSError as exc:
+        return {"error": f"list_files failed: {type(exc).__name__}: {exc}"}
+    for child in children[:200]:
+        try:
+            size = child.stat().st_size if child.is_file() else None
+        except OSError:
+            size = None
+        entries.append({"name": child.name,
+                        "kind": "dir" if child.is_dir() else "file",
+                        "size": size})
+    return {"path": str(target), "entries": entries,
+            "truncated": len(children) > 200}
+
+
+def op_read_file(path: str, max_chars: int = 12000):
+    """Read a text file's contents. Binary files are reported as
+    binary (with their size) instead of dumping garbage."""
+    target = Path(str(path)).expanduser()
+    if not target.exists():
+        return {"error": f"read_file failed: no such file: {target}"}
+    if not target.is_file():
+        return {"error": f"read_file failed: not a file: {target}"}
+    try:
+        raw = target.read_bytes()[:2_000_000]
+    except OSError as exc:
+        return {"error": f"read_file failed: {type(exc).__name__}: {exc}"}
+    if b"\x00" in raw[:8192]:
+        return {"path": str(target), "binary": True,
+                "size": target.stat().st_size,
+                "note": "binary file — contents not shown as text"}
+    text = raw.decode("utf-8", errors="replace")
+    return {"path": str(target), "text": text[:max_chars],
+            "truncated": len(text) > max_chars}
+
+
+def op_search_files(root: str = "", query: str = "", limit: int = 20):
+    """Find files by name anywhere under a root (default: home)."""
+    base = Path(root).expanduser() if str(root).strip() else Path.home()
+    if not base.exists():
+        return {"error": f"search_files failed: no such folder: {base}"}
+    needle = str(query).lower()
+    matches, scanned = [], 0
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for name in filenames:
+            scanned += 1
+            if scanned > 20000:
+                return {"root": str(base), "matches": matches,
+                        "note": "scan limit reached"}
+            if needle in name.lower():
+                matches.append(str(Path(dirpath) / name))
+                if len(matches) >= int(limit):
+                    return {"root": str(base), "matches": matches}
+    return {"root": str(base), "matches": matches}
+
+
+def op_write_file(path: str, text: str):
+    """Write a text file (creating folders as needed). The owner's
+    PC, the owner's order: JARVIS does the work end-to-end instead of
+    handing him a file to save himself."""
+    target = Path(str(path)).expanduser()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(str(text), encoding="utf-8")
+    except OSError as exc:
+        return {"error": f"write_file failed: {type(exc).__name__}: {exc}"}
+    return {"written": str(target), "chars": len(str(text))}
+
+
 def op_open_app(name: str):
     """Launch an application by name. Real on Windows; honest refusal
     (as a result, not an exception) where no driver exists."""
@@ -361,6 +446,59 @@ KNOWLEDGE_MANIFEST = {
     }],
 }
 
+FILES_MANIFEST = {
+    "name": "core.files",
+    "version": "1.0.0",
+    "tools": [
+        {
+            "name": "list_files",
+            "op": "list_files",
+            "permission": "files.read",
+            "schema": {"type": "object",
+                       "properties": {"path": {"type": "string"}},
+                       "additionalProperties": False},
+        },
+        {
+            "name": "read_file",
+            "op": "read_file",
+            "permission": "files.read",
+            "schema": {"type": "object",
+                       "properties": {"path": {"type": "string",
+                                               "minLength": 1},
+                                      "max_chars": {"type": "integer",
+                                                    "minimum": 500,
+                                                    "maximum": 40000}},
+                       "required": ["path"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "search_files",
+            "op": "search_files",
+            "permission": "files.read",
+            "schema": {"type": "object",
+                       "properties": {"root": {"type": "string"},
+                                      "query": {"type": "string",
+                                                "minLength": 1},
+                                      "limit": {"type": "integer",
+                                                "minimum": 1,
+                                                "maximum": 50}},
+                       "required": ["query"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "write_file",
+            "op": "write_file",
+            "permission": "files.write",
+            "schema": {"type": "object",
+                       "properties": {"path": {"type": "string",
+                                               "minLength": 1},
+                                      "text": {"type": "string"}},
+                       "required": ["path", "text"],
+                       "additionalProperties": False},
+        },
+    ],
+}
+
 PC_MANIFEST = {
     "name": "core.pc",
     "version": "1.0.0",
@@ -377,13 +515,13 @@ PC_MANIFEST = {
 }
 
 ALL_MANIFESTS = (TIME_MANIFEST, MEMORY_MANIFEST, WEB_MANIFEST,
-                 KNOWLEDGE_MANIFEST, PC_MANIFEST)
+                 KNOWLEDGE_MANIFEST, FILES_MANIFEST, PC_MANIFEST)
 
 # Every capability the first-party skills can ask for — the sample
 # allowances a fully-permitted owner turn would carry.
 ALL_PERMISSIONS = frozenset({
     "clock.read", "memory.read", "memory.write", "net.outbound",
-    "pc.control", "knowledge.read",
+    "pc.control", "knowledge.read", "files.read", "files.write",
 })
 
 
@@ -398,6 +536,11 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
                                          "web_fetch": op_web_fetch})
     registry.register(KNOWLEDGE_MANIFEST,
                       ops={"knowledge_search": op_knowledge_search})
+    registry.register(FILES_MANIFEST,
+                      ops={"list_files": op_list_files,
+                           "read_file": op_read_file,
+                           "search_files": op_search_files,
+                           "write_file": op_write_file})
     registry.register(PC_MANIFEST, ops={"open_app": op_open_app})
     for manifest in ALL_MANIFESTS:
         registry.approve(manifest["name"])

@@ -73,6 +73,9 @@ DEFAULT_ALLOWANCES = frozenset({
     "net.outbound",
     "pc.control",
     "knowledge.read",
+    "files.read",
+    "files.write",
+    "system.diagnose",
 })
 
 
@@ -108,6 +111,115 @@ REMINDER_MANIFEST = {
         },
     ],
 }
+
+DIAGNOSE_MANIFEST = {
+    "name": "core.diagnose",
+    "version": "1.0.0",
+    "tools": [{
+        "name": "diagnose",
+        "op": "diagnose",
+        "permission": "system.diagnose",
+        "schema": {"type": "object", "properties": {},
+                   "additionalProperties": False},
+    }],
+}
+
+
+def _diagnose_op(data_dir: Path, secrets):
+    """Self-diagnosis from JARVIS's own records — no guessing: the
+    preflight health checks, the persisted goodput ledger (which
+    brains answered, which never did), the keys on file, and the
+    journal's recent errors, distilled into plain findings. The brain
+    calls this when things keep failing or the owner asks what is
+    wrong; the owner never runs a diagnostic command himself."""
+    data = Path(data_dir)
+
+    def diagnose():
+        from . import preflight
+        root = Path(__file__).resolve().parent.parent
+        checks = preflight.run_checks(root=root, data_dir=data)
+        failed = [{"check": c["name"], "detail": c["detail"],
+                   "fix": c.get("next_fix", "")}
+                  for c in checks if not c["ok"]]
+
+        providers = {}
+        gp_path = data / "goodput.jsonl"
+        if gp_path.exists():
+            try:
+                for line in gp_path.read_text(
+                        encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    slot = providers.setdefault(
+                        str(row["provider"]),
+                        {"attempts": 0, "answered": 0})
+                    slot["attempts"] += 1
+                    if row.get("ok"):
+                        slot["answered"] += 1
+            except Exception:
+                providers = {}
+
+        keys_filed = {}
+        try:
+            keys_filed = _load_keys_module().list_keys(secrets)
+        except Exception:
+            keys_filed = {}
+
+        recent_errors = []
+        journal_path = data / "journal.jsonl"
+        if journal_path.exists():
+            try:
+                lines = journal_path.read_text(
+                    encoding="utf-8").splitlines()[-300:]
+                for line in lines:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    payload = rec.get("payload") or {}
+                    if isinstance(payload, dict) and payload.get("error"):
+                        recent_errors.append({
+                            "kind": rec.get("kind"),
+                            "error": str(payload["error"])[:200]})
+                recent_errors = recent_errors[-8:]
+            except Exception:
+                recent_errors = []
+
+        findings = []
+        for name, slot in sorted(providers.items()):
+            if name == "stub":
+                continue
+            if slot["attempts"] >= 3 and slot["answered"] == 0:
+                findings.append(
+                    f"{name} ko {slot['attempts']} baar bulaya gaya, "
+                    "ek bhi jawab nahi aaya — ye dimag abhi kaam nahi "
+                    "kar raha (model/server/key ki kharabi ho sakti hai).")
+        if providers.get("stub", {}).get("answered", 0) > 0 and \
+                not any(s["answered"] for n, s in providers.items()
+                        if n != "stub"):
+            findings.append(
+                "Aakhri jawab nakli stub dimag se aaye — koi asli "
+                "dimag pahuch me nahi tha.")
+        if not keys_filed:
+            findings.append(
+                "Koi cloud key lagi hi nahi hai — dimag sirf offline "
+                "aur keyless backup par hai. /key se ek key lagane se "
+                "sabse tez dimag jud jayega.")
+        for item in failed:
+            if "Ollama" in item["check"] and "not" in item["detail"]:
+                findings.append(
+                    "Ollama band hai ya chal nahi raha — offline dimag "
+                    "uplabdh nahi hai.")
+        if not findings:
+            findings.append(
+                "Koi badi kharabi nahi mili — sab systems apne record "
+                "ke hisaab se theek hain.")
+        return {"checks_failed": failed, "providers": providers,
+                "keys_filed": keys_filed,
+                "recent_errors": recent_errors, "findings": findings}
+
+    return diagnose
 
 
 def _reminder_ops(data_dir: Path):
@@ -572,6 +684,15 @@ def build_app(data_dir, *, chain=None, modules=None,
             registry.approve(REMINDER_MANIFEST["name"])
         except Exception as exc:  # a sibling got there first, etc.
             journal.append("chat.reminder_skill_skipped",
+                           {"error": f"{type(exc).__name__}: {exc}"})
+    if hasattr(registry, "register") and hasattr(registry, "approve"):
+        try:
+            registry.register(DIAGNOSE_MANIFEST,
+                              ops={"diagnose": _diagnose_op(data_dir,
+                                                            secrets)})
+            registry.approve(DIAGNOSE_MANIFEST["name"])
+        except Exception as exc:  # a sibling got there first, etc.
+            journal.append("chat.diagnose_skill_skipped",
                            {"error": f"{type(exc).__name__}: {exc}"})
 
     goodput = GoodputLedger()
