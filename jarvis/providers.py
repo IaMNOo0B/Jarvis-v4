@@ -427,6 +427,215 @@ class CompatProvider(_HTTPProvider):
                              usage=dict(usage), provider=self.name)
 
 
+# ---------------------------------------------------------------------------
+# Native Gemini (the Mark-LVI lesson, 2026-10-21)
+#
+# The repo the owner sent (FatihMakes/Mark-LVI) talks to Google AI
+# Studio through Gemini's NATIVE REST dialect — POST
+# /v1beta/models/<model>:generateContent with an x-goog-api-key
+# header, the system prompt carried as systemInstruction, tools as
+# functionDeclarations — never through the OpenAI-shaped detour v4
+# used before. And when a model fails it does not give up: it walks
+# a MODEL LADDER, resting each failed rung by error class (429 ->
+# 5 min, 403/404 -> 6 h, 503/504 -> 30 min). Both ideas are
+# implemented here in stdlib only (no google-genai SDK dependency).
+# ---------------------------------------------------------------------------
+
+GEMINI_MODEL_LADDER = ("gemini-2.5-flash", "gemini-2.5-flash-lite",
+                       "gemini-2.0-flash", "gemini-flash-latest")
+
+_GEMINI_REST_S = {429: 300.0, 403: 6 * 3600.0, 404: 6 * 3600.0,
+                  503: 30 * 60.0, 504: 30 * 60.0}
+
+
+def _gemini_schema(node):
+    """OpenAI-flavoured JSON schema -> Gemini's dialect (uppercase
+    types, only the keys Gemini accepts)."""
+    if not isinstance(node, Mapping):
+        return {"type": "OBJECT", "properties": {}}
+    out: Dict[str, Any] = {}
+    typ = node.get("type")
+    if typ:
+        out["type"] = str(typ).upper()
+    if node.get("description"):
+        out["description"] = str(node["description"])
+    props = node.get("properties")
+    if isinstance(props, Mapping):
+        out["properties"] = {str(k): _gemini_schema(v)
+                             for k, v in props.items()}
+    if isinstance(node.get("items"), Mapping):
+        out["items"] = _gemini_schema(node["items"])
+    if node.get("required"):
+        out["required"] = [str(r) for r in node["required"]]
+    if node.get("enum"):
+        out["enum"] = [str(e) for e in node["enum"]]
+    if "type" not in out:
+        out["type"] = "OBJECT"
+    return out
+
+
+def _message_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, (list, tuple)):
+        parts = []
+        for item in content:
+            if isinstance(item, Mapping):
+                parts.append(str(item.get("text") or ""))
+            else:
+                parts.append(str(item))
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _gemini_payload(messages, tools):
+    """OpenAI-shaped conversation -> Gemini generateContent body."""
+    system_texts: List[str] = []
+    contents: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, Mapping):
+            continue
+        role = str(msg.get("role") or "user")
+        if role in ("system", "developer"):
+            text = _message_text(msg.get("content"))
+            if text:
+                system_texts.append(text)
+            continue
+        if role in ("tool", "function"):
+            contents.append({
+                "role": "user",
+                "parts": [{"functionResponse": {
+                    "name": str(msg.get("name") or "tool"),
+                    "response": {"result":
+                                 _message_text(msg.get("content"))}}}]})
+            continue
+        parts: List[Dict[str, Any]] = []
+        text = _message_text(msg.get("content"))
+        if text:
+            parts.append({"text": text})
+        if role == "assistant":
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, Mapping):
+                    fn = call.get("function") or call
+                    args = fn.get("arguments")
+                    if isinstance(args, str):
+                        args = _parse_arguments(args)
+                    parts.append({"functionCall": {
+                        "name": str(fn.get("name") or ""),
+                        "args": args or {}}})
+        contents.append({"role": "model" if role == "assistant"
+                         else "user",
+                         "parts": parts or [{"text": ""}]})
+    payload: Dict[str, Any] = {"contents": contents}
+    if system_texts:
+        payload["systemInstruction"] = {
+            "parts": [{"text": "\n\n".join(system_texts)}]}
+    if tools:
+        decls = []
+        for tool in tools:
+            if not isinstance(tool, Mapping):
+                continue
+            fn = tool.get("function") or tool
+            name = str(fn.get("name") or tool.get("name") or "")
+            if not name:
+                continue
+            decls.append({
+                "name": name,
+                "description": str(fn.get("description")
+                                   or tool.get("description") or ""),
+                "parameters": _gemini_schema(
+                    fn.get("parameters") or tool.get("schema")
+                    or {"type": "object"})})
+        if decls:
+            payload["tools"] = [{"functionDeclarations": decls}]
+    return payload
+
+
+class GeminiProvider(_HTTPProvider):
+    """Google AI Studio over the native generateContent API, with
+    Mark-LVI's model ladder: a failed rung rests (429 -> 5 min,
+    403/404 -> 6 h, 503/504 -> 30 min) and the next model answers."""
+
+    name = "gemini"
+
+    def __init__(self, api_key: str,
+                 models: Sequence[str] = GEMINI_MODEL_LADDER,
+                 base_url: str = "https://generativelanguage.googleapis.com",
+                 timeout: float = 60.0,
+                 transport: Optional[Transport] = None,
+                 clock: Callable[[], float] = time.monotonic):
+        super().__init__(transport)
+        self.api_key = api_key
+        self.models = [str(m) for m in models if m] \
+            or list(GEMINI_MODEL_LADDER)
+        self.model = self.models[0]
+        self.base_url = base_url.rstrip("/")
+        self.timeout = float(timeout)
+        self._clock = clock
+        self._rested_until: Dict[str, float] = {}
+
+    def _rungs(self) -> List[str]:
+        now = self._clock()
+        live = [m for m in self.models
+                if self._rested_until.get(m, 0.0) <= now]
+        return live or list(self.models)  # all resting -> try anyway
+
+    def complete(self, messages, tools=None) -> ProviderReply:
+        payload = _gemini_payload(messages, tools)
+        last_error: Optional[ProviderError] = None
+        for model in self._rungs():
+            url = (f"{self.base_url}/v1beta/models/{model}"
+                   ":generateContent")
+            try:
+                data = self._post_json(
+                    url, payload,
+                    headers={"x-goog-api-key": self.api_key})
+            except ProviderHTTPError as e:
+                rest = _GEMINI_REST_S.get(e.status)
+                if rest:
+                    self._rested_until[model] = self._clock() + rest
+                last_error = e
+                continue
+            return self._reply(data, model)
+        raise last_error or ProviderDown("gemini: no model answered")
+
+    @staticmethod
+    def _reply(data: Dict[str, Any], model: str) -> ProviderReply:
+        candidates = data.get("candidates") or []
+        if not candidates:
+            feedback = data.get("promptFeedback") or {}
+            raise ProviderDown(
+                "gemini: reply had no candidates "
+                f"({feedback.get('blockReason', 'unknown reason')})")
+        parts = ((candidates[0].get("content") or {}).get("parts")
+                 or [])
+        texts: List[str] = []
+        calls: List[ToolCall] = []
+        for i, part in enumerate(parts):
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("text"):
+                texts.append(str(part["text"]))
+            fn = part.get("functionCall")
+            if isinstance(fn, Mapping):
+                calls.append(ToolCall(
+                    id=f"gemini-{i}",
+                    name=str(fn.get("name", "")),
+                    arguments=fn.get("args") or {}))
+        usage = {}
+        meta = data.get("usageMetadata") or {}
+        if "promptTokenCount" in meta:
+            usage["prompt_tokens"] = meta["promptTokenCount"]
+        if "candidatesTokenCount" in meta:
+            usage["completion_tokens"] = meta["candidatesTokenCount"]
+        return ProviderReply(text="\n".join(texts), tool_calls=calls,
+                             model=str(data.get("modelVersion")
+                                       or model),
+                             usage=usage, provider="gemini")
+
+
 class PollinationsProvider(CompatProvider):
     """Keyless last resort — clearly the weakest brain in the chain
     (it failed 9/10 real-prompt turns in v2's reality test). Present so
@@ -556,6 +765,20 @@ def build_chain(config: Any = None, secrets: Any = None,
         if not key:
             continue  # no key -> not in the chain at all
         override = _cfg(config, "providers_config", preset.name, default={})
+        if preset.name == "gemini":
+            # Native Gemini API + model ladder (the Mark-LVI lesson) —
+            # never the OpenAI-shaped detour for an AI Studio key.
+            primary = str(_cfg(override, "model",
+                               default=preset.model))
+            ladder = [primary] + [m for m in GEMINI_MODEL_LADDER
+                                   if m != primary]
+            chain.append(GeminiProvider(
+                api_key=key, models=ladder,
+                timeout=float(timeouts.get(
+                    preset.name,
+                    _cfg(override, "timeout", default=preset.timeout))),
+                transport=transport))
+            continue
         chain.append(CompatProvider(
             name=preset.name,
             base_url=str(_cfg(override, "base_url", default=preset.base_url)),
@@ -625,6 +848,7 @@ __all__ = [
     "ProviderError", "ProviderTimeout", "ProviderHTTPError", "ProviderDown",
     "ChainExhaustedError", "ToolCall", "ProviderReply", "Preset", "PRESETS",
     "Transport", "urllib_transport", "OllamaProvider", "CompatProvider",
+    "GeminiProvider", "GEMINI_MODEL_LADDER",
     "PollinationsProvider", "StubProvider", "FallbackChain",
     "build_chain", "build_fallback_chain",
 ]
