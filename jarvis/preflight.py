@@ -137,21 +137,36 @@ def _probe_writable(folder):
 
 
 def check_data_dir(data_dir):
-    """Required: data folder exists AND is writable (memory/settings live there)."""
+    """Required: data folder usable AND writable (memory/settings live there).
+
+    A missing folder is CREATED on the spot — it is JARVIS's own folder
+    and a GitHub ZIP cannot carry an empty directory, so a fresh
+    download always lacks it. Blocking the owner over a folder JARVIS
+    can make itself was a real first-run failure (2026-10-21); creation
+    only fails the check when the folder truly cannot be made/written.
+    """
     data_dir = Path(data_dir)
     why = (
         "The data folder holds JARVIS's memory, settings and keys. "
         "If JARVIS cannot write there, it forgets everything between runs."
     )
+    created = False
     if not data_dir.is_dir():
-        return _result(
-            "Data folder",
-            LEVEL_REQUIRED,
-            False,
-            f"data folder not found at {data_dir}",
-            why,
-            FIX_DATA_MISSING,
-        )
+        try:
+            data_dir.mkdir(parents=True, exist_ok=True)
+            created = data_dir.is_dir()
+        except OSError:
+            created = False
+        if not created:
+            return _result(
+                "Data folder",
+                LEVEL_REQUIRED,
+                False,
+                f"data folder not found at {data_dir} and JARVIS "
+                "could not create it",
+                why,
+                FIX_DATA_MISSING,
+            )
     if not _probe_writable(data_dir):
         return _result(
             "Data folder",
@@ -161,11 +176,12 @@ def check_data_dir(data_dir):
             why,
             FIX_DATA_UNWRITABLE,
         )
+    note = " (created it just now — it was missing)" if created else ""
     return _result(
         "Data folder",
         LEVEL_REQUIRED,
         True,
-        f"data folder ready and writable at {data_dir}",
+        f"data folder ready and writable at {data_dir}{note}",
         why,
     )
 

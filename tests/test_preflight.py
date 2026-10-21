@@ -77,11 +77,13 @@ class TestDataDir:
         assert r["ok"] is True
         assert not list(d.iterdir())  # probe file was cleaned up
 
-    def test_missing_fails_with_setup_fix(self, tmp_path):
-        r = check_data_dir(tmp_path / "data")
-        assert r["ok"] is False
-        assert r["level"] == LEVEL_REQUIRED
-        assert "setup.bat" in r["next_fix"]
+    def test_missing_folder_is_created_and_passes(self, tmp_path):
+        # A fresh GitHub ZIP has no data/ folder — JARVIS makes its
+        # own instead of blocking the owner (real failure, 2026-10-21).
+        target = tmp_path / "data"
+        r = check_data_dir(target)
+        assert r["ok"] is True
+        assert target.is_dir()
 
     def test_path_is_a_file_fails(self, tmp_path):
         f = tmp_path / "data"
@@ -135,7 +137,7 @@ class TestRunChecksAndExitCode:
         assert all(r["level"] == LEVEL_OPTIONAL for r in failed)
         assert exit_code(results) == 0
 
-    def test_missing_data_dir_blocks_with_fix(self, tmp_path):
+    def test_missing_data_dir_is_created_not_blocking(self, tmp_path):
         (tmp_path / "jarvis").mkdir()
         (tmp_path / "jarvis" / "__init__.py").write_text("", encoding="utf-8")
         results = run_checks(
@@ -143,10 +145,10 @@ class TestRunChecksAndExitCode:
             ollama_probe=lambda: (True, "up"),
             spec_finder=lambda module: True,
         )
-        assert exit_code(results) == 1
+        assert exit_code(results) == 0
         data_check = _by_name(results, "Data folder")
-        assert data_check["ok"] is False
-        assert "setup.bat" in data_check["next_fix"]
+        assert data_check["ok"] is True
+        assert (tmp_path / "data").is_dir()
 
     def test_old_python_blocks(self, good_root):
         results = run_checks(
