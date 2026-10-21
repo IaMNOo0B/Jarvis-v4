@@ -192,6 +192,48 @@ def _build_chain(providers_mod, config, secrets, goodput):
     return providers_mod.FallbackChain(built, ledger=goodput)
 
 
+def _load_keys_module():
+    """jarvis.keys, or None when this build cannot file keys."""
+    try:
+        from jarvis import keys as keys_mod
+        return keys_mod
+    except Exception:
+        return None
+
+
+class _ChainSecrets:
+    """What the provider chain sees when it asks for a provider's key.
+
+    Keys filed through /key live under llm:<provider>:<n> and are read
+    back through jarvis.keys.get_keys — the provider layer's one
+    deliberate value exit-point. Plain-named secrets (the config /
+    custom-provider path) still resolve through the store itself.
+    Without this adapter the chain asked the store for a secret
+    literally named after the provider, never found the filed keys,
+    and silently ran keyless.
+    """
+
+    def __init__(self, store):
+        self._store = store
+
+    def _lookup(self, name):
+        keys_mod = _load_keys_module()
+        if keys_mod is not None:
+            try:
+                values = keys_mod.get_keys(self._store, name)
+            except Exception:
+                values = []
+            if values:
+                return values
+        return self._store.get(name)
+
+    def get(self, name):
+        return self._lookup(name)
+
+    def get_key(self, name):
+        return self._lookup(name)
+
+
 class _BrainChainAdapter:
     """Reply-shape glue between providers and brain.
 
@@ -356,7 +398,7 @@ def build_app(data_dir, *, chain=None, modules=None,
 
     if chain is None:
         chain = _build_chain(_resolve_module(modules, "providers"),
-                             config, secrets, goodput)
+                             config, _ChainSecrets(secrets), goodput)
     chain = _BrainChainAdapter(chain)
 
     skills_mod = _resolve_module(modules, "skills")
@@ -444,6 +486,37 @@ class ChatApp:
                 return "Nothing to store, sir."
             self.memory.learn(fact, source="owner")
             return f"Yaad rakh liya, sir: {fact}"
+        if text == "/keys":
+            keys_mod = _load_keys_module()
+            if keys_mod is None:
+                return "Key support is unavailable in this build, sir."
+            counts = keys_mod.list_keys(self.secrets)
+            if not counts:
+                return ("No provider keys stored yet, sir. "
+                        "Add one with /key <key>.")
+            lines = ["Stored provider keys, sir:"]
+            for name in sorted(counts):
+                lines.append(f"- {name}: {counts[name]}")
+            return "\n".join(lines)
+        if text == "/key" or text.startswith("/key "):
+            keys_mod = _load_keys_module()
+            if keys_mod is None:
+                return "Key support is unavailable in this build, sir."
+            rest = text[len("/key"):].strip()
+            if not rest:
+                return ("Usage, sir: /key <key> — or /key <provider> "
+                        "<key> when the key's shape is ambiguous.")
+            parts = rest.split(None, 1)
+            provider = None
+            raw = rest
+            if len(parts) == 2:
+                provider, raw = parts
+            try:
+                saved = keys_mod.add_key(self.secrets, raw, provider)
+            except keys_mod.KeysError as exc:
+                return f"That key was not stored, sir: {exc}"
+            return (f"Key stored for {saved}, sir. Restart JARVIS and "
+                    "it joins the brain chain.")
         return f"Unknown command, sir: {text.split()[0] if text else ''}"
 
     # -- the turn -----------------------------------------------------------

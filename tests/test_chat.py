@@ -106,3 +106,47 @@ def test_cli_once(tmp_path):
         cwd=REPO_ROOT, capture_output=True, text=True, timeout=120)
     assert proc.returncode == 0
     assert "sir" in proc.stdout
+
+
+# -- /key wiring (the command must exist AND the filed key must reach
+#    the provider chain — both halves were missing once) ---------------
+
+_DUMMY_OR_KEY = "sk-or-v1-dummytestkey0000000000000000"
+
+
+def test_key_command_stores_and_lists_names_only(app):
+    reply = app.handle_command(f"/key {_DUMMY_OR_KEY}")
+    assert "openrouter" in reply
+    assert _DUMMY_OR_KEY not in reply
+    listing = app.handle_command("/keys")
+    assert "openrouter" in listing
+    assert _DUMMY_OR_KEY not in listing
+
+
+def test_keys_command_empty_state(app):
+    assert "No provider keys stored yet" in app.handle_command("/keys")
+
+
+def test_key_command_rejects_github_token(app):
+    reply = app.handle_command("/key ghp_" + "x" * 36)
+    assert "not stored" in reply
+    assert "No provider keys stored yet" in app.handle_command("/keys")
+
+
+def test_key_command_explicit_provider_for_ambiguous_shape(app):
+    reply = app.handle_command("/key openrouter sk-plaindummy000000000000")
+    assert "openrouter" in reply
+    assert "openrouter" in app.handle_command("/keys")
+
+
+def test_key_command_without_argument_shows_usage(app):
+    assert "Usage" in app.handle_command("/key")
+
+
+def test_filed_key_joins_chain_on_rebuild(tmp_path):
+    data = tmp_path / "data"
+    first = ChatApp(data, chain=CountingChain())
+    first.handle_command(f"/key {_DUMMY_OR_KEY}")
+    rebuilt = ChatApp(data)
+    names = [p.name for p in rebuilt.chain.inner.providers]
+    assert "openrouter" in names
