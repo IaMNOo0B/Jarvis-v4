@@ -548,6 +548,15 @@ class ChatApp:
 
         self.journal.append("assistant.reply", {
             "text": reply, "via": via, "provider": self.last_provider})
+        # The goodput ledger is the diagnostic record (which brain
+        # answered, which failed, why). It used to be loaded at startup
+        # but NEVER saved, so data/goodput.jsonl simply never existed
+        # on the owner's PC — persist it after every turn, silently:
+        # a failed save must never break the conversation.
+        try:
+            self.goodput.save_jsonl(self.data_dir / "goodput.jsonl")
+        except Exception:
+            pass
         self.memory.note_turn("assistant", reply)
         self.history.append({"role": "user", "content": text})
         self.history.append({"role": "assistant", "content": reply})

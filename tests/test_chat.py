@@ -150,3 +150,17 @@ def test_filed_key_joins_chain_on_rebuild(tmp_path):
     rebuilt = ChatApp(data)
     names = [p.name for p in rebuilt.chain.inner.providers]
     assert "openrouter" in names
+
+
+def test_goodput_ledger_is_saved_after_a_turn(tmp_path):
+    """Regression: the ledger was loaded at startup but never saved,
+    so data/goodput.jsonl never existed on the owner's PC. Any turn —
+    even a fast-path one — must leave the ledger's rows on disk."""
+    data = tmp_path / "data"
+    app = ChatApp(data, chain=CountingChain())
+    app.goodput.record("ollama", 12.0, False, False)
+    app.turn("what time is it right now?")
+    saved = data / "goodput.jsonl"
+    assert saved.exists()
+    rows = [line for line in saved.read_text().splitlines() if line.strip()]
+    assert rows and "ollama" in rows[0]
