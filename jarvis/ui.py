@@ -21,7 +21,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-from .chat import DEFAULT_DATA_DIR, ChatApp
+from .chat import DEFAULT_DATA_DIR, ChatApp, _maybe_auto_watch
 
 PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -262,6 +262,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     app = ChatApp(Path(args.data_dir))
+    _maybe_auto_watch(app)
     server = build_server(app, port=args.port)
     url = f"http://127.0.0.1:{args.port}/"
     print(f"JARVIS UI — {url}")

@@ -50,6 +50,8 @@ import json
 import os
 import re
 import sys
+import threading
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -77,6 +79,7 @@ DEFAULT_ALLOWANCES = frozenset({
     "files.write",
     "system.diagnose",
     "code.run",
+    "self.upgrade",
 })
 
 
@@ -724,6 +727,294 @@ class AppParts:
     brain: object
     dispatch: object
     allowances: frozenset
+    learned: object = None
+
+
+UPGRADE_MANIFEST = {
+    "name": "core.upgrade",
+    "version": "1.0.0",
+    "tools": [
+        {
+            "name": "watch_for_upgrades",
+            "op": "watch_for_upgrades",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"topics": {
+                           "type": "array",
+                           "items": {"type": "string"}}},
+                       "additionalProperties": False},
+        },
+        {
+            "name": "propose_skill",
+            "op": "propose_skill",
+            "permission": "self.upgrade",
+            "schema": {"type": "object",
+                       "properties": {
+                           "name": {"type": "string", "minLength": 1},
+                           "manifest": {"type": "object"},
+                           "code": {"type": "string", "minLength": 1}},
+                       "required": ["name", "manifest", "code"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "upgrade_report",
+            "op": "upgrade_report",
+            "permission": "system.diagnose",
+            "schema": {"type": "object", "properties": {},
+                       "additionalProperties": False},
+        },
+    ],
+}
+
+DEFAULT_WATCH_TOPICS = [
+    "new open source local LLM models",
+    "open source text to speech voices new",
+    "wake word detection open source",
+    "AI agent frameworks new tools release",
+    "whisper speech recognition improvements",
+]
+
+
+def _upgrade_log_path(data_dir) -> Path:
+    return Path(data_dir) / "upgrades.jsonl"
+
+
+def _read_upgrade_log(data_dir) -> list:
+    path = _upgrade_log_path(data_dir)
+    rows = []
+    if path.exists():
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    rows.append(json.loads(line))
+        except Exception:
+            return []
+    return rows
+
+
+def _append_upgrade_log(data_dir, row: dict) -> None:
+    try:
+        with _upgrade_log_path(data_dir).open("a",
+                                              encoding="utf-8") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _watch_cycle(learned: LearnedStore, data_dir, topics=None) -> dict:
+    """One market-watch cycle (the owner's standing self-upgrade
+    order): search his world's topics, keep only what is NEW, log it,
+    and learn it — findings land in the inbox and become knowledge."""
+    from . import builtin_skills as bs
+    topics = list(topics) if topics else list(DEFAULT_WATCH_TOPICS)
+    rows = _read_upgrade_log(data_dir)
+    seen = {r.get("url") for r in rows if r.get("type") == "watch"}
+    new, errors = [], []
+    for topic in topics:
+        found = bs.op_web_search(str(topic), limit=5)
+        if "error" in found:
+            errors.append(found["error"])
+            continue
+        for hit in found.get("results", []):
+            if hit["url"] not in seen:
+                seen.add(hit["url"])
+                new.append({"topic": str(topic),
+                            "title": hit["title"], "url": hit["url"]})
+    ts = time.time()
+    for item in new:
+        _append_upgrade_log(data_dir, {"type": "watch", "ts": ts,
+                                       **item})
+    _append_upgrade_log(data_dir, {"type": "watch_run", "ts": ts,
+                                   "found": len(new)})
+    learned_as = None
+    if new:
+        lines = ["# Upgrade watch — nayi cheezein jo mili", ""]
+        for item in new:
+            lines.append(f"- [{item['topic']}] {item['title']} — "
+                         f"{item['url']}")
+        learned_as = learned.add_document(
+            "\n".join(lines), title="upgrade-watch")["learned_from"]
+    return {"new_findings": new, "count": len(new),
+            "topics_checked": len(topics),
+            "search_errors": errors[:1], "learned_as": learned_as,
+            "note": "nayi findings inbox me seekh li gayi hain; "
+                    "jo kaam ki lage, propose_skill se JARVIS khud "
+                    "me naya skill laga sakta hai"}
+
+
+def _upgrade_ops(learned: LearnedStore, data_dir, journal, registry,
+                 allowances):
+    data = Path(data_dir)
+
+    def watch_for_upgrades(topics=None):
+        return _watch_cycle(learned, data, topics)
+
+    def propose_skill(name: str, manifest: dict, code: str):
+        """Self-improvement with the quality gate the owner accepted:
+        the candidate skill is staged, its code is imported in the
+        scrubbed sandbox (never in-process), its manifest must pass
+        the registry's own validation, its OPS must match the
+        manifest, and its tool names must not clash with live tools.
+        Pass everything -> promoted AUTOMATICALLY (his standing
+        order: no asking, no restrictions); fail anything -> it
+        stays staged with the reason recorded. Live next start."""
+        from . import builtin_skills as bs
+        from .skills import SkillRegistry, SkillError
+        slug = re.sub(r"[^A-Za-z0-9_-]+", "-",
+                      str(name)).strip("-").lower() or "skill"
+        staging = data / "upgrades" / "pending" / slug
+        staging.mkdir(parents=True, exist_ok=True)
+        (staging / "skill.py").write_text(str(code), encoding="utf-8")
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+
+        def reject(stage: str, reason: str) -> dict:
+            journal.append("upgrade.rejected", {
+                "skill": str(name), "stage": stage, "reason": reason})
+            _append_upgrade_log(data, {
+                "type": "rejected", "ts": time.time(),
+                "skill": str(name), "stage": stage, "reason": reason})
+            return {"promoted": False, "stage": stage,
+                    "reason": reason, "kept_in": str(staging),
+                    "note": "skill live nahi hua — wajah upar hai; "
+                            "code staging me rakha hai"}
+
+        harness = (
+            "import importlib.util, json\n"
+            "spec = importlib.util.spec_from_file_location("
+            "'candidate', 'skill.py')\n"
+            "mod = importlib.util.module_from_spec(spec)\n"
+            "spec.loader.exec_module(mod)\n"
+            "print(json.dumps(sorted(getattr(mod, 'OPS', {}))))\n")
+        run = bs.op_run_code(harness, cwd=str(staging), timeout=30)
+        if not run.get("ok"):
+            return reject("import", (run.get("stderr") or
+                                     run.get("error") or
+                                     "import failed")[-400:])
+        try:
+            ops_keys = set(json.loads(run["stdout"].strip()
+                                      .splitlines()[-1]))
+        except Exception:
+            return reject("import", "OPS list padhi nahi ja saki")
+        try:
+            manifest_ops = {t["op"] for t in manifest["tools"]}
+            tool_names = [t["name"] for t in manifest["tools"]]
+        except Exception as exc:
+            return reject("manifest", f"manifest shape: {exc}")
+        if ops_keys != manifest_ops:
+            return reject("ops", f"code ke OPS {sorted(ops_keys)} "
+                                 f"manifest ke ops "
+                                 f"{sorted(manifest_ops)} se match "
+                                 "nahi karte")
+        try:
+            SkillRegistry().register(
+                manifest, ops={k: (lambda: None) for k in ops_keys})
+        except SkillError as exc:
+            return reject("manifest", str(exc))
+        live = {t["name"] for t in
+                registry.advertised_tools(allowances)}
+        clash = [n for n in tool_names if n in live]
+        if clash:
+            return reject("clash", f"ye tools pehle se live hain: "
+                                   f"{clash}")
+        dest = data / "skills_live" / slug
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "skill.py").write_text(str(code), encoding="utf-8")
+        (dest / "manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        journal.append("upgrade.promoted", {
+            "skill": manifest.get("name"), "slug": slug,
+            "tools": tool_names})
+        _append_upgrade_log(data, {
+            "type": "promoted", "ts": time.time(),
+            "skill": manifest.get("name"), "tools": tool_names})
+        return {"promoted": True, "skill": manifest.get("name"),
+                "tools": tool_names,
+                "checks_passed": ["sandbox import", "ops match",
+                                  "manifest valid", "no tool clash"],
+                "available": "agle start se ye skill live hogi"}
+
+    def upgrade_report():
+        rows = _read_upgrade_log(data)
+        live_dir = data / "skills_live"
+        live = sorted(p.name for p in live_dir.iterdir()
+                      if p.is_dir()) if live_dir.exists() else []
+        pending_dir = data / "upgrades" / "pending"
+        pending = sorted(p.name for p in pending_dir.iterdir()
+                         if p.is_dir()) if pending_dir.exists() else []
+        last_watch = None
+        for row in rows:
+            if row.get("type") == "watch_run":
+                last_watch = row.get("ts")
+        return {
+            "watch_findings_total":
+                sum(1 for r in rows if r.get("type") == "watch"),
+            "last_watch_at": last_watch,
+            "promoted_skills":
+                [r.get("skill") for r in rows
+                 if r.get("type") == "promoted"],
+            "rejected":
+                [{"skill": r.get("skill"), "stage": r.get("stage")}
+                 for r in rows if r.get("type") == "rejected"][-5:],
+            "live_skill_folders": live, "pending_skills": pending}
+
+    return {"watch_for_upgrades": watch_for_upgrades,
+            "propose_skill": propose_skill,
+            "upgrade_report": upgrade_report}
+
+
+def _load_live_skills(registry, data_dir, journal) -> None:
+    """Register skills JARVIS promoted for itself (data/skills_live).
+    Each one passed the propose_skill gate when it was promoted;
+    anything malformed is skipped and journaled, never fatal."""
+    import importlib.util
+    live_dir = Path(data_dir) / "skills_live"
+    if not live_dir.exists():
+        return
+    for folder in sorted(p for p in live_dir.iterdir() if p.is_dir()):
+        try:
+            manifest = json.loads((folder / "manifest.json")
+                                  .read_text(encoding="utf-8"))
+            module_name = str(manifest.get("module", "skill.py"))
+            spec = importlib.util.spec_from_file_location(
+                f"live_skill_{folder.name}", folder / module_name)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            ops = getattr(module, "OPS", None)
+            if not isinstance(ops, dict):
+                raise ValueError("skill module has no OPS dict")
+            registry.register(manifest, ops=ops)
+            registry.approve(manifest["name"])
+            journal.append("upgrade.live_skill_loaded",
+                           {"skill": manifest["name"],
+                            "folder": folder.name})
+        except Exception as exc:
+            journal.append("upgrade.live_skill_skipped", {
+                "folder": folder.name,
+                "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _maybe_auto_watch(app) -> None:
+    """The standing order, running itself: when JARVIS starts (CLI
+    or UI) and the last market watch is over ~20 hours old, one watch
+    cycle runs quietly in the background. Never blocks startup,
+    never raises."""
+    try:
+        rows = _read_upgrade_log(app.data_dir)
+        last = max((r.get("ts", 0) for r in rows
+                    if r.get("type") == "watch_run"), default=0)
+        if time.time() - last < 20 * 3600:
+            return
+        learned = app.parts.learned
+        if learned is None:
+            return
+        threading.Thread(target=_watch_cycle,
+                         args=(learned, app.data_dir),
+                         daemon=True).start()
+    except Exception:
+        pass
 
 
 def build_app(data_dir, *, chain=None, modules=None,
@@ -785,6 +1076,23 @@ def build_app(data_dir, *, chain=None, modules=None,
         except Exception as exc:  # a sibling got there first, etc.
             journal.append("chat.research_skill_skipped",
                            {"error": f"{type(exc).__name__}: {exc}"})
+    # Self-upgrade: skills JARVIS promoted for itself load first,
+    # then the upgrade tools themselves are registered.
+    try:
+        _load_live_skills(registry, data_dir, journal)
+    except Exception as exc:
+        journal.append("chat.live_skills_skipped",
+                       {"error": f"{type(exc).__name__}: {exc}"})
+    if hasattr(registry, "register") and hasattr(registry, "approve"):
+        try:
+            registry.register(UPGRADE_MANIFEST,
+                              ops=_upgrade_ops(learned, data_dir,
+                                               journal, registry,
+                                               allowances))
+            registry.approve(UPGRADE_MANIFEST["name"])
+        except Exception as exc:  # a sibling got there first, etc.
+            journal.append("chat.upgrade_skill_skipped",
+                           {"error": f"{type(exc).__name__}: {exc}"})
 
     goodput = GoodputLedger()
     goodput_path = data_dir / "goodput.jsonl"
@@ -816,7 +1124,8 @@ def build_app(data_dir, *, chain=None, modules=None,
     return AppParts(journal=journal, config=config, secrets=secrets,
                     goodput=goodput, chain=chain, registry=registry,
                     gate=gate, memory=memory, brain=brain,
-                    dispatch=dispatch, allowances=allowances)
+                    dispatch=dispatch, allowances=allowances,
+                    learned=learned)
 
 
 # --------------------------------------------------------------------------- #
@@ -1014,6 +1323,7 @@ def main(argv=None) -> int:
     if args.once is not None:
         print(app.turn(args.once))
         return 0
+    _maybe_auto_watch(app)
     print("JARVIS v4 — type 'exit' to quit.")
     while True:
         try:
