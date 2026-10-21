@@ -72,6 +72,7 @@ DEFAULT_ALLOWANCES = frozenset({
     "reminder.write",
     "net.outbound",
     "pc.control",
+    "knowledge.read",
 })
 
 

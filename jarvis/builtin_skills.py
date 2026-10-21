@@ -29,6 +29,7 @@ import sys
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from pathlib import Path
 
 from jarvis.skills import SkillRegistry
 
@@ -121,6 +122,118 @@ def op_web_search(query: str, limit: int = 5):
     return {"results": results}
 
 
+_SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>",
+                              re.IGNORECASE | re.DOTALL)
+_BLOCK_BREAK_RE = re.compile(r"<(br|/p|/div|/li|/tr|/h[1-6])[^>]*>",
+                             re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _html_to_text(page: str) -> str:
+    page = _SCRIPT_STYLE_RE.sub(" ", page)
+    page = _BLOCK_BREAK_RE.sub("\n", page)
+    text = html.unescape(_TAG_RE.sub(" ", page))
+    lines = [line.strip() for line in text.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def op_web_fetch(url: str, max_chars: int = 12000):
+    """Fetch one page and return its readable text — the 'open the
+    page and read it' half of internet access (web_search finds,
+    web_fetch reads). Honest errors, never a fabricated page."""
+    target = str(url).strip()
+    if not target.startswith(("http://", "https://")):
+        return {"error": "web_fetch failed: the address must start "
+                         "with http:// or https://"}
+    request = urllib.request.Request(
+        target, headers={"User-Agent": "JARVIS-v4/1.0 (stdlib urllib)"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            raw = response.read(2_000_000)
+            ctype = ""
+            if response.headers is not None:
+                ctype = response.headers.get_content_type() or ""
+    except Exception as exc:  # network down, blocked, timeout — say so
+        return {"error": f"web_fetch failed: {type(exc).__name__}: {exc}"}
+    text = raw.decode("utf-8", errors="replace")
+    if "html" in ctype or text.lstrip().startswith("<"):
+        text = _html_to_text(text)
+    text = text.strip()
+    return {"url": target, "text": text[:max_chars],
+            "truncated": len(text) > max_chars}
+
+
+# ----------------------------------------------------------------------
+# knowledge search — the shipped library (knowledge/) made reachable.
+# The folder sat in the repo unread for too long; this op indexes it
+# with the repo's own BM25 (jarvis.rag) and returns sourced excerpts.
+# ----------------------------------------------------------------------
+
+_KNOWLEDGE_CACHE: dict = {"stamp": None, "index": None, "docs": []}
+
+
+def _knowledge_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "knowledge"
+
+
+def _knowledge_index(root: Path):
+    from jarvis.rag import BM25Index
+
+    files = sorted(p for p in root.rglob("*")
+                   if p.is_file() and p.suffix.lower() in (".md", ".txt"))
+    stamp = tuple((str(p), p.stat().st_size, int(p.stat().st_mtime))
+                  for p in files)
+    if _KNOWLEDGE_CACHE["stamp"] == stamp and \
+            _KNOWLEDGE_CACHE["index"] is not None:
+        return _KNOWLEDGE_CACHE["index"], _KNOWLEDGE_CACHE["docs"]
+    docs = []
+    for path in files:
+        try:
+            docs.append((str(path.relative_to(root)),
+                         path.read_text(encoding="utf-8",
+                                        errors="replace")))
+        except OSError:
+            continue
+    index = BM25Index([text for _name, text in docs]) if docs else None
+    _KNOWLEDGE_CACHE.update({"stamp": stamp, "index": index,
+                             "docs": docs})
+    return index, docs
+
+
+def _excerpt(text: str, query: str, width: int = 600) -> str:
+    lowered = text.lower()
+    for term in re.findall(r"[a-z0-9]+", query.lower()):
+        at = lowered.find(term)
+        if at >= 0:
+            start = max(0, at - width // 3)
+            return text[start:start + width].strip()
+    return text[:width].strip()
+
+
+def op_knowledge_search(query: str, limit: int = 4):
+    """Search JARVIS's own knowledge library; sourced excerpts back."""
+    root = _knowledge_dir()
+    if not root.exists():
+        return {"error": "knowledge_search failed: no knowledge "
+                         "folder ships with this build", "results": []}
+    index, docs = _knowledge_index(root)
+    if index is None or not docs:
+        return {"error": "knowledge_search failed: the knowledge "
+                         "library is empty", "results": []}
+    results = []
+    for doc_idx, score in index.search(str(query), top_k=int(limit)):
+        if score <= 0:
+            continue
+        name, text = docs[doc_idx]
+        results.append({"source": name,
+                        "excerpt": _excerpt(text, str(query)),
+                        "score": round(float(score), 3)})
+    if not results:
+        return {"results": [],
+                "note": "nothing in the knowledge library matched"}
+    return {"results": results}
+
+
 def op_open_app(name: str):
     """Launch an application by name. Real on Windows; honest refusal
     (as a result, not an exception) where no driver exists."""
@@ -182,15 +295,45 @@ MEMORY_MANIFEST = {
 
 WEB_MANIFEST = {
     "name": "core.web",
+    "version": "1.1.0",
+    "tools": [
+        {
+            "name": "web_search",
+            "op": "web_search",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"query": {"type": "string", "minLength": 1},
+                                      "limit": {"type": "integer",
+                                                "minimum": 1, "maximum": 10}},
+                       "required": ["query"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "web_fetch",
+            "op": "web_fetch",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"url": {"type": "string", "minLength": 1},
+                                      "max_chars": {"type": "integer",
+                                                    "minimum": 500,
+                                                    "maximum": 40000}},
+                       "required": ["url"],
+                       "additionalProperties": False},
+        },
+    ],
+}
+
+KNOWLEDGE_MANIFEST = {
+    "name": "core.knowledge",
     "version": "1.0.0",
     "tools": [{
-        "name": "web_search",
-        "op": "web_search",
-        "permission": "net.outbound",
+        "name": "knowledge_search",
+        "op": "knowledge_search",
+        "permission": "knowledge.read",
         "schema": {"type": "object",
                    "properties": {"query": {"type": "string", "minLength": 1},
                                   "limit": {"type": "integer",
-                                            "minimum": 1, "maximum": 10}},
+                                            "minimum": 1, "maximum": 8}},
                    "required": ["query"],
                    "additionalProperties": False},
     }],
@@ -211,12 +354,14 @@ PC_MANIFEST = {
     }],
 }
 
-ALL_MANIFESTS = (TIME_MANIFEST, MEMORY_MANIFEST, WEB_MANIFEST, PC_MANIFEST)
+ALL_MANIFESTS = (TIME_MANIFEST, MEMORY_MANIFEST, WEB_MANIFEST,
+                 KNOWLEDGE_MANIFEST, PC_MANIFEST)
 
 # Every capability the first-party skills can ask for — the sample
 # allowances a fully-permitted owner turn would carry.
 ALL_PERMISSIONS = frozenset({
-    "clock.read", "memory.read", "memory.write", "net.outbound", "pc.control",
+    "clock.read", "memory.read", "memory.write", "net.outbound",
+    "pc.control", "knowledge.read",
 })
 
 
@@ -227,7 +372,10 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
     registry = SkillRegistry(gate=gate, journal=journal)
     registry.register(TIME_MANIFEST, ops={"time_now": op_time_now})
     registry.register(MEMORY_MANIFEST, ops=_memory_ops(memory))
-    registry.register(WEB_MANIFEST, ops={"web_search": op_web_search})
+    registry.register(WEB_MANIFEST, ops={"web_search": op_web_search,
+                                         "web_fetch": op_web_fetch})
+    registry.register(KNOWLEDGE_MANIFEST,
+                      ops={"knowledge_search": op_knowledge_search})
     registry.register(PC_MANIFEST, ops={"open_app": op_open_app})
     for manifest in ALL_MANIFESTS:
         registry.approve(manifest["name"])
