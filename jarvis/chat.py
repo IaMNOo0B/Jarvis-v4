@@ -815,6 +815,54 @@ class _LearnedMemory:
         return lines[:8]
 
 
+class Activity:
+    """What JARVIS is ACTUALLY doing right now — the UI's state word
+    reads this, never a script. The owner caught the first UI cycling
+    Listening/Thinking/Creating on a timer while nothing of the sort
+    was happening (2026-10-21) and ordered: jo dikhe, wahi ho raha ho.
+    States: standby (waiting), thinking (brain generating), researching
+    (a knowledge/net tool is executing), creating (a making tool is
+    executing), working (any other tool). Listening/Speaking do not
+    exist until the voice feature does — no fake states, ever."""
+
+    def __init__(self):
+        self.state = "standby"
+        self.tool = None
+
+    def set(self, state, tool=None):
+        self.state = state
+        self.tool = tool
+
+
+TOOL_STATES = {
+    "web_search": "researching", "web_fetch": "researching",
+    "deep_research": "researching", "knowledge_search": "researching",
+    "watch_for_upgrades": "researching", "upgrade_report": "researching",
+    "create_project": "creating", "run_code": "creating",
+    "write_file": "creating", "learn_text": "creating",
+    "propose_skill": "creating",
+}
+
+
+def state_for_tool(name) -> str:
+    return TOOL_STATES.get(str(name), "working")
+
+
+def _activity_dispatch(dispatch, activity):
+    """Wrap the gate-mediated dispatch so the activity tells the truth
+    while a tool executes, then returns to thinking (the brain is
+    generating again) when it finishes."""
+
+    def traced(name, args=None, origin="owner"):
+        activity.set(state_for_tool(name), tool=str(name))
+        try:
+            return dispatch(name, args, origin=origin)
+        finally:
+            activity.set("thinking")
+
+    return traced
+
+
 @dataclass
 class AppParts:
     journal: Journal
@@ -829,6 +877,7 @@ class AppParts:
     dispatch: object
     allowances: frozenset
     learned: object = None
+    activity: object = None
 
 
 UPGRADE_MANIFEST = {
@@ -1243,9 +1292,12 @@ def build_app(data_dir, *, chain=None, modules=None,
             and issubclass(refused_exc, BaseException)):
         refused_exc = ()
     pass_decision = skills_mod is not _defaults
-    dispatch = make_dispatch(gate, registry, journal, allowances,
-                             pass_decision=pass_decision,
-                             refused_exc=refused_exc)
+    activity = Activity()
+    dispatch = _activity_dispatch(
+        make_dispatch(gate, registry, journal, allowances,
+                      pass_decision=pass_decision,
+                      refused_exc=refused_exc),
+        activity)
     tool_schemas = registry.advertised_tools(allowances)
     brain = _resolve_module(modules, "brain").Brain(
         chain, tool_schemas, dispatch, journal, memory)
@@ -1254,7 +1306,7 @@ def build_app(data_dir, *, chain=None, modules=None,
                     goodput=goodput, chain=chain, registry=registry,
                     gate=gate, memory=memory, brain=brain,
                     dispatch=dispatch, allowances=allowances,
-                    learned=learned)
+                    learned=learned, activity=activity)
 
 
 # --------------------------------------------------------------------------- #
@@ -1297,6 +1349,7 @@ class ChatApp:
         self.memory = parts.memory
         self.brain = parts.brain
         self.allowances = parts.allowances
+        self.activity = parts.activity or Activity()
         self.history: list = []
         self.last_provider = "none"
 

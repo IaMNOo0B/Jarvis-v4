@@ -3,10 +3,11 @@
 A local web app (stdlib http.server, bound to 127.0.0.1 only) over
 the SAME ChatApp core the CLI uses — no second brain, no drift: the
 chat he perfects here is the chat everywhere. The design follows his
-photo: dark grid, one glowing ring with JARVIS in the middle, state
-words under the ring (Listening / Thinking / Researching /
-Processing), minimal chrome. Voice arrives later by his order; this
-is chat-first, fully working.
+photo: dark grid, one glowing ring with JARVIS in the middle, a
+state word under the ring that tells the TRUTH about what the core
+is doing (Standby / Thinking / Researching / Creating / Working —
+polled from the app's activity, never rotated on a timer), minimal
+chrome. Voice arrives later by his order; this is chat-first.
 
     python -m jarvis.ui [--data-dir DIR] [--port 8765] [--no-open]
 """
@@ -122,7 +123,7 @@ PAGE = """<!DOCTYPE html>
       </svg>
       <div class="ring-core"><span>JARVIS</span></div>
     </div>
-    <div id="state">Ready</div>
+    <div id="state">Standby</div>
     <div id="provider"></div>
   </div>
   <div class="chat">
@@ -139,8 +140,23 @@ PAGE = """<!DOCTYPE html>
   const input = document.getElementById('text');
   const stateEl = document.getElementById('state');
   const providerEl = document.getElementById('provider');
-  const busyWords = ['Listening', 'Thinking', 'Researching', 'Processing', 'Creating'];
+  // The state word is the TRUTH, polled from the app while a turn
+  // runs — never a rotating script (owner's order, 2026-10-21).
+  const stateLabels = { standby: 'Standby', thinking: 'Thinking…',
+    researching: 'Researching…', creating: 'Creating…',
+    working: 'Working…' };
   let timer = null;
+  function showState(s) {
+    stateEl.textContent = stateLabels[s] || 'Standby';
+    document.body.classList.toggle('busy', !!s && s !== 'standby');
+  }
+  async function pollState() {
+    try {
+      const r = await fetch('/api/state');
+      const s = await r.json();
+      showState(s.activity);
+    } catch (e) { /* decoration only */ }
+  }
 
   function addMsg(text, who) {
     const div = document.createElement('div');
@@ -150,15 +166,12 @@ PAGE = """<!DOCTYPE html>
     log.scrollTop = log.scrollHeight;
   }
   function setBusy(on) {
-    document.body.classList.toggle('busy', on);
     clearInterval(timer);
     if (on) {
-      let i = 0;
-      stateEl.textContent = busyWords[0] + '…';
-      timer = setInterval(() => { i = (i + 1) % busyWords.length;
-        stateEl.textContent = busyWords[i] + '…'; }, 1700);
+      showState('thinking');
+      timer = setInterval(pollState, 600);
     } else {
-      stateEl.textContent = 'Ready';
+      showState('standby');
     }
   }
   const bell = document.getElementById('bell');
@@ -269,6 +282,8 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                     pass
                 self._json(200, {"provider": app.last_provider,
                                  "tools": tools, "learned": learned,
+                                 "activity": app.activity.state,
+                                 "tool": app.activity.tool,
                                  "notifications":
                                      _unread_count(app.data_dir)})
                 return
@@ -300,10 +315,14 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 self._json(400, {"error": "empty message"})
                 return
             with lock:
-                if text.startswith("/"):
-                    reply = app.handle_command(text)
-                else:
-                    reply = app.turn(text)
+                app.activity.set("thinking")
+                try:
+                    if text.startswith("/"):
+                        reply = app.handle_command(text)
+                    else:
+                        reply = app.turn(text)
+                finally:
+                    app.activity.set("standby")
             self._json(200, {"reply": reply,
                              "provider": app.last_provider})
 
