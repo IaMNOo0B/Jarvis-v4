@@ -873,6 +873,9 @@ DEFAULT_WATCH_TOPICS = [
     "wake word detection open source",
     "AI agent frameworks new tools release",
     "whisper speech recognition improvements",
+    "AI assistant memory systems long term memory",
+    "open source AI agent skills tools",
+    "LLM tool calling reliability agents",
 ]
 
 
@@ -927,12 +930,21 @@ def _watch_cycle(learned: LearnedStore, data_dir, topics=None) -> dict:
                                        **item})
     _append_upgrade_log(data_dir, {"type": "watch_run", "ts": ts,
                                    "found": len(new)})
+    # Depth, per the owner's standing order (research zyada, roz,
+    # khud ke liye achhi cheez): the top findings are not just
+    # listed — their pages are READ and the content is learned.
+    for item in new[:3]:
+        page = bs.op_web_fetch(item["url"], max_chars=3500)
+        if "error" not in page:
+            item["content"] = page["text"]
     learned_as = None
     if new:
         lines = ["# Upgrade watch — nayi cheezein jo mili", ""]
         for item in new:
             lines.append(f"- [{item['topic']}] {item['title']} — "
                          f"{item['url']}")
+            if item.get("content"):
+                lines += ["", item["content"][:3000], ""]
         learned_as = learned.add_document(
             "\n".join(lines), title="upgrade-watch")["learned_from"]
         _notify(data_dir, "Upgrade watch",

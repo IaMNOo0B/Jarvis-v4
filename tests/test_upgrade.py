@@ -63,6 +63,20 @@ def test_watch_dedupes_and_learns(app, monkeypatch):
     assert any("Zed" in hit["text"] for hit in hits)   # it learned it
 
 
+def test_watch_reads_top_findings_not_just_titles(app, monkeypatch):
+    monkeypatch.setattr(bs, "op_web_search", lambda q, limit=5: {
+        "results": [{"title": "Memory System Q",
+                     "url": "https://q.example/mem", "snippet": ""}]})
+    monkeypatch.setattr(bs, "op_web_fetch", lambda url, max_chars=0: {
+        "url": url, "truncated": False,
+        "text": "Q system stores episodes in a graph of glowing "
+                "runes and recalls them by resonance."})
+    out = _ops(app)["watch_for_upgrades"](topics=["memory"])
+    assert out["count"] == 1
+    hits = app.memory.recall("episodes graph glowing runes resonance")
+    assert any("resonance" in hit["text"] for hit in hits)
+
+
 def test_good_skill_passes_gate_and_promotes(app):
     out = _ops(app)["propose_skill"]("echo", GOOD_MANIFEST, GOOD_CODE)
     assert out["promoted"] is True
