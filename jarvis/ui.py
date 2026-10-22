@@ -265,6 +265,34 @@ PAGE = """<!DOCTYPE html>
       cardsEl.appendChild(d);
     });
   }
+  async function decideBuild(id, approve) {
+    try {
+      const r = await fetch('/api/builds/proceed', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id, approve})});
+      const out = await r.json();
+      addMsg('jarvis', out.ok ? (approve ? 'Build shuru kar di — ant me walkthrough milega.' : 'Build rok di gayi.')
+                              : ('Proceed nahi hua: ' + (out.error || '?')));
+    } catch(e) { addMsg('jarvis', 'Build ka faisla nahi gaya: ' + e); }
+    refreshState();
+  }
+  function renderBuilds(builds) {
+    (builds || []).filter(b => b.status === 'awaiting_proceed').forEach(b => {
+      const d = document.createElement('div');
+      d.style.cssText = 'border:1px solid #7ad9ff;border-radius:10px;padding:10px 12px;margin:8px;background:rgba(122,217,255,.08)';
+      const t = document.createElement('div');
+      t.textContent = '🔨 Build plan taiyaar: ' + b.goal + ' — plan dekh kar aage badhun? (chat me /buildplan ' + b.id + ')';
+      const yes = document.createElement('button');
+      yes.textContent = '▶ PROCEED';
+      yes.onclick = () => decideBuild(b.id, true);
+      const no = document.createElement('button');
+      no.textContent = '✗ NAHI';
+      no.style.marginLeft = '8px';
+      no.onclick = () => decideBuild(b.id, false);
+      d.appendChild(t); d.appendChild(yes); d.appendChild(no);
+      cardsEl.appendChild(d);
+    });
+  }
   async function refreshState() {
     try {
       const r = await fetch('/api/state');
@@ -272,6 +300,7 @@ PAGE = """<!DOCTYPE html>
       providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned) : '';
       setBadge(s.notifications || 0);
       renderCards(s.confirmations || []);
+      renderBuilds(s.builds || []);
       const v = s.voice || {};
       voiceBtn.textContent = v.active
         ? ('♪ VOICE · ' + (v.connected ? 'ON' : '…')) : '♪ VOICE · OFF';
@@ -600,6 +629,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                                  "ptt": app.push_to_talk(),
                                  "confirmations":
                                      app.pending_confirmations(),
+                                 "builds": app.list_builds(),
                                  "notifications":
                                      _unread_count(app.data_dir)})
                 return
@@ -611,6 +641,21 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.wfile.write(body)
 
         def do_POST(self):
+            if self.path == "/api/builds/proceed":
+                try:
+                    size = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(
+                        self.rfile.read(size).decode("utf-8"))
+                except Exception:
+                    self._json(400, {"ok": False,
+                                     "error": "bad request"})
+                    return
+                with lock:
+                    out = app.proceed_build(
+                        str(payload.get("id", "")),
+                        approve=bool(payload.get("approve", True)))
+                self._json(200, out)
+                return
             if self.path == "/api/confirm":
                 try:
                     size = int(self.headers.get("Content-Length", 0))

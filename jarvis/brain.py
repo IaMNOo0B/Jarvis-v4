@@ -211,14 +211,26 @@ class Brain:
                  max_rounds: int = 3,
                  max_tool_calls: int = 12,
                  persona: str = PERSONA,
-                 protocol: str = PROTOCOL):
+                 protocol: str = PROTOCOL,
+                 audit: bool = True):
         self.chain = chain
+        # The CompletionAudit guards the OWNER-facing brain: it
+        # stops a reply that claims work no tool performed.
+        # Internal structured brains (planner, judge, doctor,
+        # critic) answer in JSON to other machinery that
+        # verifies them itself — and their prompts legitimately
+        # carry action verbs ("DELETE", the owner's goal text),
+        # which made the audit eat their JSON and return its
+        # admission instead. Those brains pass audit=False;
+        # the owner's brain never does.
+        self._audit_enabled = bool(audit)
         self._init_kwargs = {
             "soft_cap_tokens": soft_cap_tokens,
             "hard_budget_tokens": hard_budget_tokens,
             "max_rounds": max_rounds,
             "max_tool_calls": max_tool_calls,
-            "persona": persona, "protocol": protocol}
+            "persona": persona, "protocol": protocol,
+            "audit": audit}
         self.views = tool_views(tool_schemas)
         # Simultaneity's safety map: which tools may run side by
         # side. A round of independent, non-destructive calls
@@ -626,7 +638,11 @@ class Brain:
                                stopped_reason=stopped, rounds=rounds,
                                prompt_estimate=assembled.estimate)
 
-        stopped, final_text = self._audit(user_text, records, final_text)
+        if self._audit_enabled:
+            stopped, final_text = self._audit(user_text, records,
+                                              final_text)
+        else:
+            stopped = "completed"
         if stopped == "completed":
             self._log("brain.reply", {"text": final_text})
         else:

@@ -293,6 +293,25 @@ MISSION_MANIFEST = {
 }
 
 
+BUILDS_MANIFEST = {
+    "name": "core.builds",
+    "version": "1.0.0",
+    "tools": [{
+        "name": "build_task",
+        "op": "build_task",
+        "permission": "tasks.delegate",
+        "schema": {"type": "object",
+                   "properties": {
+                       "goal": {"type": "string", "minLength": 1},
+                       "mode": {"type": "string",
+                                "enum": ["planning", "fast"]},
+                       "workspace": {"type": "string"}},
+                   "required": ["goal"],
+                   "additionalProperties": False},
+    }],
+}
+
+
 USER_MODEL_MANIFEST = {
     "name": "core.user_model",
     "version": "1.0.0",
@@ -835,7 +854,7 @@ def _team_brain(parts, with_tools: bool):
     schemas = (parts.registry.advertised_tools(parts.allowances)
                if with_tools else [])
     return Brain(parts.chain, schemas, parts.dispatch,
-                 parts.journal, parts.memory,
+                 parts.journal, parts.memory, audit=False,
                  **({"protocol": chat_protocol(parts.rules_text)}
                     if getattr(parts, "rules_text", "") else {}))
 
@@ -1698,7 +1717,7 @@ def _mission_check(parts, goal: str, log) -> dict:
         'owner", "confidence": 0.0, "note": "ek chhoti line"}')
     try:
         brain = Brain(parts.chain, [], parts.dispatch,
-                      parts.journal, parts.memory)
+                      parts.journal, parts.memory, audit=False)
         out = brain.respond([], prompt)
         parsed = _json_from_reply(str(out.reply))
         if isinstance(parsed, dict) and parsed.get("state") in (
@@ -1742,7 +1761,7 @@ def _mission_repair(parts, goal: str, log, failure: str) -> dict:
         '"retry|skip|abort", "instruction": "..."}')
     try:
         brain = Brain(parts.chain, [], parts.dispatch,
-                      parts.journal, parts.memory)
+                      parts.journal, parts.memory, audit=False)
         out = brain.respond([], prompt)
         parsed = _json_from_reply(str(out.reply))
         if isinstance(parsed, dict) and parsed.get("strategy") in (
@@ -1894,6 +1913,282 @@ def _mission_op(holder: dict, data_dir: Path):
                         "Beech me tang nahi karunga; sirf ant me "
                         "ya asal rukawat par khabar dunga."}
     return run_mission_tool
+
+
+def _plan_for_build(parts, goal: str, workspace: str):
+    """The planner brain: Antigravity's plan schema as JSON —
+    changes tagged [NEW]/[MODIFY]/[DELETE], steps, and a
+    Verification Plan the builder commits to BEFORE building.
+    One self-repair round: a plan the schema refuses is sent
+    back with its problems named."""
+    from .brain import Brain
+    from .builds import validate_plan
+    prompt = (
+        f"BUILD GOAL: {goal}\n"
+        f"WORKSPACE: {workspace or '(build ki apni folder)'}\n"
+        "Tum planner ho. Is kaam ka implementation plan banao "
+        "— abhi code NAHI likhna, sirf plan.\n"
+        'Reply ONLY with JSON: {"review_notes": ["khatre ya '
+        'faisle jo owner ko dikhne chahiye"], "changes": '
+        '[{"path": "relative/path", "action": '
+        '"NEW|MODIFY|DELETE", "what": "kya hoga"}], "steps": '
+        '["kadam 1", "..."], "verification": [{"kind": '
+        '"command|check", "detail": "command items me woh '
+        'shell command jo safalta saabit kare; check items me '
+        'woh jaanch jo ek parakhne wala kare"}]}\n'
+        "Verification plan lazmi hai — safalta KAISE saabit "
+        "hogi, pehle se tay karo.")
+    problems = ["plan JSON hi nahi mila"]
+    for _attempt in range(2):
+        try:
+            brain = Brain(parts.chain, [], parts.dispatch,
+                          parts.journal, parts.memory,
+                          audit=False)
+            out = brain.respond([], prompt)
+            parsed = _json_from_reply(str(out.reply))
+        except Exception:
+            parsed = None
+        if isinstance(parsed, dict):
+            plan = {"goal": goal,
+                    "review_notes":
+                        parsed.get("review_notes") or [],
+                    "changes": parsed.get("changes") or [],
+                    "steps": parsed.get("steps") or [],
+                    "verification":
+                        parsed.get("verification") or []}
+            problems = validate_plan(plan)
+            if not problems:
+                return plan, []
+            prompt += ("\nPichhle plan me ye khamiyan theen, "
+                       "sudhaar kar do: " + "; ".join(problems))
+    return None, problems
+
+
+def _build_check(parts, goal: str, item: dict, context: str):
+    """The critic for a verification 'check' item: a fresh
+    no-tools Brain judges ONE declared check against the
+    real build context (steps + diff). Fail-closed: a check
+    that cannot be judged counts as not passed, with the
+    reason named."""
+    from .brain import Brain
+    prompt = (
+        f"BUILD GOAL: {goal}\nJAANCH: {item.get('detail')}\n"
+        f"ASAL HAAL:\n{context}\n"
+        "Sirf upar diye asal haal ki bina par faisla do — "
+        "andaza nahi.\n"
+        'Reply ONLY with JSON: {"ok": true|false, "note": '
+        '"ek line saboot ke saath"}')
+    try:
+        brain = Brain(parts.chain, [], parts.dispatch,
+                      parts.journal, parts.memory, audit=False)
+        out = brain.respond([], prompt)
+        parsed = _json_from_reply(str(out.reply))
+        if isinstance(parsed, dict) and "ok" in parsed:
+            return {"ok": bool(parsed["ok"]),
+                    "note": str(parsed.get("note", ""))[:240]}
+    except Exception:
+        pass
+    return {"ok": False, "note": "jaanch chal nahi payi"}
+
+
+def _run_build_app(parts, data_dir, build_id: str) -> None:
+    """The build executor: steps through the gated dispatch,
+    the live checklist on disk, the plan's Verification Plan
+    actually RUN, the plan bound to the real tree diff, and
+    ONE walkthrough at the end — batched, Antigravity tarz,
+    no drip-feed."""
+    from .builds import (BuildStore, binding_report,
+                         computed_confidence, diff_trees,
+                         snapshot_tree)
+    store = BuildStore(data_dir)
+    state = store.load(build_id)
+    if not state:
+        return
+    plan = state["plan"]
+    workspace = Path(state["workspace"]) if state.get(
+        "workspace") else store._dir(build_id) / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    state["status"] = "executing"
+    store.save(state)
+    baseline = snapshot_tree(workspace)
+    summaries = []
+    changes_txt = "; ".join(
+        f"[{c.get('action')}] {c.get('path')}"
+        for c in plan.get("changes") or [])
+    for i, step in enumerate(plan.get("steps") or []):
+        if _is_stopped(data_dir):
+            state["step_states"][i] = "failed"
+            state["note"] = "owner ne rok diya"
+            break
+        state["step_states"][i] = "running"
+        store.save(state)
+        work = (f"BUILD TASK. GOAL: {plan['goal']}\n"
+                f"WORKSPACE: {workspace}\n"
+                f"Plan ke badlav: {changes_txt}\n"
+                f"Sirf ye kadam pura karo: {step}\n"
+                "Files isi workspace ke andar banao/badlo "
+                "(create_project, run_code, file tools). Ant "
+                "me ek-do line me batao kya hua.")
+        try:
+            summary = _delegated_summary(parts, work)
+            state["step_states"][i] = "done"
+        except Exception as exc:
+            summary = (f"kadam crash: {type(exc).__name__}: "
+                       f"{exc}")
+            state["step_states"][i] = "failed"
+        summaries.append(str(summary)[:300])
+        store.save(state)
+    diff = diff_trees(baseline, snapshot_tree(workspace))
+    binding = binding_report(plan, diff)
+    state["status"] = "verifying"
+    store.save(state)
+    verify_results = []
+    for item in plan.get("verification") or []:
+        if item.get("kind") == "command":
+            code = (
+                "import subprocess, json\n"
+                f"_p = subprocess.run({item['detail']!r}, "
+                "shell=True, capture_output=True, text=True, "
+                "timeout=110)\n"
+                "print(json.dumps({'exit': _p.returncode, "
+                "'out': (_p.stdout + _p.stderr)[-800:]}))")
+            evidence = ""
+            ok = False
+            try:
+                res = parts.dispatch("run_code", {
+                    "code": code, "timeout": 120,
+                    "cwd": str(workspace)})
+                raw = str(res.get("stdout") or "")
+                for line in reversed(raw.splitlines()):
+                    try:
+                        got = json.loads(line)
+                        ok = got.get("exit") == 0
+                        evidence = str(got.get("out", ""))[:300]
+                        break
+                    except (ValueError, AttributeError):
+                        continue
+            except Exception as exc:
+                evidence = f"{type(exc).__name__}: {exc}"
+            verify_results.append(
+                {"kind": "command", "detail": item["detail"],
+                 "ok": ok, "evidence": evidence})
+        else:
+            context = ("Kadam: " + " | ".join(summaries)
+                       + "\nBadlav: created="
+                       + ", ".join(diff["created"])
+                       + "; modified="
+                       + ", ".join(diff["modified"])
+                       + "; deleted="
+                       + ", ".join(diff["deleted"]))
+            got = _build_check(parts, plan["goal"], item,
+                                context)
+            verify_results.append(
+                {"kind": "check", "detail": item["detail"],
+                 "ok": got["ok"], "evidence": got["note"]})
+    confidence, justification = computed_confidence(
+        verify_results, binding)
+    all_ok = all(r["ok"] for r in verify_results) \
+        and not binding["missing"]
+    state["status"] = "done" if all_ok else "failed"
+    state["confidence"] = confidence
+    state["finished"] = time.time()
+    if not all_ok:
+        bits = []
+        if binding["missing"]:
+            bits.append("plan ke badlav adhoore: "
+                        + ", ".join(binding["missing"]))
+        bad = [r["detail"] for r in verify_results
+               if not r["ok"]]
+        if bad:
+            bits.append("verification fail: " + "; ".join(bad))
+        state["note"] = "; ".join(bits)[:300]
+    lines = [f"# Walkthrough — {plan['goal']}", "",
+             f"**Confidence: {confidence}** — {justification}",
+             "", "## Kya hua (kadam-dar-kadam)"]
+    lines += [f"{i + 1}. [{state['step_states'][i]}] "
+              f"{plan['steps'][i]} — {summaries[i]}"
+              for i in range(len(summaries))]
+    lines += ["", "## Plan bandish (plan vs asal)",
+              f"- Hue: {', '.join(binding['done']) or '—'}",
+              f"- NAHI hue: "
+              f"{', '.join(binding['missing']) or '—'}",
+              f"- Plan se bahar ke badlav: "
+              f"{', '.join(binding['extras']) or '—'}",
+              "", "## Verification (plan ka apna waada)"]
+    lines += [f"- [{'x' if r['ok'] else '!'}] ({r['kind']}) "
+              f"{r['detail']} — {r['evidence'][:160]}"
+              for r in verify_results]
+    if state["note"]:
+        lines += ["", f"## Note\n{state['note']}"]
+    store.write_walkthrough(build_id, "\n".join(lines) + "\n")
+    store.save(state)
+    icon = "✅" if state["status"] == "done" else "⛔"
+    _notify(data_dir, f"Build {state['status']}",
+            f"{icon} Goal: {plan['goal'][:110]}\n"
+            f"Confidence: {confidence} — {justification}\n"
+            f"Walkthrough: data/builds/{build_id}/"
+            "walkthrough.md", kind="build")
+    try:
+        parts.journal.append("build.done", {
+            "id": build_id, "status": state["status"],
+            "confidence": confidence})
+    except Exception:
+        pass
+
+
+def _builds_op(holder: dict, data_dir: Path):
+    def build_task(goal: str, mode: str = "planning",
+                   workspace: str = ""):
+        parts = holder.get("parts")
+        if parts is None:
+            return {"ok": False,
+                    "error": "build engine wired nahi hai, sir."}
+        if _is_stopped(data_dir):
+            return {"ok": False,
+                    "error": "Band hoon, sir — pehle /resume "
+                             "kahiye."}
+        goal = str(goal).strip()
+        if not goal:
+            return {"ok": False, "error": "Khali goal, sir."}
+        plan, problems = _plan_for_build(
+            parts, goal, str(workspace).strip())
+        if plan is None:
+            return {"ok": False,
+                    "error": "plan nahi ban paya — "
+                             + "; ".join(problems)}
+        from .builds import BuildStore
+        build_id = uuid.uuid4().hex[:8]
+        store = BuildStore(data_dir)
+        state = store.create(
+            build_id, goal, plan,
+            mode if mode in ("planning", "fast") else "planning",
+            str(workspace).strip())
+        changes = [f"[{c.get('action')}] {c.get('path')}"
+                   for c in plan["changes"]]
+        if state["status"] == "awaiting_proceed":
+            _notify(data_dir, "Build plan taiyaar",
+                    f"Goal: {goal[:110]}\nBadlav: "
+                    f"{len(changes)} | Kadam: "
+                    f"{len(plan['steps'])}\nProceed karne ke "
+                    f"liye: /proceed {build_id}",
+                    kind="build")
+            return {"ok": True, "build_id": build_id,
+                    "status": "awaiting_proceed",
+                    "changes": changes,
+                    "note": "Plan ban gaya hai, sir — "
+                            "implementation_plan.md me pura "
+                            "plan hai. Owner ke Proceed ke "
+                            "baad hi kaam shuru hoga."}
+        threading.Thread(target=_run_build_app,
+                         args=(parts, data_dir, build_id),
+                         daemon=True,
+                         name=f"jarvis-build-{build_id}").start()
+        return {"ok": True, "build_id": build_id,
+                "status": "executing",
+                "note": "Fast mode — plan ke saath build chal "
+                        "raha hai, sir. Ant me walkthrough "
+                        "milega."}
+    return build_task
 
 
 def _delegate_op(holder: dict, data_dir: Path):
@@ -3059,6 +3354,7 @@ TOOL_STATES = {
     "web_fetch_tor": "researching", "learn_url": "researching",
     "deep_research": "researching", "knowledge_search": "researching",
     "search_all": "researching",
+    "build_task": "creating",
     "watch_for_upgrades": "researching", "upgrade_report": "researching",
     "create_project": "creating", "run_code": "creating",
     "write_file": "creating", "learn_text": "creating",
@@ -3679,6 +3975,16 @@ def build_app(data_dir, *, chain=None, modules=None,
             registry.approve(MISSION_MANIFEST["name"])
         except Exception as exc:
             journal.append("chat.mission_skill_skipped",
+                           {"error": f"{type(exc).__name__}: {exc}"})
+    if hasattr(registry, "register") and hasattr(registry, "approve"):
+        try:
+            registry.register(BUILDS_MANIFEST,
+                              ops={"build_task":
+                                   _builds_op(parts_holder,
+                                              data_dir)})
+            registry.approve(BUILDS_MANIFEST["name"])
+        except Exception as exc:
+            journal.append("chat.builds_skill_skipped",
                            {"error": f"{type(exc).__name__}: {exc}"})
     if hasattr(registry, "register") and hasattr(registry, "approve"):
         try:
@@ -4526,6 +4832,31 @@ class ChatApp:
                              f"(/confirm {c['id']} | "
                              f"/deny {c['id']})")
             return "\n".join(lines)
+        if text == "/builds":
+            rows = self.list_builds()
+            if not rows:
+                return "Abhi tak koi build nahi hui, sir."
+            return "\n".join(
+                f"🔨 {r['id']} — {r['status']} — "
+                f"{str(r['goal'])[:60]}"
+                for r in rows)
+        if text.startswith("/proceed "):
+            out = self.proceed_build(
+                text[len("/proceed "):].strip())
+            return ("Build shuru kar di, sir — ant me "
+                    "walkthrough milega."
+                    if out.get("ok")
+                    else f"Proceed nahi hua: {out.get('error')}")
+        if text.startswith("/builddeny "):
+            out = self.proceed_build(
+                text[len("/builddeny "):].strip(),
+                approve=False)
+            return ("Build rok di gayi, sir."
+                    if out.get("ok")
+                    else f"Deny nahi hua: {out.get('error')}")
+        if text.startswith("/buildplan "):
+            return self.build_plan_text(
+                text[len("/buildplan "):].strip())
         if text == "/rules":
             return ("Ye rahe mere saare rules, sir — ek hi file "
                     f"se ({self.rules_source}):\n\n"
@@ -4722,6 +5053,48 @@ class ChatApp:
         return f"Unknown command, sir: {text.split()[0] if text else ''}"
 
     # -- the turn -----------------------------------------------------------
+
+    # -- build tasks (the Antigravity planning gate) ----------
+
+    def list_builds(self):
+        from .builds import BuildStore
+        return BuildStore(self.data_dir).list_builds()
+
+    def build_plan_text(self, build_id: str) -> str:
+        path = (self.data_dir / "builds" / build_id
+                / "implementation_plan.md")
+        if not path.exists():
+            return "Aisi koi build nahi hai, sir."
+        return path.read_text(encoding="utf-8")
+
+    def proceed_build(self, build_id: str,
+                      approve: bool = True) -> dict:
+        """The owner's Proceed on a build plan — the gate
+        Antigravity puts between planning and execution.
+        Approval starts the executor thread on the plan
+        exactly as filed; denial retires the build."""
+        from .builds import BuildStore
+        store = BuildStore(self.data_dir)
+        state = store.load(build_id)
+        if not state:
+            return {"ok": False, "error": "build nahi mili"}
+        if state["status"] != "awaiting_proceed":
+            return {"ok": False,
+                    "error": f"build '{state['status']}' haal "
+                             "me hai — Proceed sirf plan par "
+                             "hota hai"}
+        if not approve:
+            state["status"] = "denied"
+            store.save(state)
+            return {"ok": True, "status": "denied"}
+        state["status"] = "executing"
+        store.save(state)
+        threading.Thread(target=_run_build_app,
+                         args=(self.parts, self.data_dir,
+                               build_id),
+                         daemon=True,
+                         name=f"jarvis-build-{build_id}").start()
+        return {"ok": True, "status": "executing"}
 
     # -- confirmation cards (the owner's approval door) --------
 
