@@ -90,6 +90,27 @@ def test_chain_key_may_be_a_rotation_list():
     chain = build_chain({}, {"groq": ["first-key", "second-key"]})
     groq = chain[0]
     assert groq.name == "groq" and groq.api_key == "first-key"
+    assert groq._keys == ["first-key", "second-key"]
+    # Rotation (audit 2026-10-22): a 401 on the first key
+    # retries with the second — the pool is not decoration.
+    seen_auth = []
+
+    def transport(url, body, headers, timeout):
+        seen_auth.append(headers.get("Authorization"))
+        if headers.get("Authorization") == "Bearer first-key":
+            return 401, b'{"error": "bad key"}'
+        return 200, json.dumps({"choices": [{"message": {
+            "content": "dusri key se jawab"}}]}).encode()
+
+    rotating = CompatProvider(
+        "groq", "https://api.groq.com/openai/v1", "m",
+        api_key="first-key",
+        api_keys=["first-key", "second-key"],
+        transport=transport)
+    reply = rotating.complete([{"role": "user", "content": "hi"}])
+    assert reply.text == "dusri key se jawab"
+    assert rotating.api_key == "second-key"
+    assert seen_auth == ["Bearer first-key", "Bearer second-key"]
 
 def test_chain_custom_provider_from_config():
     cfg = {"providers": [{"name": "mybox", "base_url": "http://x.test/v1",

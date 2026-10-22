@@ -89,29 +89,38 @@ DOMAIN_STEMS: Dict[str, Sequence[str]] = {
 MAX_DOMAINS = 3
 
 
-def route_schemas(text: str,
-                  schemas: Sequence[dict]) -> Optional[List[dict]]:
-    """The specialized subset for this text, or None when no
-    domain speaks up (the caller then uses the full set)."""
+def _top_domains(text: str) -> List[str]:
+    """The score-ranked top domains for this text — the ONE
+    selection both the schema router and the journal use
+    (audit 2026-10-22: routed_domains sorted alphabetically
+    and the journal named domains the router never chose)."""
     low = " " + str(text or "").lower() + " "
     scored: Dict[str, int] = {}
     for skill, stems in DOMAIN_STEMS.items():
         hits = sum(1 for stem in stems if stem in low)
         if hits:
             scored[skill] = hits
-    if not scored:
+    ranked = sorted(scored, key=lambda s: (-scored[s], s))
+    return ranked[:MAX_DOMAINS]
+
+
+def route_schemas(text: str,
+                  schemas: Sequence[dict]) -> Optional[List[dict]]:
+    """The specialized subset for this text, or None when no
+    domain speaks up (the caller then uses the full set)."""
+    top = _top_domains(text)
+    if not top:
         return None
-    top = sorted(scored, key=lambda s: (-scored[s], s))
-    chosen = set(top[:MAX_DOMAINS]) | set(ALWAYS_SKILLS)
+    chosen = set(top) | set(ALWAYS_SKILLS)
     subset = [s for s in schemas if s.get("skill") in chosen]
-    if len(subset) >= len(schemas):
+    if not subset or len(subset) >= len(schemas):
+        # An empty subset is NOT a routing decision — it
+        # would leave the brain tool-less. None = full set.
         return None
     return subset
 
 
 def routed_domains(text: str) -> List[str]:
-    """Which domains the router heard (for the journal)."""
-    low = " " + str(text or "").lower() + " "
-    hits = [skill for skill, stems in DOMAIN_STEMS.items()
-            if any(stem in low for stem in stems)]
-    return sorted(hits)[:MAX_DOMAINS]
+    """Which domains the router heard (for the journal) —
+    the same ranked top-3 route_schemas picks."""
+    return _top_domains(text)

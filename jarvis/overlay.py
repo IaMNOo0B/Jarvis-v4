@@ -42,10 +42,19 @@ def buddy_text(state: dict) -> tuple:
     Pure: the same state always paints the same buddy."""
     state = state or {}
     voice = state.get("voice") or {}
-    if voice.get("active"):
-        word = "speaking" if voice.get("speaking") else "listening"
+    # The word comes from the app's ACTIVITY — the same truth
+    # the HUD shows (audit 2026-10-22: the buddy derived it
+    # from voice flags alone and said "Listening" while the
+    # wake gate was asleep, and after the 120 s decay had
+    # already put the app on standby). Speaking is the one
+    # voice fact that outranks activity, since sound coming
+    # out IS the state.
+    if voice.get("speaking"):
+        word = "speaking"
     else:
         word = str(state.get("activity") or "standby").lower()
+        if word not in _STATES:
+            word = "standby"
     line, colour = _STATES.get(word, _STATES["standby"])
     unread = int(state.get("notifications") or 0)
     sub = f"{unread} nayi khabar" if unread else "JARVIS"

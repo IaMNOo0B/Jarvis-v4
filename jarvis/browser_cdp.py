@@ -97,8 +97,16 @@ class WSConnection:
     def _send_pong(self, payload: bytes) -> None:
         mask = os.urandom(4)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self.sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + mask
-                          + masked)
+        length = len(payload)
+        if length < 126:
+            header = bytes([0x8A, 0x80 | length])
+        elif length < 65536:
+            header = bytes([0x8A, 0x80 | 126]) + struct.pack(
+                ">H", length)
+        else:
+            header = bytes([0x8A, 0x80 | 127]) + struct.pack(
+                ">Q", length)
+        self.sock.sendall(header + mask + masked)
 
     def recv_text(self) -> str:
         message = b""
@@ -148,24 +156,43 @@ class CDPSession:
     def __init__(self, ws_url: str):
         self.ws = ws_connect(ws_url)
         self._next_id = 0
+        # Set when the socket proves dead (close frame, broken
+        # pipe, garbage frame): _ensure_session then drops this
+        # session and reconnects instead of every later op
+        # failing against a corpse until someone calls status.
+        self.dead = False
 
     def call(self, method: str, params: dict | None = None,
              timeout=20):
         self._next_id += 1
         call_id = self._next_id
-        self.ws.sock.settimeout(timeout)
-        self.ws.send_text(json.dumps(
-            {"id": call_id, "method": method,
-             "params": params or {}}))
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            message = json.loads(self.ws.recv_text())
-            if message.get("id") == call_id:
-                if "error" in message:
-                    raise WSError(f"{method}: "
-                                  f"{message['error'].get('message')}")
-                return message.get("result", {})
-        raise WSError(f"{method}: no answer within {timeout}s")
+        try:
+            self.ws.sock.settimeout(timeout)
+            self.ws.send_text(json.dumps(
+                {"id": call_id, "method": method,
+                 "params": params or {}}))
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                message = json.loads(self.ws.recv_text())
+                if message.get("id") == call_id:
+                    if "error" in message:
+                        raise WSError(
+                            f"{method}: "
+                            f"{message['error'].get('message')}")
+                    return message.get("result", {})
+            raise WSError(f"{method}: no answer within {timeout}s")
+        except (WSError, OSError) as exc:
+            # Dead means the SOCKET proved dead — a close
+            # frame or an OS-level failure. A CDP application
+            # error or a slow page leaves the session usable.
+            if isinstance(exc, OSError) or \
+                    "closed" in str(exc):
+                self.dead = True
+            raise
+        except ValueError as exc:      # a frame that was not JSON
+            self.dead = True
+            raise WSError(f"{method}: bad frame from the "
+                          f"browser ({exc})") from exc
 
     def evaluate(self, expression: str, timeout=20):
         result = self.call(
@@ -228,6 +255,12 @@ def _connect_page() -> CDPSession:
 
 def _ensure_session() -> CDPSession:
     global _ws
+    if _ws is not None and getattr(_ws, "dead", False):
+        try:
+            _ws.ws.close()
+        except Exception:
+            pass
+        _ws = None
     if _ws is not None:
         return _ws
     try:
@@ -299,7 +332,15 @@ def op_browser_open(url: str):
         try:
             session = _ensure_session()
             session.call("Page.enable")
-            session.call("Page.navigate", {"url": target})
+            nav = session.call("Page.navigate", {"url": target})
+            nav_error = nav.get("errorText") \
+                if isinstance(nav, dict) else None
+            if nav_error:
+                # DNS/cert/blocked navigations land here; the
+                # old code discarded this and reported the
+                # PREVIOUS page as the opened one.
+                return {"error": f"browser_open failed: "
+                                 f"{nav_error}"}
             deadline = time.time() + 8
             while time.time() < deadline:
                 state = session.evaluate("document.readyState")
@@ -322,6 +363,12 @@ def op_browser_open(url: str):
 
 SNAPSHOT_JS = """
 (() => {
+  // Refs from any OLDER snapshot die here: without this, a
+  // dropped element kept its ref while the same ref was
+  // reassigned to a new element, and a click could land on
+  // the stale twin the brain never saw.
+  document.querySelectorAll('[data-jarvis-ref]')
+    .forEach(e => e.removeAttribute('data-jarvis-ref'));
   const out = {elements: [], text: ''};
   const els = document.querySelectorAll(
     'a, button, [role="button"], input, select, textarea, [onclick]');
@@ -355,19 +402,36 @@ SNAPSHOT_JS = """
 _RISKY_CLICK_RE = re.compile(
     r"\b(buy|pay|purchase|checkout|place order|order now|subscribe|"
     r"delete|remove|confirm|transfer|send|post|publish|cancel|"
-    r"unsubscribe|sign up|signup|register|book now)\b", re.I)
+    r"unsubscribe|sign up|signup|register|book now|donate|"
+    r"authorize|withdraw|bid)\b", re.I)
 _PAYMENT_SIGNAL_RE = re.compile(
-    r"(cvv|cvc|billing|payment method|\$|€|£|₹|\brs\.?\s*\d|"
-    r"per month|/month|\d+\s*(rupees|dollars))", re.I)
+    r"(cvv|cvc|billing|payment method|card on file|billed|"
+    r"monthly|\$|€|£|₹|\brs\.?\s*\d|"
+    r"per month|/month|\d+\s*(rupees|dollars)|auto-?renew|"
+    r"free trial)", re.I)
+# Labels that COMMIT whatever the surrounding card is about —
+# harmless on a settings page, the money step on a checkout
+# card. Paired with payment signals in the card they are high.
+_COMMIT_LABEL_RE = re.compile(
+    r"\b(continue|submit|next|proceed|complete|finish|place|"
+    r"done|ok|confirm|pay|buy)\b", re.I)
+_STRONG_PAYMENT_RE = re.compile(
+    r"(cvv|cvc|billing|payment method|card on file)", re.I)
 
 
 def classify_click_risk(label: str, context: str = "") -> str:
     """'high' when the click smells like money or commitment: a
     risky verb in the label, or payment signals around it. A bare
     'Subscribe' is a purchase UNLESS the surrounding text proves
-    it is free and carries no money signals (Sentient's rule)."""
+    it is free and carries no money signals (Sentient's rule).
+    The card CONTEXT counts too (audit 2026-10-22): checkout's
+    final button is usually a harmless-looking 'Continue' or
+    'Submit' sitting inside a card full of totals and CVV
+    fields — judging the label alone waved exactly those
+    through."""
     label = str(label or "")
-    text = f"{label} {context or ''}"
+    context = str(context or "")
+    text = f"{label} {context}"
     if _RISKY_CLICK_RE.search(label):
         if re.search(r"subscribe", label, re.I) \
                 and re.search(r"\bfree\b", text, re.I) \
@@ -375,6 +439,13 @@ def classify_click_risk(label: str, context: str = "") -> str:
             return "low"
         return "high"
     if _PAYMENT_SIGNAL_RE.search(label):
+        return "high"
+    if _STRONG_PAYMENT_RE.search(context) and (
+            _COMMIT_LABEL_RE.search(label)
+            or len(label.strip()) <= 12):
+        return "high"
+    if _PAYMENT_SIGNAL_RE.search(context) \
+            and _COMMIT_LABEL_RE.search(label):
         return "high"
     return "low"
 
@@ -426,13 +497,19 @@ def op_browser_snapshot(max_chars: int = 12000):
 
 
 def _fingerprint(session) -> str:
-    """A cheap page fingerprint (URL + visible-text length):
-    the action-verdict's yardstick. A click that changes
-    neither moved nothing the eye can see."""
+    """A cheap page fingerprint: URL + title + text length +
+    a small hash of the text itself. Length alone called two
+    different same-length pages 'no change' (audit 2026-10-22);
+    the hash catches content swaps the counter cannot."""
     try:
         return str(session.evaluate(
-            "location.href + '|' + (document.body ? "
-            "document.body.innerText.length : 0)") or "")
+            "(() => { const t = document.body ? "
+            "document.body.innerText : ''; let h = 0; "
+            "const s = t.slice(0, 3000); for (let i = 0; "
+            "i < s.length; i++) { h = ((h * 31) + "
+            "s.charCodeAt(i)) | 0; } return location.href "
+            "+ '|' + document.title + '|' + t.length + '|' "
+            "+ h; })()") or "")
     except Exception:
         return ""
 
@@ -450,7 +527,8 @@ def op_browser_click_ref(ref: str, confirm: bool = False):
   const el = document.querySelector('[data-jarvis-ref="{ref}"]');
   if (!el) return null;
   const holder = el.closest('div, section, li, form');
-  return JSON.stringify({{label: (el.innerText || el.value || ''),
+  return JSON.stringify({{label: (el.innerText || el.value ||
+    el.placeholder || el.getAttribute('aria-label') || ''),
     card: holder ? (holder.innerText || '') : ''}});
 }})()"""
     with _lock:
@@ -524,34 +602,79 @@ def op_browser_text(max_chars: int = 12000):
             "truncated": len(text) > max_chars}
 
 
-def op_browser_click(text: str):
+def op_browser_click(text: str, confirm: bool = False):
+    """Click by visible text — through the SAME risk gate as
+    click_ref (audit 2026-10-22: this path used to have no
+    gate at all, so 'Buy now'/'Delete' by text bypassed the
+    whole click-safety system). Probe first (label + card,
+    first VISIBLE match), classify, refuse high risk without
+    confirm=True, only then click."""
     needle = json.dumps(str(text))
-    script = f"""
+    probe = f"""
 (() => {{
   const needle = {needle}.toLowerCase();
   const els = document.querySelectorAll(
     'a, button, [role="button"], input[type="submit"], ' +
     'input[type="button"]');
   for (const el of els) {{
-    const label = (el.innerText || el.value || '').toLowerCase();
-    if (label.includes(needle)) {{ el.click(); return el.innerText
-      || el.value || 'clicked'; }}
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    const label = (el.innerText || el.value || el.placeholder ||
+      el.getAttribute('aria-label') || '');
+    if (label.toLowerCase().includes(needle)) {{
+      const holder = el.closest('div, section, li, form');
+      return JSON.stringify({{label: label,
+        card: holder ? (holder.innerText || '') : ''}});
+    }}
+  }}
+  return null;
+}})()"""
+    click_script = f"""
+(() => {{
+  const needle = {needle}.toLowerCase();
+  const els = document.querySelectorAll(
+    'a, button, [role="button"], input[type="submit"], ' +
+    'input[type="button"]');
+  for (const el of els) {{
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    const label = (el.innerText || el.value || el.placeholder ||
+      el.getAttribute('aria-label') || '');
+    if (label.toLowerCase().includes(needle)) {{
+      el.click(); return label || 'clicked';
+    }}
   }}
   return null;
 }})()"""
     with _lock:
         try:
             session = _ensure_session()
+            raw = session.evaluate(probe)
+            info = json.loads(raw) if raw else None
+            if info is None:
+                return {"error": f"browser_click failed: '{text}' "
+                                 "likha koi button/link page par "
+                                 "nahi mila"}
+            risk = classify_click_risk(info.get("label", ""),
+                                       info.get("card", ""))
+            if risk == "high" and not confirm:
+                return {"ok": False, "risk": "high",
+                        "label": info.get("label", ""),
+                        "error": "yeh click risky hai (paisa ya "
+                                 "commitment) — pehle owner se "
+                                 "poochho, phir confirm=True ke "
+                                 "saath bhejo"}
             fp_before = _fingerprint(session)
-            clicked = session.evaluate(script)
+            clicked = session.evaluate(click_script)
             time.sleep(0.6)
             _refresh_current(session)
             fp_after = _fingerprint(session)
         except (WSError, OSError) as exc:
             return {"error": f"browser_click failed: {exc}"}
     if clicked is None:
-        return {"error": f"browser_click failed: '{text}' likha "
-                         "koi button/link page par nahi mila"}
+        return {"error": f"browser_click failed: '{text}' click "
+                         "hone se pehle page badal gaya — naya "
+                         "snapshot lo"}
     return {"clicked": clicked, "url": _current["url"],
             "title": _current["title"],
             "effect": {"changed": bool(fp_before)
@@ -572,27 +695,56 @@ def op_browser_type(text: str, into: str = ""):
     const boxes = [...document.querySelectorAll(
       'input[type="text"], input[type="search"], input:not([type]),'
       + ' textarea')].filter(el => el.offsetParent !== null);
-    box = boxes.find(el => ((el.placeholder || '') + ' ' +
-      (el.name || '') + ' ' + (el.getAttribute('aria-label') || ''))
-        .toLowerCase().includes(hint)) || boxes[0];
+    if (hint) {{
+      box = boxes.find(el => ((el.placeholder || '') + ' ' +
+        (el.name || '') + ' ' + (el.getAttribute('aria-label')
+        || '')).toLowerCase().includes(hint));
+      if (!box) return JSON.stringify({{error: 'hint-nomatch'}});
+    }} else {{
+      box = boxes[0];
+    }}
   }}
   if (!box) return null;
   box.focus();
-  box.value = value;
+  // Controlled inputs (React/Vue) ignore a plain .value set:
+  // go through the prototype setter so the framework sees
+  // the change, then VERIFY by reading the value back.
+  const proto = box instanceof HTMLTextAreaElement
+    ? window.HTMLTextAreaElement.prototype
+    : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(
+    proto, 'value');
+  if (setter && setter.set) setter.set.call(box, value);
+  else box.value = value;
   box.dispatchEvent(new Event('input', {{bubbles: true}}));
   box.dispatchEvent(new Event('change', {{bubbles: true}}));
-  return box.placeholder || box.name || 'field';
+  return JSON.stringify({{field: box.placeholder || box.name
+    || 'field', value: box.value}});
 }})()"""
     with _lock:
         try:
             session = _ensure_session()
-            filled = session.evaluate(script)
+            raw = session.evaluate(script)
         except (WSError, OSError) as exc:
             return {"error": f"browser_type failed: {exc}"}
-    if filled is None:
+    if raw is None:
         return {"error": "browser_type failed: page par koi text "
                          "field nahi mila"}
-    return {"typed_into": filled, "text": str(text)}
+    try:
+        out = json.loads(raw)
+    except (TypeError, ValueError):
+        out = {}
+    if out.get("error") == "hint-nomatch":
+        return {"error": f"browser_type failed: '{into}' se "
+                         "milta koi field nahi mila — andaz se "
+                         "kisi aur field me nahi likha"}
+    if out.get("value") != str(text):
+        return {"ok": False, "typed_into": out.get("field"),
+                "readback": str(out.get("value") or "")[:80],
+                "error": "field ne text qabool nahi kiya "
+                         "(controlled input?) — jo likha tha woh "
+                         "field me nahi hai"}
+    return {"typed_into": out.get("field"), "text": str(text)}
 
 
 def op_browser_status():

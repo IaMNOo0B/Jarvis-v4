@@ -231,4 +231,10 @@ def test_lesson_with_bad_evidence_cannot_supersede(tmp_path):
         "The workshop fee is 500 rupees",
         "The workshop fee is 500 rupees, not 400",
         evidence="galat hai, fee 400 nahi 500 rupees hai")
-    assert lesson2["supersedes"] == wrong["id"]
+    # Multi-supersede (audit fix): the good lesson retires the
+    # wrong fact AND the earlier blocked lesson that quoted it.
+    sup = lesson2["supersedes"]
+    sup_ids = sup if isinstance(sup, list) else [sup]
+    assert wrong["id"] in sup_ids
+    current_ids = {f["id"] for f in mem.facts.current_facts()}
+    assert wrong["id"] not in current_ids

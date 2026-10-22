@@ -268,6 +268,10 @@ class LiveSession:
         self._resume_handle = None
         self._resumed_with = None
         self._interrupted = False
+        self._pending_said = False   # a finished turn whose
+                                     # transcript is NOT yet
+                                     # committed — playback may
+                                     # still be behind
         self._in_buf = _TranscriptBuffer()
         self._out_buf = _TranscriptBuffer()
         self._turns: list = []
@@ -286,6 +290,10 @@ class LiveSession:
         self._thread.start()
 
     def stop(self):
+        # Commit whatever of the pending reply was actually
+        # HEARD before the session closes — no more, no less.
+        if self._pending_said:
+            self._commit_said(self._probe_heard())
         self._stop.set()
         self._close_ws()
         if self._on_session_end and len(self._turns) >= 3:
@@ -300,6 +308,11 @@ class LiveSession:
         self._send({"realtimeInput": {"audio": {
             "data": base64.b64encode(pcm).decode(),
             "mimeType": "audio/pcm;rate=16000"}}})
+        # Audio sends arm the stall watchdog too (audit
+        # 2026-10-22: only send_text did — a half-dead socket
+        # after speech never tripped the deadline, so the UI
+        # showed "connected" while JARVIS was deaf).
+        self._arm_stall()
 
     def send_text(self, text: str):
         self._send({"clientContent": {
@@ -319,17 +332,41 @@ class LiveSession:
         self._interrupted = True
         self._in_buf.clear()
         if heard_fraction is None:
-            probe = getattr(self.events, "heard_fraction", None)
-            if callable(probe):
-                try:
-                    heard_fraction = probe()
-                except Exception:
-                    heard_fraction = None
-        said = self._out_buf.heard(heard_fraction)
+            heard_fraction = self._probe_heard()
+        self._commit_said(heard_fraction)
+        self.events.on_interrupted()
+
+    def _probe_heard(self):
+        probe = getattr(self.events, "heard_fraction", None)
+        if callable(probe):
+            try:
+                return probe()
+            except Exception:
+                return None
+        return None
+
+    def _commit_said(self, fraction):
+        """The ONLY door by which a spoken reply reaches
+        history/memory: the prefix that was actually HEARD
+        (the owner's doctrine — record what was spoken, not
+        what was generated)."""
+        self._pending_said = False
+        said = self._out_buf.heard(fraction)
         if said:
             self._turns.append(("assistant", said))
             self.events.on_transcript("assistant", said)
-        self.events.on_interrupted()
+
+    def on_playback_drained(self):
+        """Manager signal: the play queue emptied — everything
+        generated for this turn was heard, so the pending
+        transcript commits WHOLE. Until this fires, the
+        transcript waits: an interrupt after turnComplete can
+        still cut it to the played prefix (audit 2026-10-22:
+        turnComplete used to flush the full text instantly,
+        so seconds of unplayed audio were already 'history'
+        and an interrupt found nothing to truncate)."""
+        if self._pending_said:
+            self._commit_said(1.0)
 
     # -- plumbing -----------------------------------------------------------
 
@@ -411,7 +448,17 @@ class LiveSession:
             self._enhanced = False
             self._api_version = "v1beta"
             return 0.0
-        if "api key not valid" in low:
+        if "api key not valid" in low \
+                or "api_key_invalid" in low \
+                or "invalid_api_key" in low \
+                or "api key invalid" in low \
+                or "invalid api key" in low \
+                or ("key" in low and ("400" in low
+                                      or "403" in low)):
+            # A rejected key never heals by retrying (audit
+            # 2026-10-22: only the one exact phrase was
+            # recognized; every other auth shape retried
+            # forever against a dead key).
             self.events.on_session(False, "bad key")
             self._stop.set()
             return 0.0
@@ -480,6 +527,15 @@ class LiveSession:
                     self.events.on_audio(pcm[i:i + AUDIO_SLICE_BYTES])
         in_tr = content.get("inputTranscription") or {}
         if in_tr.get("text"):
+            # A NEW user turn ends any interrupt episode: the
+            # flag must not eat the next turn's audio (audit
+            # 2026-10-22: it only cleared at turnComplete).
+            if self._interrupted:
+                self._interrupted = False
+            if self._pending_said:
+                # The owner spoke over the tail of the last
+                # reply — commit only what was heard by now.
+                self._commit_said(self._probe_heard())
             self._in_buf.add(str(in_tr["text"]))
             self.last_user_speech = self._clock()
         out_tr = content.get("outputTranscription") or {}
@@ -491,15 +547,18 @@ class LiveSession:
                 self._interrupted = False
                 self._in_buf.clear()
                 self._out_buf.clear()
+                self._pending_said = False
                 return
             heard = self._in_buf.flush()
-            said = self._out_buf.flush()
             if heard:
                 self._turns.append(("user", heard))
                 self.events.on_transcript("user", heard)
-            if said:
-                self._turns.append(("assistant", said))
-                self.events.on_transcript("assistant", said)
+            # The assistant's words are NOT committed yet:
+            # they wait in the buffer until playback drains
+            # (on_playback_drained) or an interrupt cuts them
+            # to the heard prefix.
+            if self._out_buf.text.strip():
+                self._pending_said = True
 
     def _run_one_tool(self, fn: dict) -> dict:
         """One tool call -> one STRUCTURED function response

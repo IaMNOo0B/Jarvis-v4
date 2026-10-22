@@ -32,6 +32,7 @@ fakes, production with delegated Brains.
 from __future__ import annotations
 
 import json
+import posixpath
 import shutil
 import subprocess
 import sys
@@ -41,9 +42,20 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Optional
 
+from .builds import _safe_relpath
+
 MAX_AGENTS = 5
 MAX_REPAIRS = 2
 _FILE_CAP = 6000
+
+
+def _norm_owned(name: str) -> str:
+    """One canonical spelling per owned file: backslashes
+    become slashes, './' and duplicate separators fold away —
+    overlap is judged on THIS, never on the raw string (audit
+    2026-10-22: './a.py' and 'a.py' were 'different' files and
+    two workers owned the same file)."""
+    return posixpath.normpath(str(name).replace("\\", "/"))
 
 
 # ---------------------------------------------------------------------------
@@ -69,11 +81,19 @@ def validate_plan(raw) -> tuple:
     for item in items:
         if not isinstance(item, dict):
             return None, "planner ka ek hissa kharab hai, sir"
-        files = [str(f).strip() for f in item.get("files") or []
+        files = [_norm_owned(f) for f in item.get("files") or []
                  if str(f).strip()]
         if not files:
             return None, "har hisse ke paas kam se kam ek file " \
                          "honi chahiye, sir"
+        # Builds-grade path safety (audit 2026-10-22: team
+        # plans carried NO path validation — '../secret.txt'
+        # and '/etc/passwd' were accepted as owned files and
+        # read + merged).
+        for name in files:
+            if not _safe_relpath(name):
+                return None, (f"file '{name}' surakshit relative "
+                              "path nahi hai — plan radd, sir")
         for name in files:
             if name in seen:
                 return None, (f"file '{name}' do hisson me hai "
@@ -149,13 +169,50 @@ def _one_subtask(task: str, subtask: dict, workspace: Path,
     rounds = 0
     while True:
         rounds += 1
-        summary = worker(task, subtask, workspace, issues)
+        try:
+            summary = worker(task, subtask, workspace, issues)
+        except Exception as exc:
+            # A crashed worker is a FAILED subtask in the
+            # report — never an exception out of run_team,
+            # whose contract is "never raises" (audit
+            # 2026-10-22: worker/critic exceptions escaped
+            # through future.result()).
+            return {"title": subtask["title"], "ok": False,
+                    "rounds": rounds,
+                    "issues": f"worker crash: "
+                              f"{type(exc).__name__}: {exc}",
+                    "summary": ""}
+        # Mechanical landing check BEFORE the critic: a file
+        # the worker never wrote is a failure no critic's
+        # mood can overrule.
+        missing = [name for name in subtask["files"]
+                   if not (workspace / name).exists()]
+        if missing:
+            issues = ("ye files bani hi nahi: "
+                      + ", ".join(missing))[:600]
+            if rounds > MAX_REPAIRS:
+                return {"title": subtask["title"], "ok": False,
+                        "rounds": rounds, "issues": issues,
+                        "summary": str(summary)[:300]}
+            continue
         content = _read_workspace(workspace, subtask["files"])
-        verdict = critic(task, subtask, content, summary)
-        if verdict.get("ok"):
+        try:
+            verdict = critic(task, subtask, content, summary)
+        except Exception as exc:
+            return {"title": subtask["title"], "ok": False,
+                    "rounds": rounds,
+                    "issues": f"critic crash: "
+                              f"{type(exc).__name__}: {exc}",
+                    "summary": str(summary)[:300]}
+        # ok must be exactly True — a critic answering the
+        # STRING "false" is not a pass (audit 2026-10-22:
+        # truthiness merged rejected work).
+        if isinstance(verdict, dict) and verdict.get("ok") is True:
             return {"title": subtask["title"], "ok": True,
                     "rounds": rounds, "summary": str(summary)[:300]}
-        issues = str(verdict.get("issues", ""))[:600]
+        issues = str(verdict.get("issues", "")
+                     if isinstance(verdict, dict) else
+                     "critic ka jawab kharab tha")[:600]
         if rounds > MAX_REPAIRS:
             return {"title": subtask["title"], "ok": False,
                     "rounds": rounds, "issues": issues,
@@ -189,19 +246,34 @@ def run_team(data_dir, task: str, planner: Callable,
                         base / f"agent-{i + 1}", worker, critic)
             for i, subtask in enumerate(subtasks)]
         for future in futures:
-            results.append(future.result())
+            try:
+                results.append(future.result())
+            except Exception as exc:
+                results.append(
+                    {"title": "?", "ok": False,
+                     "issues": f"subtask crash: "
+                               f"{type(exc).__name__}: {exc}"})
     output = Path(target_dir) if target_dir else base / "output"
     output.mkdir(parents=True, exist_ok=True)
     for i, (subtask, result) in enumerate(zip(subtasks, results)):
         if not result.get("ok"):
             continue
         workspace = base / f"agent-{i + 1}"
+        # The merge VERIFIES the landing: every owned file of
+        # a passed subtask must arrive in the output — a
+        # vanished file flips the subtask to failed instead
+        # of shipping a hole as a deliverable.
         for name in subtask["files"]:
             source = workspace / name
+            dest = output / name
             if source.exists():
-                dest = output / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, dest)
+            if not dest.exists():
+                result["ok"] = False
+                result["issues"] = (
+                    str(result.get("issues", ""))
+                    + f" merge me file nahi mili: {name}").strip()
     verification = verify_output(output)
     report.update({
         "ok": all(r.get("ok") for r in results)

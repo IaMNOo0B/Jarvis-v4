@@ -64,6 +64,12 @@ def run_mission(goal: str,
     cause named. Without repair_fn the loop behaves exactly
     as it always did — the first failure ends the mission."""
     max_steps = max(1, min(MAX_STEPS, int(max_steps)))
+    # The repair ceilings are module law, not suggestions —
+    # a caller passing 99 gets the ceiling (audit 2026-10-22).
+    max_repairs_per_step = max(0, min(MAX_REPAIRS_PER_STEP,
+                                      int(max_repairs_per_step)))
+    max_repairs_total = max(0, min(MAX_REPAIRS_TOTAL,
+                                   int(max_repairs_total)))
     log: List[Dict] = []
     repairs: List[Dict] = []
     state, note = "stuck", "koi kadam hi nahi chala"
@@ -87,7 +93,23 @@ def run_mission(goal: str,
                 summary = failure
             if failure is None:
                 log.append({"step": n, "summary": summary})
-                verdict = check_fn(goal, log) or {}
+                # The judge is a brain: it can crash or answer
+                # nonsense. Both are a STUCK verdict with the
+                # reason named — never a crash out of the
+                # mission, never a silent continue (audit
+                # 2026-10-22: check_fn exceptions escaped
+                # run_mission entirely).
+                try:
+                    verdict = check_fn(goal, log)
+                except Exception as exc:
+                    verdict = {"state": "stuck",
+                               "note": f"judge fail: "
+                                       f"{type(exc).__name__}: "
+                                       f"{exc}"}
+                if not isinstance(verdict, dict):
+                    verdict = {"state": "stuck",
+                               "note": "judge ka jawab dict "
+                                       "nahi tha"}
                 if on_step is not None:
                     on_step(n, verdict, log[-1])
                 state = str(verdict.get("state", "continue"))
@@ -95,12 +117,25 @@ def run_mission(goal: str,
                 if state in ("done", "owner"):
                     finished = True
                     break
-                if state != "stuck":
-                    break  # continue → the step is complete
-                failure = note or "judge ne stuck kaha"
+                if state == "continue":
+                    break  # the step is complete; walk on
+                if state == "stuck":
+                    failure = note or "judge ne stuck kaha"
+                else:
+                    # Unknown verdict ("DONE", "banana"):
+                    # fail CLOSED to stuck, with the word
+                    # named — the old code read anything
+                    # non-stuck as continue.
+                    failure = (f"judge ka ajib verdict "
+                               f"{state!r} — stuck mana gaya")
+                    note = failure
             else:
                 log.append({"step": n, "summary": summary})
             # ---- the self-healing cycle -------------------- #
+            if should_stop is not None and should_stop():
+                state, note = "stopped", "owner ne rok diya"
+                finished = True
+                break
             can_repair = (
                 repair_fn is not None
                 and attempts <= max_repairs_per_step
@@ -144,6 +179,13 @@ def run_mission(goal: str,
         note = (f"kadam ki had ({max_steps}) puri — goal abhi "
                 "baki hai; chaaho to mission dobara chalao, "
                 "woh wahin se aage badhega jahan log chhoda tha")
+    # steps_taken counts REAL steps — the repair/diagnosis
+    # entries in the log are not steps (audit 2026-10-22:
+    # 1 step + 1 repair reported steps_taken 3).
+    real_steps = sum(
+        1 for entry in log
+        if not str(entry.get("summary", "")).startswith(
+            "repair:"))
     return {"goal": goal, "state": state, "note": note,
-            "steps": log, "steps_taken": len(log),
+            "steps": log, "steps_taken": real_steps,
             "repairs": repairs, "repairs_made": len(repairs)}

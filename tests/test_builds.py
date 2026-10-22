@@ -58,7 +58,11 @@ def test_binding_reports_missing_and_extras(tmp_path):
     assert rep["extras"] == ["surprise.txt"]
     conf, why = computed_confidence(
         [{"ok": True}, {"ok": False}], rep)
-    assert conf == 0.5 and "verification 1/2" in why
+    # Base 0.5 (verify 1/2, binding 1/2), diluted by the one
+    # unplanned extra: x planned/(planned+extras) = 2/3
+    # (audit 2026-10-22 — extras used to cost nothing).
+    assert conf == 0.33 and "verification 1/2" in why
+    assert "bina-plan" in why
 
 
 class _Chain:

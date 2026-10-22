@@ -42,18 +42,36 @@ def _message(sender: str, to: str, subject: str,
     return msg
 
 
+def _recipients(to: str) -> list:
+    parts = str(to).replace(";", ",").split(",")
+    return [p.strip() for p in parts if p.strip()]
+
+
 def send_email(address: str, password: str, to: str,
                subject: str, body: str,
                smtp_factory=None) -> dict:
     """One real send over SMTP-SSL. Raises on failure — callers
-    report honestly, never swallow."""
+    report honestly, never swallow. send_message's refusal
+    dict is SURFACED (audit 2026-10-22: it was discarded, so
+    a refused recipient still reported a clean send): partial
+    refusals ride in the result; a total refusal raises. The
+    result names every recipient so the caller can count EACH
+    one against the account's daily cap."""
     (host, port), _ = hosts_for(address)
     factory = smtp_factory or smtplib.SMTP_SSL
     msg = _message(address, to, subject, body)
+    recipients = _recipients(to)
     with factory(host, port, timeout=30) as server:
         server.login(address, password)
-        server.send_message(msg)
+        refused = server.send_message(msg) or {}
+    refused = {str(k) for k in refused}
+    if recipients and refused >= set(recipients):
+        raise RuntimeError(
+            "saare recipients refuse ho gaye: "
+            + ", ".join(sorted(refused)))
     return {"ok": True, "from": address, "to": to,
+            "recipients": recipients,
+            "refused": sorted(refused),
             "via": f"{host}:{port}"}
 
 
@@ -67,10 +85,21 @@ def draft_email(address: str, password: str, to: str,
     factory = imap_factory or imaplib.IMAP4_SSL
     msg = _message(address, to, subject, body)
     raw = msg.as_bytes()
-    with factory(host, port) as server:
+    try:
+        server_cm = factory(host, port, timeout=30)
+    except TypeError:
+        server_cm = factory(host, port)
+    with server_cm as server:
         server.login(address, password)
         folder = "[Gmail]/Drafts" if "gmail" in host else "Drafts"
-        server.append(folder, "\\Draft",
-                      imaplib.Time2Internaldate(time.time()), raw)
+        # The APPEND result is the only proof the draft
+        # landed — a "NO" used to sail through as ok
+        # (audit 2026-10-22).
+        status, detail = server.append(
+            folder, "\\Draft",
+            imaplib.Time2Internaldate(time.time()), raw)
+        if str(status).upper() != "OK":
+            raise RuntimeError(
+                f"draft APPEND mana hua ({status}): {detail!r}")
     return {"ok": True, "from": address, "to": to,
             "draft_in": folder}

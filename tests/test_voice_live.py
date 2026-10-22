@@ -144,8 +144,14 @@ def test_audio_slicing_and_transcript_flush():
     session, sink, sockets = make_session(script)
     session.start()
     try:
-        assert wait_for(lambda: len(sink.transcripts) == 2)
+        # The USER's words commit at turnComplete; the
+        # ASSISTANT's wait for playback (audit 2026-10-22:
+        # heard-truncation — an interrupt must still be able
+        # to cut the unplayed tail, so turnComplete alone no
+        # longer flushes the reply into history).
+        assert wait_for(lambda: len(sink.transcripts) == 1)
         assert sink.transcripts[0] == ("user", "hello world")
+        session.on_playback_drained()
         assert sink.transcripts[1] == ("assistant", "Hi sir.")
         sizes = [len(s) for s in sink.audio]
         assert sizes == [2400, 672]       # ~50 ms slices

@@ -27,6 +27,9 @@ def good_root(tmp_path):
     (tmp_path / "jarvis" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "data").mkdir()
     (tmp_path / "models").mkdir()
+    # The wake check tests the same resolution the detector
+    # uses — a real model file, not just the folder.
+    (tmp_path / "models" / "hey_jarvis.onnx").write_bytes(b"onnx")
     return tmp_path
 
 

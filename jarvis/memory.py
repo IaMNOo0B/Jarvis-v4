@@ -40,14 +40,40 @@ JOURNAL_FILE = "journal.jsonl"
 
 
 _URL_IN_TEXT_RE = re.compile(r"(https?://\S+|www\.\S+)", re.I)
-_NUMBER_IN_TEXT_RE = re.compile(r"\d[\d,.]*")
+# Real number tokens: grouped thousands or plain digits, with
+# an optional decimal part. A sentence-final period is NOT
+# part of the number (the old \d[\d,.]* swallowed it, so
+# "500." never matched the evidence's "500" and honest
+# corrections were blocked — audit 2026-10-22).
+_NUMBER_IN_TEXT_RE = re.compile(
+    r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?")
+
+
+def _number_key(token: str) -> str:
+    """Canonical numeric value of a token: '1,000', '1000' and
+    '1000.00' are the same figure; '50' and '500' are NOT
+    (the old raw-substring check passed '50' inside '500' —
+    the exact figure-swap the rule exists to stop)."""
+    from decimal import Decimal, InvalidOperation
+    try:
+        return format(
+            Decimal(str(token).replace(",", "")).normalize(),
+            "f")
+    except (InvalidOperation, ValueError):
+        return str(token)
+
+
+def _numbers_in(text: str) -> set:
+    return {_number_key(n)
+            for n in _NUMBER_IN_TEXT_RE.findall(str(text))}
 
 
 def evidence_problems(claim: str, evidence: Optional[str]) -> list:
     """Dodaios's evidence rule as a check: the supporting quote
     must be a real quote (>= 12 chars), and every URL or number the
     claim carries must appear in it — a distilled fact may not
-    invent a link or a figure the owner never said. No evidence
+    invent a link or a figure the owner never said. Numbers
+    compare by VALUE, not by substring. No evidence
     supplied -> no problems (the rule binds only provenanced
     writes)."""
     if evidence is None:
@@ -61,12 +87,34 @@ def evidence_problems(claim: str, evidence: Optional[str]) -> list:
             problems.append(
                 f"claim cites a link the evidence never mentions: "
                 f"{url}")
+    ev_numbers = _numbers_in(ev)
     for num in _NUMBER_IN_TEXT_RE.findall(str(claim)):
-        if num not in ev:
+        if _number_key(num) not in ev_numbers:
             problems.append(
                 f"claim cites a number the evidence never "
                 f"mentions: {num}")
     return problems
+
+
+_ATTRIBUTION_RE = re.compile(
+    r"\b(owner|owais|malik|user)\s+(said|says|told|ne kaha|"
+    r"ka kehna)\b|\byou told me\b|\bthe owner said\b", re.I)
+
+_STOPWORDS = frozenset({
+    "the", "a", "an", "is", "are", "was", "were", "on", "in",
+    "at", "of", "to", "for", "and", "or", "it", "its", "this",
+    "that", "hai", "hain", "ka", "ki", "ke", "ko", "me", "mein",
+    "par", "se", "ne", "bhi", "tha", "thi", "ek", "ye", "woh",
+})
+
+
+def _content_tokens(text: str) -> set:
+    """Tokens that carry meaning — function words removed.
+    Supersession decisions ride on this: overlap built from
+    'the'/'is' alone once let a lesson about Sydney delete
+    an unrelated meeting fact (audit 2026-10-22)."""
+    return {t for t in rag.tokenize(str(text))
+            if t not in _STOPWORDS and len(t) > 1}
 
 
 def _overlap_score(query_tokens: set, claim_tokens: set) -> float:
@@ -98,13 +146,21 @@ class Memory:
         self._lock = threading.Lock()
         self._db = sqlite3.connect(
             os.path.join(self.data_dir, HISTORY_DB),
-            check_same_thread=False)
+            check_same_thread=False, timeout=15.0)
         self._fts = self._init_history(use_fts)
 
     # -- history store -------------------------------------------------
 
     def _init_history(self, use_fts: Optional[bool]) -> bool:
         with self._lock:
+            # A second connection holding the DB must not make
+            # note_turn raise and lose the owner's turn
+            # (audit 2026-10-22): wait for the lock, in WAL.
+            try:
+                self._db.execute("PRAGMA journal_mode=WAL")
+                self._db.execute("PRAGMA busy_timeout=15000")
+            except sqlite3.OperationalError:
+                pass
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS turns "
                 "(id INTEGER PRIMARY KEY, role TEXT, text TEXT)")
@@ -117,6 +173,20 @@ class Memory:
                     "USING fts5(role, text, content='turns', "
                     "content_rowid='id')")
                 self._db.commit()
+                # Turns noted while FTS was off (or by an older
+                # build) never entered the index and stayed
+                # invisible to search forever: when the counts
+                # disagree, rebuild the index from the turns
+                # table once.
+                turns_n = self._db.execute(
+                    "SELECT COUNT(*) FROM turns").fetchone()[0]
+                fts_n = self._db.execute(
+                    "SELECT COUNT(*) FROM turns_fts").fetchone()[0]
+                if turns_n != fts_n:
+                    self._db.execute(
+                        "INSERT INTO turns_fts(turns_fts) "
+                        "VALUES('rebuild')")
+                    self._db.commit()
                 return True
             except sqlite3.OperationalError:
                 return False
@@ -135,6 +205,28 @@ class Memory:
         owner quote the claim rests on (Dodaios's evidence rule),
         stored with the record. Journaled, always."""
         trust = source if source in TRUST_LEVELS else "inference"
+        # Dedupe: the identical claim already current is not
+        # stored twice (audit 2026-10-22 — a duplicated wrong
+        # fact survived its own correction because the lesson
+        # superseded only one copy).
+        norm = " ".join(str(text).lower().split())
+        for rec in self.facts.current_facts():
+            if " ".join(str(rec["claim"]).lower().split()) == norm:
+                self.journal.append("memory.learn_duplicate", {
+                    "fact_id": rec["id"], "claim": str(text)})
+                return rec
+        # The evidence rule binds here too, not only in
+        # learn_lesson: invented numbers/links are journaled
+        # where anyone can audit them.
+        problems = evidence_problems(str(text), evidence)
+        # A weak channel's text claiming the owner's authority
+        # ("the owner said: ...") is the poisoning shape: it
+        # is stored at its channel trust (never higher), the
+        # claim is flagged on the record and in the journal,
+        # and recall's trust weighting keeps it below real
+        # owner facts.
+        attribution = trust != "owner" and bool(
+            _ATTRIBUTION_RE.search(str(text)))
         record = self.facts.add(claim=str(text), source=str(source),
                                 source_trust=trust, presented_as=trust,
                                 evidence=evidence)
@@ -144,7 +236,16 @@ class Memory:
             "source_trust": record["source_trust"],
             "claim": str(text),
             "has_evidence": bool(evidence),
+            "evidence_problems": problems,
+            "attribution_claim": attribution,
         })
+        if attribution:
+            self.journal.append("memory.attribution_flagged", {
+                "fact_id": record["id"], "source": str(source),
+                "claim": str(text)[:120]})
+        if problems:
+            record = dict(record)
+            record["evidence_problems"] = problems
         try:
             self.graph.add_fact(record)
         except Exception:
@@ -184,16 +285,25 @@ class Memory:
         claim = (f"Lesson: {str(lesson).strip()} "
                  f"(Earlier wrong: {str(wrong).strip()}. "
                  f"Correct: {str(correct).strip()}.)")
-        supersedes = None
-        wrong_tokens = set(rag.tokenize(str(wrong)))
-        best, best_score = None, 0.0
+        # Supersede EVERY current fact the wrong claim matches
+        # — not just the single best (a duplicated wrong fact
+        # otherwise survives its own correction). Matching
+        # runs on content tokens: stopword overlap ('the',
+        # 'is') once let an unrelated fact be deleted.
+        wrong_tokens = _content_tokens(str(wrong))
+        if not wrong_tokens:
+            wrong_tokens = set(rag.tokenize(str(wrong)))
+        targets = []
         for rec in self.facts.current_facts():
             score = _overlap_score(
-                wrong_tokens, set(rag.tokenize(rec["claim"])))
-            if score > best_score:
-                best, best_score = rec, score
-        if best is not None and best_score >= 0.5:
-            supersedes = best["id"]
+                wrong_tokens, _content_tokens(rec["claim"]))
+            if score >= 0.5:
+                targets.append(rec["id"])
+        # Stored shape stays the historical one: a bare id for
+        # the single-target case, a list only for a true
+        # multi-supersede.
+        supersedes = (targets[0] if len(targets) == 1
+                      else targets or None)
         problems = evidence_problems(claim, evidence)
         if problems:
             # The evidence rule's teeth: a lesson whose numbers or
@@ -222,10 +332,20 @@ class Memory:
         the query. Only facts sharing at least one token are returned —
         an empty list honestly means "nothing stored about that"."""
         q_tokens = set(rag.tokenize(str(query)))
+        # Trust weights the rank (audit 2026-10-22): a terse
+        # web claim once outscored the owner's own full fact
+        # and the fast path served it verbatim. Channel trust
+        # is a multiplier, never a gate — weak sources still
+        # recall, they just cannot outrank the owner on a
+        # similar overlap.
+        trust_weight = {"owner": 1.0, "tool": 0.85,
+                        "inference": 0.8, "web": 0.6}
         scored = []
         for idx, rec in enumerate(self.facts.current_facts()):
             score = _overlap_score(q_tokens,
                                    set(rag.tokenize(rec["claim"])))
+            score *= trust_weight.get(
+                rec.get("source_trust"), 0.8)
             if score > 0.0:
                 scored.append((score, idx, rec))
         scored.sort(key=lambda item: (-item[0], -item[1]))
@@ -248,7 +368,10 @@ class Memory:
             extra = 0
             for edge in self.graph.about(
                     str(query), current_ids)["edges"]:
-                if extra >= 2:
+                # The caller's k is a budget, not a floor:
+                # expansion fills free slots, never overflows
+                # past k (audit 2026-10-22: k=1 returned 3).
+                if extra >= 2 or len(hits) >= k:
                     break
                 rec = self.facts.get(edge["fact_id"])
                 if rec is None or rec["id"] in seen:

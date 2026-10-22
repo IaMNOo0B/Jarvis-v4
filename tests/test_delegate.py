@@ -64,7 +64,14 @@ def test_run_delegated_completes_and_notifies(tmp_path):
 
 
 def test_delegate_op_spawns_and_reports(tmp_path):
-    holder = {"parts": _parts(tmp_path)}
+    # A real script: one tool call, then the report. (The old
+    # default — a bare "Ho gaya" with no tool call — is an
+    # honest_stop under the completion audit, and the task
+    # log now says so instead of "done": batch-7 honesty.)
+    holder = {"parts": _parts(tmp_path, [
+        {"content": "", "tool_calls": [
+            {"id": "c1", "name": "time_now", "arguments": {}}]},
+        {"content": "Report ban gaya, sir."}])}
     op = _delegate_op(holder, tmp_path)
     out = op(task="find the cheapest flight options")
     assert out["ok"] is True and out["task_id"]

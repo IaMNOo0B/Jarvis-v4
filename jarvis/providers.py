@@ -45,6 +45,7 @@ has landed; until then the local table below — same shape — is used.
 
 from __future__ import annotations
 
+import http.client
 import json
 import socket
 import time
@@ -167,6 +168,13 @@ def urllib_transport(url: str, body: bytes, headers: Dict[str, str],
         if isinstance(reason, (socket.timeout, TimeoutError)):
             raise ProviderTimeout(f"timeout after {timeout}s: {reason}") from e
         raise ProviderDown(f"unreachable: {reason}") from e
+    except http.client.HTTPException as e:
+        # IncompleteRead & friends: a truncated HTTP stream is
+        # a provider failure the chain may fall through —
+        # left unconverted it escaped urllib_transport raw
+        # and killed the whole chain (it ended two live
+        # judge-eval runs on 2026-10-22).
+        raise ProviderDown(f"http stream error: {e}") from e
     except OSError as e:
         raise ProviderDown(f"connection error: {e}") from e
 
@@ -292,6 +300,23 @@ def _secret_for(secrets: Any, name: str) -> Optional[str]:
     return str(value) if value else None
 
 
+def _secret_list_for(secrets: Any, name: str) -> List[str]:
+    """ALL of a provider's keys (the rotation pool), in filed
+    order. A single key is a pool of one."""
+    if secrets is None:
+        return []
+    value = None
+    if isinstance(secrets, Mapping):
+        value = secrets.get(name)
+    elif hasattr(secrets, "get_key"):
+        value = secrets.get_key(name)
+    elif hasattr(secrets, "get"):
+        value = secrets.get(name)
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value if item]
+    return [str(value)] if value else []
+
+
 def _parse_arguments(raw: Any) -> Dict[str, Any]:
     if isinstance(raw, Mapping):
         return dict(raw)
@@ -354,6 +379,55 @@ class _HTTPProvider:
 # ---------------------------------------------------------------------------
 
 
+def _ollama_payload(model: str, messages, tools) -> Dict[str, Any]:
+    """The brain's internal messages -> Ollama /api/chat shape.
+
+    The brain carries tool-call arguments as a JSON STRING
+    (OpenAI's wire shape). Ollama's chat dialect wants the
+    arguments as an OBJECT — forwarding the brain's messages
+    verbatim made Ollama's template layer try to parse the
+    string as an object and die: HTTP 400 'Value looks like
+    object, but can't find closing } symbol' on every tool
+    turn, while text turns sailed through (live /diagnose,
+    2026-10-22). Convert here, at the dialect border, the
+    same way _gemini_payload converts for Gemini."""
+    out: List[Dict[str, Any]] = []
+    for msg in messages or []:
+        if not isinstance(msg, Mapping):
+            continue
+        role = str(msg.get("role") or "user")
+        if role in ("tool", "function"):
+            entry: Dict[str, Any] = {
+                "role": "tool",
+                "content": _message_text(msg.get("content"))}
+            if msg.get("name"):
+                entry["tool_name"] = str(msg["name"])
+            out.append(entry)
+            continue
+        entry = {"role": role,
+                 "content": _message_text(msg.get("content"))}
+        if role == "assistant" and msg.get("tool_calls"):
+            calls = []
+            for call in msg["tool_calls"]:
+                if not isinstance(call, Mapping):
+                    continue
+                fn = call.get("function") or call
+                args = fn.get("arguments")
+                if isinstance(args, str):
+                    args = _parse_arguments(args)
+                calls.append({"function": {
+                    "name": str(fn.get("name") or ""),
+                    "arguments": args or {}}})
+            if calls:
+                entry["tool_calls"] = calls
+        out.append(entry)
+    payload: Dict[str, Any] = {"model": model, "messages": out,
+                               "stream": False}
+    if tools:
+        payload["tools"] = list(tools)
+    return payload
+
+
 class OllamaProvider(_HTTPProvider):
     """Local Ollama — POST {base}/api/chat. No key; default timeout 120 s
     (a cold 7B load on a 6 GB card is slow, and correctly so)."""
@@ -370,11 +444,7 @@ class OllamaProvider(_HTTPProvider):
         self.timeout = float(timeout)
 
     def complete(self, messages, tools=None) -> ProviderReply:
-        payload: Dict[str, Any] = {"model": self.model,
-                                   "messages": list(messages),
-                                   "stream": False}
-        if tools:
-            payload["tools"] = list(tools)
+        payload = _ollama_payload(self.model, messages, tools)
         data = self._post_json(f"{self.base_url}/api/chat", payload)
         msg = data.get("message") or {}
         calls: List[ToolCall] = []
@@ -401,15 +471,52 @@ class CompatProvider(_HTTPProvider):
 
     def __init__(self, name: str, base_url: str, model: str,
                  api_key: Optional[str] = None, timeout: float = 60.0,
-                 transport: Optional[Transport] = None):
+                 transport: Optional[Transport] = None,
+                 api_keys: Optional[Sequence[str]] = None):
         super().__init__(transport)
         self.name = str(name)
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.api_key = api_key
+        # The rotation pool: every key the owner filed for
+        # this provider. api_key always names the CURRENT key
+        # (the first until a rotation moves it).
+        pool = [str(k) for k in (api_keys or []) if k]
+        if api_key and api_key not in pool:
+            pool.insert(0, api_key)
+        self._keys = pool
+        self._key_idx = 0
+        self.api_key = pool[0] if pool else api_key
         self.timeout = float(timeout)
 
+    def _rotate_key(self) -> bool:
+        """Advance to the next filed key. False when the pool
+        has no other key to try."""
+        if len(self._keys) < 2:
+            return False
+        self._key_idx = (self._key_idx + 1) % len(self._keys)
+        self.api_key = self._keys[self._key_idx]
+        return True
+
     def complete(self, messages, tools=None) -> ProviderReply:
+        # Auth/quota failures (401/403/429) rotate to the next
+        # filed key and retry — a second key used to sit
+        # unused while the chain fell through to weaker
+        # brains (audit 2026-10-22).
+        attempts = max(1, len(self._keys))
+        last: Optional[ProviderError] = None
+        for i in range(attempts):
+            try:
+                return self._complete_once(messages, tools)
+            except ProviderHTTPError as e:
+                last = e
+                if e.status in (401, 403, 429) \
+                        and i + 1 < attempts \
+                        and self._rotate_key():
+                    continue
+                raise
+        raise last or ProviderDown(f"{self.name}: no key answered")
+
+    def _complete_once(self, messages, tools=None) -> ProviderReply:
         payload: Dict[str, Any] = {"model": self.model,
                                    "messages": list(messages)}
         if tools:
@@ -501,8 +608,18 @@ def _message_text(content) -> str:
     return str(content)
 
 
-def _gemini_payload(messages, tools):
-    """OpenAI-shaped conversation -> Gemini generateContent body."""
+def _gemini_payload(messages, tools, signatures=None):
+    """OpenAI-shaped conversation -> Gemini generateContent body.
+
+    ``signatures`` maps tool-call ids to the thoughtSignature
+    Gemini attached to that call's part: thinking models
+    REJECT the follow-up request unless the signature rides
+    back on the functionCall part it belongs to (live
+    /diagnose 2026-10-22: HTTP 400 'Function call is missing
+    a thought_signature' — every Gemini tool turn died).
+    The map lives on the provider instance; the signature
+    never enters the shared message dicts, so no other
+    provider ever sees it."""
     system_texts: List[str] = []
     contents: List[Dict[str, Any]] = []
     for msg in messages or []:
@@ -533,9 +650,15 @@ def _gemini_payload(messages, tools):
                     args = fn.get("arguments")
                     if isinstance(args, str):
                         args = _parse_arguments(args)
-                    parts.append({"functionCall": {
+                    part: Dict[str, Any] = {"functionCall": {
                         "name": str(fn.get("name") or ""),
-                        "args": args or {}}})
+                        "args": args or {}}}
+                    cid = call.get("id")
+                    if signatures and cid and \
+                            signatures.get(str(cid)):
+                        part["thoughtSignature"] = \
+                            signatures[str(cid)]
+                    parts.append(part)
         contents.append({"role": "model" if role == "assistant"
                          else "user",
                          "parts": parts or [{"text": ""}]})
@@ -576,9 +699,19 @@ class GeminiProvider(_HTTPProvider):
                  base_url: str = "https://generativelanguage.googleapis.com",
                  timeout: float = 60.0,
                  transport: Optional[Transport] = None,
-                 clock: Callable[[], float] = time.monotonic):
+                 clock: Callable[[], float] = time.monotonic,
+                 api_keys: Optional[Sequence[str]] = None):
         super().__init__(transport)
-        self.api_key = api_key
+        # The rotation pool, same discipline as the compat
+        # providers: api_key names the CURRENT key; an
+        # auth/quota failure rotates BEFORE a rung is rested
+        # for hours (audit 2026-10-22).
+        pool = [str(k) for k in (api_keys or []) if k]
+        if api_key and api_key not in pool:
+            pool.insert(0, api_key)
+        self._keys = pool
+        self._key_idx = 0
+        self.api_key = pool[0] if pool else api_key
         self.models = [str(m) for m in models if m] \
             or list(GEMINI_MODEL_LADDER)
         self.model = self.models[0]
@@ -586,6 +719,11 @@ class GeminiProvider(_HTTPProvider):
         self.timeout = float(timeout)
         self._clock = clock
         self._rested_until: Dict[str, float] = {}
+        # thoughtSignature cache: tool-call id -> signature,
+        # recorded as responses are parsed, echoed back by
+        # _gemini_payload. Bounded (oldest evicted past 500).
+        self._signatures: Dict[str, str] = {}
+        self._call_seq = 0
 
     def _rungs(self) -> List[str]:
         now = self._clock()
@@ -593,23 +731,44 @@ class GeminiProvider(_HTTPProvider):
                 if self._rested_until.get(m, 0.0) <= now]
         return live or list(self.models)  # all resting -> try anyway
 
+    def _rotate_key(self) -> bool:
+        if len(self._keys) < 2:
+            return False
+        self._key_idx = (self._key_idx + 1) % len(self._keys)
+        self.api_key = self._keys[self._key_idx]
+        return True
+
     def complete(self, messages, tools=None) -> ProviderReply:
-        payload = _gemini_payload(messages, tools)
+        payload = _gemini_payload(messages, tools,
+                                  self._signatures)
         last_error: Optional[ProviderError] = None
         for model in self._rungs():
             url = (f"{self.base_url}/v1beta/models/{model}"
                    ":generateContent")
-            try:
-                data = self._post_json(
-                    url, payload,
-                    headers={"x-goog-api-key": self.api_key})
-            except ProviderHTTPError as e:
-                rest = _GEMINI_REST_S.get(e.status)
-                if rest:
-                    self._rested_until[model] = self._clock() + rest
-                last_error = e
-                continue
-            return self._reply(data, model)
+            # Per rung: every filed key gets its chance before
+            # the rung rests; ANY ProviderError (timeout,
+            # no-candidates, HTTP) advances the ladder — the
+            # old code caught only HTTP errors, so a timeout
+            # or an empty reply killed the whole provider.
+            for _ in range(max(1, len(self._keys))):
+                try:
+                    data = self._post_json(
+                        url, payload,
+                        headers={"x-goog-api-key": self.api_key})
+                    return self._reply(data, model)
+                except ProviderHTTPError as e:
+                    last_error = e
+                    if e.status in (401, 403, 429) \
+                            and self._rotate_key():
+                        continue    # same rung, next key
+                    rest = _GEMINI_REST_S.get(e.status)
+                    if rest:
+                        self._rested_until[model] = \
+                            self._clock() + rest
+                    break           # next rung
+                except ProviderError as e:
+                    last_error = e
+                    break           # next rung
         raise last_error or ProviderDown("gemini: no model answered")
 
     def generate_content(self, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -622,20 +781,28 @@ class GeminiProvider(_HTTPProvider):
         for model in self._rungs():
             url = (f"{self.base_url}/v1beta/models/{model}"
                    ":generateContent")
-            try:
-                return self._post_json(
-                    url, payload,
-                    headers={"x-goog-api-key": self.api_key})
-            except ProviderHTTPError as e:
-                rest = _GEMINI_REST_S.get(e.status)
-                if rest:
-                    self._rested_until[model] = self._clock() + rest
-                last_error = e
-                continue
+            for _ in range(max(1, len(self._keys))):
+                try:
+                    return self._post_json(
+                        url, payload,
+                        headers={"x-goog-api-key": self.api_key})
+                except ProviderHTTPError as e:
+                    last_error = e
+                    if e.status in (401, 403, 429) \
+                            and self._rotate_key():
+                        continue
+                    rest = _GEMINI_REST_S.get(e.status)
+                    if rest:
+                        self._rested_until[model] = \
+                            self._clock() + rest
+                    break
+                except ProviderError as e:
+                    last_error = e
+                    break
         raise last_error or ProviderDown("gemini: no model answered")
 
-    @staticmethod
-    def _reply(data: Dict[str, Any], model: str) -> ProviderReply:
+    def _reply(self, data: Dict[str, Any],
+               model: str) -> ProviderReply:
         candidates = data.get("candidates") or []
         if not candidates:
             feedback = data.get("promptFeedback") or {}
@@ -646,15 +813,23 @@ class GeminiProvider(_HTTPProvider):
                  or [])
         texts: List[str] = []
         calls: List[ToolCall] = []
-        for i, part in enumerate(parts):
+        for part in parts:
             if not isinstance(part, Mapping):
                 continue
             if part.get("text"):
                 texts.append(str(part["text"]))
             fn = part.get("functionCall")
             if isinstance(fn, Mapping):
+                self._call_seq += 1
+                call_id = f"gemini-{self._call_seq}"
+                signature = part.get("thoughtSignature")
+                if signature:
+                    self._signatures[call_id] = str(signature)
+                    while len(self._signatures) > 500:
+                        self._signatures.pop(
+                            next(iter(self._signatures)))
                 calls.append(ToolCall(
-                    id=f"gemini-{i}",
+                    id=call_id,
                     name=str(fn.get("name", "")),
                     arguments=fn.get("args") or {}))
         usage = {}
@@ -744,7 +919,12 @@ class FallbackChain:
             t0 = self._clock()
             try:
                 reply = provider.complete(messages, tools=tools)
-            except ProviderError as e:
+            except Exception as e:
+                # ANY provider failure falls through (audit
+                # 2026-10-22: only ProviderError did — a raw
+                # http.client.IncompleteRead from a transport
+                # killed the entire chain and the owner got
+                # silence from a healthy second brain).
                 self._record(provider.name, t0, ok=False, quality_ok=False,
                              error=str(e))
                 last_error = f"{provider.name}: {e}"
@@ -795,12 +975,30 @@ def build_chain(config: Any = None, secrets: Any = None,
     chain: List[Any] = []
     timeouts = _cfg(config, "timeouts", default={}) or {}
 
+    def _preset_override(preset_name: str):
+        """Per-preset overrides (model / base_url / timeout).
+        Two homes, in order: the legacy providers_config
+        section, then a config["providers"] entry NAMED for
+        the preset (audit 2026-10-22: the providers_config
+        read was dead — nothing ever wrote that section,
+        while owners naturally put overrides in providers)."""
+        override = _cfg(config, "providers_config", preset_name,
+                        default=None)
+        if isinstance(override, Mapping):
+            return override
+        for entry in _cfg(config, "providers", default=[]) or []:
+            if isinstance(entry, Mapping) \
+                    and str(entry.get("name") or "") == preset_name:
+                return entry
+        return {}
+
     # 1. Keyed compat providers, smartest-first by preset order.
     for preset in PRESETS:
         key = _secret_for(secrets, preset.name)
         if not key:
             continue  # no key -> not in the chain at all
-        override = _cfg(config, "providers_config", preset.name, default={})
+        keys = _secret_list_for(secrets, preset.name)
+        override = _preset_override(preset.name)
         if preset.name == "gemini":
             # Native Gemini API + model ladder (the Mark-LVI lesson) —
             # never the OpenAI-shaped detour for an AI Studio key.
@@ -813,7 +1011,7 @@ def build_chain(config: Any = None, secrets: Any = None,
                 timeout=float(timeouts.get(
                     preset.name,
                     _cfg(override, "timeout", default=preset.timeout))),
-                transport=transport))
+                transport=transport, api_keys=keys))
             continue
         chain.append(CompatProvider(
             name=preset.name,
@@ -823,7 +1021,7 @@ def build_chain(config: Any = None, secrets: Any = None,
             timeout=float(timeouts.get(preset.name,
                                        _cfg(override, "timeout",
                                             default=preset.timeout))),
-            transport=transport))
+            transport=transport, api_keys=keys))
 
     # 2. Owner-declared custom providers (config["providers"] list).
     for entry in _cfg(config, "providers", default=[]) or []:

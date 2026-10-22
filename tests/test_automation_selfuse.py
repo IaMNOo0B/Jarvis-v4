@@ -53,6 +53,14 @@ def test_matched_route_runs_without_the_brain(tmp_path):
     chain = MarkerChain()
     app = ChatApp(tmp_path, chain=chain)
     _mk_route(app)
+    # The route self-runs from the ACT band: seed the
+    # automations domain's lived record first (an unproven
+    # domain is verify-band since batch 7 and goes to the
+    # brain instead — by design).
+    for _ in range(4):
+        row = app.calibrator.record("core.automations",
+                                    "route chalega", 0.7)
+        app.calibrator.resolve(row["id"], True)
     reply = app.turn("roz ki entry kar do aaj ki")
     assert reply.startswith("🤖 Automation 'roz-entry'")
     assert chain.calls == 0            # the brain never woke

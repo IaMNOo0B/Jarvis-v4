@@ -467,16 +467,25 @@ def _mail_ops(secrets, data_dir):
                              "app-password Settings me nahi "
                              "dala gaya, sir"}
         try:
-            mailer.send_email(row["address"], str(password),
-                              to, subject, body)
+            sent = mailer.send_email(row["address"],
+                                     str(password),
+                                     to, subject, body)
         except Exception as exc:
             return {"ok": False,
                     "error": f"email nahi gaya: "
                              f"{type(exc).__name__}: "
                              f"{str(exc)[:120]}"}
-        book.record_send(row["id"])
+        # Every DELIVERED recipient counts against the cap —
+        # one record_send per address, refused ones excluded
+        # (audit 2026-10-22: a 5-recipient send counted once).
+        delivered = [r for r in
+                     sent.get("recipients", [to])
+                     if r not in sent.get("refused", [])] or [to]
+        for _ in delivered:
+            book.record_send(row["id"])
         return {"ok": True, "account": row["label"], "to": to,
-                "sent_today": row["sent_count"] + 1,
+                "refused": sent.get("refused", []),
+                "sent_today": row["sent_count"] + len(delivered),
                 "cap": row["cap"]}
 
     def email_draft(to: str, subject: str, body: str,
@@ -1194,13 +1203,24 @@ def _calibration_ops(calibrator):
     model), and ask the calibration map before acting."""
     def record_decision(domain: str, claim: str,
                         confidence: float):
-        row = calibrator.record(domain, claim, confidence)
+        try:
+            row = calibrator.record(domain, claim, confidence)
+        except Exception as exc:
+            # The calibrator raises on write failure now — a
+            # decision that never reached disk gets an honest
+            # error, never a usable-looking id.
+            return {"ok": False,
+                    "error": f"decision likhi nahi gayi: {exc}"}
         return {"ok": True, "decision_id": row["id"],
                 "note": "nateeja aane par resolve_decision se "
                         "band karna — score khud lagega"}
 
     def resolve_decision(decision_id: str, right: bool):
-        row = calibrator.resolve(decision_id, bool(right))
+        try:
+            row = calibrator.resolve(decision_id, bool(right))
+        except Exception as exc:
+            return {"ok": False,
+                    "error": f"decision band nahi hui: {exc}"}
         if row is None:
             return {"ok": False,
                     "error": "woh decision mili nahi ya pehle se "
@@ -1637,6 +1657,34 @@ def _delegated_summary(parts, task_text: str) -> str:
     return str(result.reply)[:900]
 
 
+def _delegated_run(parts, task_text: str):
+    """(summary, stopped_reason) — the honest-status variant
+    of _delegated_summary: the brain's summary TEXT rides
+    first, but HOW the run ended rides beside it, so the task
+    log and the notification can say 'failed' when the brain
+    stopped short (audit 2026-10-22: _run_delegated marked
+    every non-crashing run 'done', including runs whose
+    tools all failed and whose summary literally said so)."""
+    from .brain import Brain
+    from .rules import chat_protocol
+    schemas = parts.registry.advertised_tools(parts.allowances)
+    from .router import route_schemas
+    subset = route_schemas(task_text, schemas)
+    brain = Brain(parts.chain, subset or schemas, parts.dispatch,
+                  parts.journal, parts.memory,
+                  **({"protocol": chat_protocol(parts.rules_text)}
+                     if getattr(parts, "rules_text", "") else {}))
+    prompt = (
+        "Background task from the owner (work autonomously "
+        "with your tools; do not ask questions — nobody is "
+        "watching live): " + task_text +
+        "\nWhen finished, end with a concise summary of what "
+        "was done and the outcome.")
+    result = brain.respond([], prompt)
+    return str(result.reply)[:900], str(
+        getattr(result, "stopped_reason", "completed"))
+
+
 def _local_summary(parts, task_text: str) -> str:
     """The same worker, but on the LOCAL brain only (Ollama) —
     the job scheduler's cheap road: a routine marked `local`
@@ -1671,8 +1719,12 @@ def _run_delegated(parts, data_dir, task_id: str, task: str) -> None:
     notification — the conversation that delegated it never
     blocks and never has to ask."""
     try:
-        summary = _delegated_summary(parts, task)
-        status = "done"
+        summary, reason = _delegated_run(parts, task)
+        if reason == "completed":
+            status = "done"
+        else:
+            status = "failed"
+            summary = f"[{reason}] {summary}"
     except Exception as exc:
         summary = f"Task failed: {type(exc).__name__}: {exc}"
         status = "failed"
@@ -1712,14 +1764,22 @@ def _run_batch(parts, data_dir, batch_id: str, tasks, fleet):
     owner asked not to be pestered), each lands in the task
     log, and ONE summary notification closes the batch."""
     results = fleet.run_many(
-        tasks, lambda t: _delegated_summary(parts, t))
+        tasks, lambda t: _delegated_run(parts, t))
     ok_count = 0
     failures = []
     for i, (task, res) in enumerate(zip(tasks, results)):
-        if res.get("ok"):
+        outcome = res.get("result") if res.get("ok") else None
+        if isinstance(outcome, tuple) and len(outcome) == 2 \
+                and outcome[1] == "completed":
             ok_count += 1
-            summary = str(res.get("result", ""))[:400]
+            summary = str(outcome[0])[:400]
             status = "done"
+        elif isinstance(outcome, tuple) and len(outcome) == 2:
+            # The worker RAN but stopped short — a failure
+            # with its reason, not a silent "done".
+            summary = f"[{outcome[1]}] {outcome[0]}"[:400]
+            status = "failed"
+            failures.append(f"{task[:60]} — {summary[:80]}")
         else:
             summary = str(res.get("error", ""))[:400]
             status = "failed"
@@ -1918,13 +1978,16 @@ def _run_mission_app(parts, data_dir, mission_id: str,
                            f"{type(exc).__name__}: {exc}",
                    "steps": [], "steps_taken": 0}
     if cal is not None and decision_ids:
+        # EVERY ending resolves the recorded 'aage badho'
+        # decisions (audit M5): done -> right; stuck, owner,
+        # budget and stopped all mean the mission did not land,
+        # so its proceed-decisions score wrong. Leaving them
+        # open forever poisoned the mission domain's map with
+        # perpetually-pending rows.
         try:
-            if outcome["state"] == "done":
-                for did in decision_ids:
-                    cal.resolve(did, True)
-            elif outcome["state"] == "stuck":
-                for did in decision_ids:
-                    cal.resolve(did, False)
+            landed = outcome["state"] == "done"
+            for did in decision_ids:
+                cal.resolve(did, landed)
         except Exception:
             pass
     _task_log(data_dir, {"id": mission_id, "kind": "mission",
@@ -2072,7 +2135,7 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
     no drip-feed."""
     from .builds import (BuildStore, binding_report,
                          computed_confidence, diff_trees,
-                         snapshot_tree)
+                         snapshot_tree_full)
     store = BuildStore(data_dir)
     state = store.load(build_id)
     if not state:
@@ -2083,7 +2146,7 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
     workspace.mkdir(parents=True, exist_ok=True)
     state["status"] = "executing"
     store.save(state)
-    baseline = snapshot_tree(workspace)
+    baseline, base_truncated = snapshot_tree_full(workspace)
     summaries = []
     changes_txt = "; ".join(
         f"[{c.get('action')}] {c.get('path')}"
@@ -2111,8 +2174,10 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
             state["step_states"][i] = "failed"
         summaries.append(str(summary)[:300])
         store.save(state)
-    diff = diff_trees(baseline, snapshot_tree(workspace))
+    after_snap, after_truncated = snapshot_tree_full(workspace)
+    diff = diff_trees(baseline, after_snap)
     binding = binding_report(plan, diff)
+    snapshot_truncated = base_truncated or after_truncated
     state["status"] = "verifying"
     store.save(state)
     verify_results = []
@@ -2188,6 +2253,11 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
               f"- Plan se bahar ke badlav: "
               f"{', '.join(binding['extras']) or '—'}",
               "", "## Verification (plan ka apna waada)"]
+    if snapshot_truncated:
+        lines.append(
+            "- ⚠️ Snapshot file-cap (5000) par kata — kuch "
+            "badlav ginne se reh sakte hain; upar ki bandish "
+            "adhoori ho sakti hai.")
     lines += [f"- [{'x' if r['ok'] else '!'}] ({r['kind']}) "
               f"{r['detail']} — {r['evidence'][:160]}"
               for r in verify_results]
@@ -2981,9 +3051,16 @@ class _BrainChainAdapter:
             if isinstance(call, dict):
                 calls.append(call)
             else:
-                calls.append({
+                entry = {
                     "name": getattr(call, "name", ""),
-                    "args": getattr(call, "arguments", None) or {}})
+                    "args": getattr(call, "arguments", None) or {}}
+                # The provider's call id rides along: Gemini's
+                # thoughtSignature cache is keyed by it, and the
+                # brain echoes the same id back next round.
+                cid = getattr(call, "id", "")
+                if cid:
+                    entry["id"] = str(cid)
+                calls.append(entry)
         provider = getattr(raw, "provider", "") or ""
         if provider:
             self._seen_provider = str(provider)
@@ -3056,7 +3133,7 @@ def _run_guarded(ledger, session_id, name, args, execute, journal):
 def make_dispatch(gate, registry, journal, allowances,
                   pass_decision=False, refused_exc=(), ledger=None,
                   session_id="", approval_sink=None,
-                  calibrator=None):
+                  calibrator=None, degraded=False):
     """The gate-mediated dispatch every tool call flows through.
 
     Journals tool.call (with the gate verdict) and tool.result — the
@@ -3073,6 +3150,20 @@ def make_dispatch(gate, registry, journal, allowances,
                        if t.get("destructive")}
         except Exception:
             guarded = set()
+
+    def _is_guarded(name) -> bool:
+        """LIVE destructive-class check (audit 2026-10-22:
+        the snapshot above is taken once at startup — a
+        destructive tool from a skill the Forge promotes at
+        RUNTIME was never in it and ran unledgered). The
+        registry's current tool record wins; the snapshot is
+        only the fallback for registries without one."""
+        tools = getattr(registry, "_tools", None)
+        if isinstance(tools, dict):
+            tool = tools.get(name)
+            if tool is not None:
+                return bool(getattr(tool, "destructive", False))
+        return name in guarded
 
     def _dispatch_once(name, args=None, origin="owner",
                        approved_decision=None):
@@ -3094,7 +3185,21 @@ def make_dispatch(gate, registry, journal, allowances,
         executable = verdict in ("allow", "allow_with_undo") or (
             verdict == "require_approval"
             and approved_decision is not None)
-        if executable:
+        if executable and degraded and _is_guarded(name):
+            # The degraded path (jarvis.skills failed to
+            # import, so _defaults is dispatching and NO gate
+            # decision rides along — nothing downstream will
+            # verify an approval token). A destructive-class
+            # tool must fail CLOSED here, never run bare
+            # (audit 2026-10-22). `degraded` is explicit:
+            # pass_decision=False alone is also a legitimate
+            # wiring for registries that take no decision.
+            result = {"ok": False, "gate_denied": True,
+                      "degraded_refusal": True,
+                      "error": f"{name} ek destructive tool hai "
+                               "aur degraded mode me bina gate "
+                               "decision ke nahi chal sakta, sir."}
+        elif executable:
 
             def _execute():
                 try:
@@ -3105,7 +3210,7 @@ def make_dispatch(gate, registry, journal, allowances,
                 except refused_exc as exc:
                     return {"ok": False, "error": str(exc)}
 
-            if ledger is not None and name in guarded:
+            if ledger is not None and _is_guarded(name):
                 result, replayed = _run_guarded(
                     ledger, session_id, name, args, _execute, journal)
             else:
@@ -4320,7 +4425,8 @@ def build_app(data_dir, *, chain=None, modules=None,
                       refused_exc=refused_exc, ledger=ledger,
                       session_id=session_id,
                       approval_sink=_card_book.add,
-                      calibrator=calibrator),
+                      calibrator=calibrator,
+                      degraded=skills_mod is _defaults),
         activity)
     tool_schemas = registry.advertised_tools(allowances)
     # The ONE rules file (the owner's standing order): the brain's
@@ -4484,11 +4590,24 @@ class ChatApp:
 
     def voice_status(self) -> dict:
         if self.voice_manager is None:
+            # No manager = voice OFF = NOT awake (audit
+            # 2026-10-22: awake was hard-coded True, and the
+            # HUD's setFx read it as "listening" forever).
             return {"active": False, "connected": False,
                     "speaking": False, "muted": False,
-                    "awake": True, "wake_word": False,
+                    "awake": False, "wake_word": False,
                     "voice": "Charon"}
         return self.voice_manager.status()
+
+    def voice_ptt_hold(self, held: bool) -> dict:
+        """Push-to-talk hold from the UI: while held, the mic
+        passes the wake gate. Voice off = nothing to hold."""
+        if self.voice_manager is None:
+            return {"ok": False,
+                    "error": "voice off hai, sir — pehle voice "
+                             "chalu karein"}
+        self.voice_manager.ptt_hold(bool(held))
+        return {"ok": True, "ptt_held": bool(held)}
 
     def _make_voice_session(self, events):
         """The Live session factory the VoiceManager calls: the
@@ -5267,12 +5386,16 @@ class ChatApp:
                     "error": f"build '{state['status']}' haal "
                              "me hai — Proceed sirf plan par "
                              "hota hai"}
+        # The transition itself is atomic (audit 2026-10-22:
+        # load-check-save raced — a double Proceed started
+        # the executor twice).
+        claimed = store.claim(build_id, approve)
+        if claimed is None:
+            return {"ok": False,
+                    "error": "build isi darmiyan kisi aur "
+                             "Proceed se aage badh gaya, sir"}
         if not approve:
-            state["status"] = "denied"
-            store.save(state)
             return {"ok": True, "status": "denied"}
-        state["status"] = "executing"
-        store.save(state)
         threading.Thread(target=_run_build_app,
                          args=(self.parts, self.data_dir,
                                build_id),
@@ -5307,7 +5430,12 @@ class ChatApp:
                 return (f"Card {card_id} radd kar diya, sir — "
                         "woh kaam nahi chalega.")
             return f"Card {card_id} pending nahi mila, sir."
-        card = book.take(card_id)
+        # Peek FIRST, consume LAST (audit 2026-10-22: the
+        # card was taken — burned — before the gate was
+        # re-evaluated, so a DENY verdict was misreported as
+        # "approval ki zaroorat nahi rahi" and the card was
+        # gone either way).
+        card = book.peek(card_id)
         if card is None:
             return (f"Card {card_id} nahi chala, sir — ya woh "
                     "pehle hi tay ho chuka hai, ya uski miyad "
@@ -5316,10 +5444,25 @@ class ChatApp:
         decision = self.gate.evaluate(
             card["tool"], card["args"], ifc.OWNER_ORIGIN,
             self.allowances)
-        if getattr(decision, "verdict", "") != "require_approval":
+        verdict = getattr(decision, "verdict", "")
+        if verdict == "deny":
+            book.deny(card_id)
+            self.journal.append("confirm.gate_denied",
+                                {"id": card_id,
+                                 "tool": card["tool"]})
+            return (f"Ab ye kaam mana hai, sir — gate ne "
+                    f"{card['tool']} ko deny kar diya "
+                    f"({getattr(decision, 'reason', '')}). "
+                    "Card radd kar diya; kuch nahi chalaya.")
+        if verdict != "require_approval":
+            book.take(card_id)     # retire the moot card
             return (f"Ab is kaam ko approval ki zaroorat nahi "
-                    f"rahi ({getattr(decision, 'verdict', '?')}) "
+                    f"rahi ({verdict}) "
                     "— kuch nahi chalaya, sir.")
+        card = book.take(card_id)
+        if card is None:
+            return (f"Card {card_id} isi darmiyan kisi aur "
+                    "ne tay kar diya, sir — kuch nahi chalaya.")
         result = self.parts.dispatch(
             card["tool"], card["args"],
             approved_decision=decision)
@@ -5380,15 +5523,33 @@ class ChatApp:
                     "action": pol["action"],
                     "calibrated": pol["calibrated"]})
                 if pol["action"] == "ask":
+                    # No "[Automation note:" wrapper here —
+                    # turn() adds it (audit 2026-10-22: the
+                    # hint arrived double-wrapped).
                     return (None,
-                            f"[Automation note: '{row['name']}' "
+                            f"'{row['name']}' "
                             "naam ka saved route mila tha, "
                             "lekin automations ki calibrated "
                             f"reliability kam hai "
                             f"({pol['calibrated']:.2f}) — khud "
                             "nahi chalaya. Owner ko ye batao "
                             "aur poochho route chalayen ya "
-                            "kaam haath se karein.]")
+                            "kaam haath se karein.")
+                if pol["action"] == "verify":
+                    # The middle band is NOT a mechanical
+                    # self-run (audit 2026-10-22: only "ask"
+                    # diverted, so verify-band routes ran
+                    # unwatched). The brain runs the route
+                    # itself and watches every step.
+                    return (None,
+                            f"'{row['name']}' naam ka saved "
+                            "route mila hai — automations ki "
+                            "calibrated reliability darmiyani "
+                            f"hai ({pol['calibrated']:.2f}), "
+                            "isliye khud nahi chalaya. Tum "
+                            "run_automation se ye route chalao "
+                            "aur har kadam ka nateeja khud "
+                            "dekho.")
                 report = run_steps(self.parts.dispatch, row, {})
                 book.note_run(row["name"],
                               str(report.get("status", "")))
@@ -5573,17 +5734,42 @@ class ChatApp:
             rows_before = len(self.goodput.to_rows())
             brain_text = text if not auto_hint else (
                 text + "\n[Automation note: " + auto_hint + "]")
-            result = self._brain_for(text).respond(
-                self._brain_history(), brain_text,
-                correction=bool(correction))
-            reply = str(result.reply)
-            stopped_reason = str(
-                getattr(result, "stopped_reason", "completed"))
-            via = "brain"
-            if not self.incognito:
-                note = self._automation_auto_create(text, result)
-                if note:
-                    reply = reply + "\n\n" + note
+            from .prompt import PromptBudgetError
+            result = None
+            try:
+                result = self._brain_for(text).respond(
+                    self._brain_history(), brain_text,
+                    correction=bool(correction))
+            except PromptBudgetError:
+                # ONE retry with an empty history — the
+                # minimal build. A bloated history must not
+                # silence the turn (audit 2026-10-22: the
+                # error propagated, /api/chat 500'd, and the
+                # owner heard nothing at all).
+                try:
+                    result = self._brain_for(text).respond(
+                        [], brain_text,
+                        correction=bool(correction))
+                except PromptBudgetError:
+                    result = None
+            if result is None:
+                reply = ("Sir, baat-cheet itni aage badh gayi "
+                         "hai ki is turn ka prompt budget me "
+                         "nahi sama raha — jawab nahi ban "
+                         "paya. Ek nayi baat shuru karein, sab "
+                         "chalega.")
+                stopped_reason = "budget"
+                via = "brain"
+            else:
+                reply = str(result.reply)
+                stopped_reason = str(
+                    getattr(result, "stopped_reason", "completed"))
+                via = "brain"
+                if not self.incognito:
+                    note = self._automation_auto_create(
+                        text, result)
+                    if note:
+                        reply = reply + "\n\n" + note
             rows = self.goodput.to_rows()
             if len(rows) > rows_before:
                 self.last_provider = str(rows[-1]["provider"])
@@ -5808,8 +5994,15 @@ class ChatApp:
         return target
 
     @staticmethod
-    def _format_now(result: dict) -> str:
+    def _format_now(result: dict):
+        """The fast-path clock reply — or None, declining to
+        the brain (audit 2026-10-22: an error payload from
+        time_now produced the reply "It's, sir.")."""
+        if not isinstance(result, dict) or result.get("error"):
+            return None
         iso = result.get("iso") or result.get("local") or ""
+        if not iso:
+            return None
         try:
             moment = datetime.fromisoformat(str(iso)).astimezone()
             return (f"It's {moment.strftime('%I:%M %p')}, sir — "

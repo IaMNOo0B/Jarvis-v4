@@ -213,6 +213,11 @@ def add_key(store, raw, provider: str | None = None) -> str:
                 f"unknown provider {provider!r}; known: "
                 + ", ".join(sorted(PRESETS))
             )
+    # Filing the SAME key twice must not inflate the pool
+    # (audit 2026-10-22: a re-filed key silently doubled the
+    # provider's key count and skewed rotation).
+    if key in get_keys(store, provider):
+        return provider
     index = _next_index(store, provider)
     store.set(secret_name(provider, index), key)
     return provider

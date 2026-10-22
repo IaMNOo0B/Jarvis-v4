@@ -28,6 +28,24 @@ from typing import Any, Dict, List, Optional
 CARD_TTL_SECONDS = 3600
 MAX_CARDS = 100
 
+# One lock per cards file, shared across instances (audit
+# 2026-10-22: every caller built a fresh book with its OWN
+# lock — the UI thread and the chat thread could take() the
+# same card in the same moment and run a destructive tool
+# twice).
+_LOCKS: dict = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path) -> threading.Lock:
+    key = str(Path(path).resolve())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _LOCKS[key] = lock
+        return lock
+
 
 def card_summary(tool: str, args: Dict[str, Any]) -> str:
     """One plain line: what will happen, concretely."""
@@ -44,7 +62,7 @@ def card_summary(tool: str, args: Dict[str, Any]) -> str:
 class ConfirmationBook:
     def __init__(self, data_dir):
         self.path = Path(data_dir) / "confirmations.json"
-        self._lock = threading.Lock()
+        self._lock = _lock_for(self.path)
 
     def _rows(self) -> List[Dict]:
         try:
@@ -64,16 +82,42 @@ class ConfirmationBook:
             pass
 
     def add(self, tool: str, args: Dict[str, Any]) -> Dict:
-        card = {"id": uuid.uuid4().hex[:8], "ts": time.time(),
-                "tool": str(tool),
-                "args": dict(args or {}),
-                "summary": card_summary(tool, args or {}),
-                "status": "pending"}
         with self._lock:
             rows = self._rows()
+            # An identical pending card (same tool, same
+            # args) is the SAME request — return it instead
+            # of stacking duplicates the owner must deny
+            # one by one.
+            now = time.time()
+            for existing in rows:
+                if existing.get("status") == "pending" \
+                        and existing.get("tool") == str(tool) \
+                        and existing.get("args") \
+                        == dict(args or {}) \
+                        and now - float(existing.get("ts", 0)) \
+                        < CARD_TTL_SECONDS:
+                    return existing
+            card = {"id": uuid.uuid4().hex[:8], "ts": now,
+                    "tool": str(tool),
+                    "args": dict(args or {}),
+                    "summary": card_summary(tool, args or {}),
+                    "status": "pending"}
             rows.append(card)
             self._save(rows)
-        return card
+            return card
+
+    def peek(self, card_id: str) -> Optional[Dict]:
+        """The pending card WITHOUT consuming it — the gate
+        is re-evaluated against a peeked card first, and only
+        a card that will actually run gets taken."""
+        now = time.time()
+        for card in self._rows():
+            if card.get("id") == card_id \
+                    and card.get("status") == "pending" \
+                    and now - float(card.get("ts", 0)) \
+                    < CARD_TTL_SECONDS:
+                return card
+        return None
 
     def pending(self) -> List[Dict]:
         now = time.time()

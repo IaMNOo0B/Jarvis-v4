@@ -757,9 +757,9 @@ def op_browser_text(max_chars: int = 12000):
     return _text(max_chars)
 
 
-def op_browser_click(text: str):
+def op_browser_click(text: str, confirm: bool = False):
     from jarvis.browser_cdp import op_browser_click as _click
-    return _click(text)
+    return _click(text, confirm=confirm)
 
 
 def op_browser_snapshot(max_chars: int = 12000):
@@ -812,15 +812,28 @@ def op_open_app(name: str):
     if not out.get("error"):
         return {"launched": name, "route": "powershell"}
     # Last route: the Start menu's own catalog (Get-StartApps).
+    # An EXACT name match wins; a substring match is the
+    # fallback — and the result reports the app that ACTUALLY
+    # launched, not the name that was asked for (audit
+    # 2026-10-22: the first substring hit launched and the
+    # requested name was reported as if it had).
+    safe = str(name).replace("'", "''")
+    like = safe.replace("`", "``").replace("*", "`*").replace(
+        "?", "`?").replace("[", "`[").replace("]", "`]")
     lookup = run_ps(
-        "$a = Get-StartApps | Where-Object {$_.Name -like "
-        f"'*{str(name).replace(chr(39), chr(39) * 2)}*'}} | "
-        "Select-Object -First 1; if ($a) { $a.AppID }")
-    app_id = (lookup.get("stdout") or "").strip()
+        "$a = Get-StartApps; "
+        f"$m = $a | Where-Object {{$_.Name -ieq '{safe}'}} | "
+        "Select-Object -First 1; "
+        f"if (-not $m) {{ $m = $a | Where-Object {{$_.Name "
+        f"-like '*{like}*'}} | Select-Object -First 1 }}; "
+        "if ($m) { $m.Name + '|' + $m.AppID }")
+    found = (lookup.get("stdout") or "").strip()
+    matched, _, app_id = found.partition("|")
     if app_id and not lookup.get("error"):
         try:
             os.startfile(f"shell:AppsFolder\\{app_id}")
-            return {"launched": name, "route": "appsfolder",
+            return {"launched": matched or name,
+                    "requested": name, "route": "appsfolder",
                     "app_id": app_id}
         except OSError:
             pass
@@ -1230,7 +1243,9 @@ BROWSER_MANIFEST = {
             "permission": "browser.control",
             "schema": {"type": "object",
                        "properties": {"text": {"type": "string",
-                                               "minLength": 1}},
+                                               "minLength": 1},
+                                      "confirm": {
+                                          "type": "boolean"}},
                        "required": ["text"],
                        "additionalProperties": False},
         },
@@ -1329,7 +1344,7 @@ PC_MANIFEST = {
                  {"target": {"type": "string", "minLength": 1}},
                  ("target",), destructive=True),
         _pc_tool("empty_recycle_bin", destructive=True),
-        _pc_tool("lock_pc"),
+        _pc_tool("lock_pc", destructive=True),
     ],
 }
 

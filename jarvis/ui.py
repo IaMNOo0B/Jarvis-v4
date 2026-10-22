@@ -218,7 +218,8 @@ PAGE = """<!DOCTYPE html>
   const stateLabels = { standby: 'Standby', thinking: 'Thinking…',
     researching: 'Researching…', creating: 'Creating…',
     working: 'Working…', listening: 'Listening…',
-    speaking: 'Speaking…' };
+    speaking: 'Speaking…', sending: 'Sending…',
+    writing: 'Writing…' };
   let timer = null;
   function showState(s) {
     stateEl.textContent = stateLabels[s] || 'Standby';
@@ -364,7 +365,10 @@ PAGE = """<!DOCTYPE html>
       showState('thinking');
       timer = setInterval(pollState, 600);
     } else {
-      showState('standby');
+      // Ask the app for the TRUE word — forcing 'standby'
+      // here flashed Standby after every typed turn while
+      // JARVIS was in fact listening.
+      pollState();
     }
   }
   const bell = document.getElementById('bell');
@@ -381,8 +385,8 @@ PAGE = """<!DOCTYPE html>
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({id, approve})});
       const out = await r.json();
-      addMsg('jarvis', out.result || '(card tay ho gaya)');
-    } catch(e) { addMsg('jarvis', 'Card ka faisla nahi gaya: ' + e); }
+      addMsg(out.result || '(card tay ho gaya)', 'jarvis');
+    } catch(e) { addMsg('Card ka faisla nahi gaya: ' + e, 'jarvis'); }
     refreshState();
   }
   function renderCards(cards) {
@@ -409,9 +413,9 @@ PAGE = """<!DOCTYPE html>
         headers:{'Content-Type':'application/json'},
         body: JSON.stringify({id, approve})});
       const out = await r.json();
-      addMsg('jarvis', out.ok ? (approve ? 'Build shuru kar di — ant me walkthrough milega.' : 'Build rok di gayi.')
-                              : ('Proceed nahi hua: ' + (out.error || '?')));
-    } catch(e) { addMsg('jarvis', 'Build ka faisla nahi gaya: ' + e); }
+      addMsg(out.ok ? (approve ? 'Build shuru kar di — ant me walkthrough milega.' : 'Build rok di gayi.')
+                              : ('Proceed nahi hua: ' + (out.error || '?')), 'jarvis');
+    } catch(e) { addMsg('Build ka faisla nahi gaya: ' + e, 'jarvis'); }
     refreshState();
   }
   function renderBuilds(builds) {
@@ -440,6 +444,7 @@ PAGE = """<!DOCTYPE html>
       renderCards(s.confirmations || []);
       renderBuilds(s.builds || []);
       const v = s.voice || {};
+      voiceActive = !!v.active;
       voiceBtn.textContent = v.active
         ? ('♪ VOICE · ' + (v.connected ? 'ON' : '…')) : '♪ VOICE · OFF';
       muteBtn.style.display = v.active ? '' : 'none';
@@ -483,6 +488,15 @@ PAGE = """<!DOCTYPE html>
   const pttBtn = document.getElementById('pttBtn');
   let pttOn = false;
   let pttHeld = false;
+  let pttBooted = false;
+  let voiceActive = false;
+  async function pttHold(held) {
+    try {
+      await fetch('/api/ptt', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ held }) });
+    } catch (e) { /* additive control */ }
+  }
   pttBtn.addEventListener('click', async () => {
     try {
       await fetch('/api/ptt', { method: 'POST',
@@ -492,7 +506,10 @@ PAGE = """<!DOCTYPE html>
     } catch (e) { /* additive control */ }
   });
   // Push-to-talk: Space dabaye rakho to mic khula, chhodo to
-  // band — sirf tab jab kahin type na ho raha ho.
+  // band — sirf tab jab kahin type na ho raha ho. Voice ON ho
+  // to Space sirf HOLD hai (gate khulta hai, engine band
+  // NAHI hota); voice OFF ho to Space engine ko is ek bol
+  // ke liye chalata hai aur chhodne par band karta hai.
   document.addEventListener('keydown', (e) => {
     if (!pttOn || pttHeld || e.code !== 'Space' || e.repeat) { return; }
     const t = e.target;
@@ -500,12 +517,14 @@ PAGE = """<!DOCTYPE html>
               || t.tagName === 'SELECT')) { return; }
     e.preventDefault();
     pttHeld = true;
-    voiceAction('start');
+    if (voiceActive) { pttHold(true); }
+    else { pttBooted = true; voiceAction('start'); }
   });
   document.addEventListener('keyup', (e) => {
     if (!pttOn || !pttHeld || e.code !== 'Space') { return; }
     pttHeld = false;
-    voiceAction('stop');
+    if (pttBooted) { pttBooted = false; voiceAction('stop'); }
+    else { pttHold(false); }
   });
   const spanel = document.getElementById('spanel');
   const smsg = document.getElementById('smsg');
@@ -674,7 +693,6 @@ PAGE = """<!DOCTYPE html>
   }
   document.getElementById('send').addEventListener('click', send);
   input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-  addMsg('Hello, sir. How may I assist you today?', 'jarvis');
   refreshState();
   input.focus();
 </script>
@@ -792,7 +810,9 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 with lock:
                     out = app.proceed_build(
                         str(payload.get("id", "")),
-                        approve=bool(payload.get("approve", True)))
+                        # Fail CLOSED: a missing approve field
+                        # is not a Proceed (was default True).
+                        approve=bool(payload.get("approve", False)))
                 self._json(200, out)
                 return
             if self.path == "/api/confirm":
@@ -820,8 +840,12 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                                      "error": "bad request"})
                     return
                 with lock:
-                    out = app.set_push_to_talk(
-                        bool(payload.get("enabled", False)))
+                    if "held" in payload:
+                        out = app.voice_ptt_hold(
+                            bool(payload.get("held")))
+                    else:
+                        out = app.set_push_to_talk(
+                            bool(payload.get("enabled", False)))
                 self._json(200 if out.get("ok") else 400, out)
                 return
             if self.path == "/api/accounts":
@@ -906,7 +930,12 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                         self.rfile.read(size).decode("utf-8")
                     ).get("action", "toggle")).lower()
                 except Exception:
-                    action = "toggle"
+                    # Malformed JSON is a 400 — it must never
+                    # TOGGLE the owner's voice (the old fallback
+                    # did exactly that).
+                    self._json(400, {"ok": False,
+                                     "error": "bad request"})
+                    return
                 with lock:
                     if action == "mute":
                         message = app.handle_command("/voice mute")
@@ -947,6 +976,16 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                         reply = app.handle_command(text)
                     else:
                         reply = app.turn(text)
+                except Exception as exc:
+                    # A crashed turn is a JSON error the UI can
+                    # SHOW — never a dropped connection (the
+                    # old behaviour made the UI ask "is JARVIS
+                    # still running?" about a healthy process).
+                    self._json(500, {
+                        "error": f"turn fail ho gaya, sir: "
+                                 f"{type(exc).__name__}: "
+                                 f"{str(exc)[:200]}"})
+                    return
                 finally:
                     # The resting word after a turn is Listening
                     # — JARVIS is waiting for the owner's next

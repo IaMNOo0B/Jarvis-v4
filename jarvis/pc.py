@@ -99,7 +99,12 @@ def op_pc_info(runner=None):
 def op_process_list(name: str = "", runner=None):
     filt = ""
     if name:
-        safe = str(name).replace("'", "''")
+        # Escape PowerShell's -like wildcards so the filter is
+        # a plain substring search, never a pattern the caller
+        # (or a process name) smuggled in.
+        safe = str(name).replace("`", "``").replace(
+            "*", "`*").replace("?", "`?").replace(
+            "[", "`[").replace("]", "`]").replace("'", "''")
         filt = f" | Where-Object {{$_.ProcessName -like '*{safe}*'}}"
     script = (
         "Get-Process" + filt +
@@ -162,8 +167,9 @@ def op_clipboard_read(runner=None):
     out = run_ps("Get-Clipboard -Raw", runner)
     if out.get("error"):
         return out
-    text = (out.get("stdout") or "")[:2000]
-    return {"ok": True, "clipboard": text}
+    full = out.get("stdout") or ""
+    return {"ok": True, "clipboard": full[:2000],
+            "truncated": len(full) > 2000}
 
 
 # -- hands -----------------------------------------------------------
@@ -173,8 +179,19 @@ def op_clipboard_write(text: str, runner=None):
     out = run_ps(f"Set-Clipboard -Value '{safe}'", runner)
     if out.get("error"):
         return out
+    # Verify by reading back (audit 2026-10-22: Set-Clipboard
+    # can fail non-terminatingly with exit 0, and the owner
+    # then pastes the OLD clipboard somewhere, told it was
+    # the new text).
+    back = run_ps("Get-Clipboard -Raw", runner)
+    if not back.get("error"):
+        actual = (back.get("stdout") or "").rstrip("\r\n")
+        if actual != str(text):
+            return {"ok": False,
+                    "error": "clipboard par text nahi chipka — "
+                             "wapas padhne par kuch aur mila"}
     return {"ok": True, "clipboard_set": True,
-            "chars": len(str(text))}
+            "chars": len(str(text)), "verified": True}
 
 
 # The canonical CoreAudio route to the master endpoint:
@@ -248,6 +265,13 @@ def _audio_script(call: str) -> str:
             "\n'@; " + call)
 
 
+def _parse_level(text: str):
+    try:
+        return int(round(float(str(text).strip())))
+    except (TypeError, ValueError):
+        return None
+
+
 def op_volume_get(runner=None):
     out = run_ps(_audio_script(
         "[math]::Round([AudioVol]::Get() * 100)"), runner)
@@ -271,8 +295,15 @@ def op_volume_set(level: int, runner=None):
         f"[AudioVol]::Set({level / 100.0:.2f}); "
         "[math]::Round([AudioVol]::Get() * 100)"), runner)
     if not out.get("error"):
-        return {"ok": True, "volume_set_to": level,
-                "route": "endpoint (exact)"}
+        # The script already reads the level back — USE it
+        # (audit 2026-10-22: the read-back was computed and
+        # thrown away, so a failed Set still reported the
+        # requested level as done).
+        actual = _parse_level(out.get("stdout") or "")
+        if actual is not None and abs(actual - level) <= 1:
+            return {"ok": True, "volume_set_to": level,
+                    "route": "endpoint (exact)",
+                    "verified": True}
     steps_up = int(round(level / 2.0))
     script = (
         "$s = New-Object -ComObject WScript.Shell; "
@@ -283,8 +314,18 @@ def op_volume_set(level: int, runner=None):
     out2 = run_ps(script, runner)
     if out2.get("error"):
         return out2
+    back = run_ps(_audio_script(
+        "[math]::Round([AudioVol]::Get() * 100)"), runner)
+    actual = None if back.get("error") else _parse_level(
+        back.get("stdout") or "")
+    if actual is not None and abs(actual - level) > 3:
+        return {"ok": False, "volume_now": actual,
+                "error": f"volume {level} par nahi gaya — "
+                         f"abhi {actual} par hai, dono raaste "
+                         "koshish karke haar gaye"}
     return {"ok": True, "volume_set_to": level,
             "route": "key-ladder (floor se gin kar)",
+            "verified": actual is not None,
             "note": "Pehla raasta fail hua, isliye key-steps "
                     "wala dusra raasta chala — volume takreeban "
                     "usi satah par hai, halka idhar-udhar ho "
@@ -293,18 +334,46 @@ def op_volume_set(level: int, runner=None):
 
 def op_process_kill(target: str, runner=None):
     """DESTRUCTIVE — rides the confirmation card. Kills by
-    process name or numeric pid."""
+    EXACT process name or numeric pid, and verifies the
+    process is actually gone.
+
+    Audit 2026-10-22: Get-Process -Name treats its argument
+    as a WILDCARD pattern — target='*' would have piped every
+    process on the machine into Stop-Process. Names now match
+    by exact -ieq equality over an enumeration, wildcard
+    characters are refused outright, the PID branch carries
+    -ErrorAction Stop like the name branch always did, and
+    both branches check afterwards that nothing survives."""
     t = str(target).strip()
+    if any(ch in t for ch in "*?[]"):
+        return {"error": "process_kill failed: target me "
+                         "wildcard (* ? [ ]) nahi chalega — "
+                         "poora exact process naam ya PID do, "
+                         "sir. Wildcard se aadha PC band ho "
+                         "sakta hai."}
     if t.isdigit():
-        script = f"Stop-Process -Id {int(t)} -Force"
+        pid = int(t)
+        script = (f"Stop-Process -Id {pid} -Force "
+                  f"-ErrorAction Stop; "
+                  f"Start-Sleep -Milliseconds 200; "
+                  f"if (Get-Process -Id {pid} -ErrorAction "
+                  f"SilentlyContinue) {{ throw 'process abhi "
+                  f"bhi zinda hai' }}")
     else:
         safe = t.replace("'", "''")
-        script = (f"Get-Process -Name '{safe}' -ErrorAction "
-                  f"Stop | Stop-Process -Force")
+        script = (f"$ps = Get-Process | Where-Object "
+                  f"{{$_.ProcessName -ieq '{safe}'}}; "
+                  f"if (-not $ps) {{ throw 'is naam ka koi "
+                  f"process nahi mila' }}; "
+                  f"$ps | Stop-Process -Force -ErrorAction "
+                  f"Stop; Start-Sleep -Milliseconds 200; "
+                  f"if (Get-Process | Where-Object "
+                  f"{{$_.ProcessName -ieq '{safe}'}}) "
+                  f"{{ throw 'process abhi bhi zinda hai' }}")
     out = run_ps(script, runner)
     if out.get("error"):
         return out
-    return {"ok": True, "killed": t}
+    return {"ok": True, "killed": t, "verified": True}
 
 
 def op_empty_recycle_bin(runner=None):
@@ -321,4 +390,10 @@ def op_lock_pc(runner=None):
                  runner)
     if out.get("error"):
         return out
-    return {"ok": True, "locked": True}
+    # rundll32 exits 0 even when the lock never engages, and
+    # Windows offers no cheap read-back — say so instead of
+    # claiming a verified lock (audit 2026-10-22).
+    return {"ok": True, "locked": True, "verified": False,
+            "note": "lock command chal gaya, sir — Windows "
+                    "iski pushti wapas nahi deta, isliye "
+                    "screen dekh kar pakka kar lena."}

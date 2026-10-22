@@ -51,7 +51,15 @@ def test_automation_gate_asks_when_reliability_is_low(tmp_path):
         "steps": [{"tool": "time_now", "args": {}}],
         "params": []})
     assert out["ok"] is True
-    # A healthy domain self-runs (no gate interference).
+    # A PROVEN-healthy domain self-runs: seed its record into
+    # the act band first. (An unproven domain sits in the
+    # verify band since the batch-7 fix — the brain runs the
+    # route via run_automation and watches, it does not
+    # self-run mechanically.)
+    for _ in range(4):
+        row = app.calibrator.record("core.automations",
+                                    "route chalega", 0.7)
+        app.calibrator.resolve(row["id"], True)
     reply, hint = app._automation_pre_brain("waqt batao route")
     assert reply is not None and hint is None
     # Poison the domain's lived record: 8 resolved failures.

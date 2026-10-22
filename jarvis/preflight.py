@@ -57,8 +57,10 @@ FIX_OLLAMA = (
     "without it."
 )
 FIX_MODELS = (
-    "Optional — for the hands-free wake word: put the wake-word model files "
-    "in a 'models' folder next to JARVIS.bat."
+    "Optional — for the hands-free wake word: the model usually "
+    "comes bundled with openwakeword (setup.bat's voice pack) or "
+    "downloads on first voice start; custom model files go in a "
+    "'models' folder next to JARVIS.bat."
 )
 FIX_WHISPER = (
     "Optional — for voice typing: double-click setup.bat and let it install "
@@ -226,20 +228,52 @@ def check_ollama(probe=None):
 
 
 def check_models_dir(models_dir):
-    """Optional: models folder (wake-word .onnx files live there)."""
+    """Optional: the wake-word .onnx — tested through the SAME
+    resolution the detector uses (app models dir OR the
+    openwakeword package's bundled resources). The old check
+    tested only <install>/models, a folder the detector never
+    read, and failed fresh installs whose model was bundled
+    all along (live /diagnose, 2026-10-22)."""
     models_dir = Path(models_dir)
-    ok = models_dir.is_dir()
+    status = None
+    for importer in ("jarvis.wake", "wake"):
+        try:
+            import importlib
+            module = importlib.import_module(importer)
+            status = module.wake_model_status(models_dir=models_dir)
+            break
+        except Exception:
+            continue
+    if status is None:
+        # Bare-script fallback: the same two places, by hand.
+        found = None
+        candidates = [models_dir]
+        spec = importlib.util.find_spec("openwakeword")
+        if spec is not None and spec.submodule_search_locations:
+            candidates.append(
+                Path(list(spec.submodule_search_locations)[0])
+                / "resources" / "models")
+        for folder in candidates:
+            hits = sorted(Path(folder).glob("hey_jarvis*.onnx")) \
+                if Path(folder).is_dir() else []
+            if hits:
+                found = str(hits[0])
+                break
+        status = {"found": found is not None, "path": found,
+                  "searched": [str(c) for c in candidates]}
+    ok = bool(status["found"])
     detail = (
-        f"models folder found at {models_dir}"
+        f"wake model found at {status['path']}"
         if ok
-        else f"models folder not found at {models_dir}"
+        else "wake model (.onnx) not found — searched: "
+             + "; ".join(status["searched"])
     )
     return _result(
-        "Wake-word models folder",
+        "Wake-word model",
         LEVEL_OPTIONAL,
         ok,
         detail,
-        "The wake-word model lives here so JARVIS can hear 'Jarvis' "
+        "The wake-word model lets JARVIS hear 'Jarvis' "
         "hands-free. Without it you start JARVIS by clicking.",
         "" if ok else FIX_MODELS,
     )

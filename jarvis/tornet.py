@@ -85,12 +85,16 @@ def fetch_via_tor(url: str, timeout: float = 25.0,
     if parsed.query:
         path += "?" + parsed.query
     last_error = ""
+    last_kind = "no-tor"
     for proxy_port in ports:
         raw = None
         try:
+            # The caller's timeout rules BOTH phases (audit
+            # 2026-10-22: the connect silently capped itself
+            # at 15s whatever the caller asked).
             raw = socks5_connect(parsed.hostname, target_port,
                                  proxy_port=proxy_port,
-                                 timeout=min(timeout, 15.0))
+                                 timeout=timeout)
             if parsed.scheme == "https":
                 context = ssl.create_default_context()
                 raw = context.wrap_socket(
@@ -104,15 +108,36 @@ def fetch_via_tor(url: str, timeout: float = 25.0,
                 "Accept": "text/html,application/xhtml+xml"})
             response = conn.getresponse()
             body = response.read()
+            status = response.status
             conn.close()
+            if status >= 400:
+                # An HTTP error is an ERROR-shaped result,
+                # not a page (audit 2026-10-22: 404/500
+                # bodies came back as successes).
+                return None, (f"tor fetch: {parsed.hostname} ne "
+                              f"HTTP {status} diya, sir")
             return body.decode("utf-8", errors="replace"), ""
         except Exception as exc:
+            # Name the failure for what it IS: a refused proxy
+            # connection means Tor is not running; a timeout
+            # AFTER connecting means the road is up but slow
+            # — the old message blamed Tor for both.
+            if isinstance(exc, (socket.timeout, TimeoutError)):
+                last_kind = "timeout"
+            elif isinstance(exc, ConnectionRefusedError):
+                last_kind = "no-tor"
+            else:
+                last_kind = "error"
             last_error = f"{type(exc).__name__}: {exc}"
             try:
                 if raw is not None:
                     raw.close()
             except Exception:
                 pass
+    if last_kind == "timeout":
+        return None, ("tor fetch failed — Tor mila, par jawab "
+                      f"time par nahi aaya ({last_error}). "
+                      "Raasta chalu hai, bas sust hai, sir.")
     return None, ("tor fetch failed — Tor chalta hua nahi mila "
                   f"(ports {', '.join(str(p) for p in ports)} "
                   f"aazmaye; aakhri galti: {last_error}). Tor "

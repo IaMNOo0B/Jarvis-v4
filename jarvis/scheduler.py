@@ -70,10 +70,18 @@ def load_goals(data_dir) -> list:
 def compute_next(schedule: dict, now: float,
                  last_run: Optional[float] = None) -> Optional[float]:
     """The next epoch a schedule fires after `now`, or None when
-    the schedule has run its course."""
+    the schedule has run its course. Garbage in the schedule
+    (a hand-edited "25:99") means None — never an exception
+    (audit 2026-10-22: replace(hour=25) raised ValueError and
+    took the whole tick down with it)."""
+    if not isinstance(schedule, dict):
+        return None
     kind = str(schedule.get("type", "daily"))
     if kind == "interval":
-        hours = max(0.25, float(schedule.get("hours", 24)))
+        try:
+            hours = max(0.25, float(schedule.get("hours", 24)))
+        except (TypeError, ValueError):
+            return None
         base = last_run if last_run else now
         nxt = base + hours * 3600
         return nxt if nxt > now else now + 60.0
@@ -91,7 +99,9 @@ def compute_next(schedule: dict, now: float,
     try:
         hour, minute = (int(x) for x in at.split(":", 1))
     except Exception:
-        hour, minute = 9, 0
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
     today = datetime.fromtimestamp(now).replace(
         hour=hour, minute=minute, second=0, microsecond=0)
     nxt = today.timestamp()
@@ -169,10 +179,33 @@ def tick(data_dir, runner: Callable[[str], str],
                     row["enabled"] = False
             changed = True
             report[kind] += 1
+            # Persist BEFORE notify, against a FRESH load
+            # (audit 2026-10-22): the old order saved once at
+            # the end and notified first — a raising notify
+            # crashed the tick ("never raises" was a lie),
+            # the run's bookkeeping never landed, and the
+            # routine fired AGAIN next tick. A long runner
+            # also made the in-memory rows stale: another
+            # writer's updates were overwritten by the final
+            # save. Now each fire merges into a fresh copy
+            # and saves immediately.
+            fresh_rows = _load(data_dir, filename)
+            for fresh in fresh_rows:
+                if fresh.get("id") == row.get("id"):
+                    for key in ("last_run", "runs", "last_summary",
+                                "next_run", "status", "enabled"):
+                        if key in row:
+                            fresh[key] = row[key]
+                    break
+            _save(data_dir, filename, fresh_rows)
+            rows = fresh_rows
             if notify is not None:
                 label = "Routine" if kind == "routines" else "Goal"
-                notify(f"{label}: {row.get('name', '')}",
-                       str(summary)[:900])
+                try:
+                    notify(f"{label}: {row.get('name', '')}",
+                           str(summary)[:900])
+                except Exception:
+                    pass    # told or not, the run is recorded
             if journal is not None:
                 try:
                     journal.append(f"scheduler.{kind[:-1]}_ran",
@@ -200,6 +233,13 @@ def fire_row(data_dir, filename: str, row_id: str,
     for row in rows:
         if row.get("id") != row_id:
             continue
+        # The manual path respects the same switches the tick
+        # does (audit 2026-10-22: fire_row ran DISABLED
+        # routines and DONE goals).
+        if not row.get("enabled", True):
+            return row
+        if kind == "goals" and row.get("status") == "done":
+            return row
         now = time.time()
         run = runner
         if row.get("local") and local_runner is not None:

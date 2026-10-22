@@ -275,6 +275,20 @@ class SkillRegistry:
         if not callable(op):
             raise DispatchRefused(
                 tool_name, f"op {tool.op_name!r} does not exist (LAW 2)")
+        # Args and rate are judged BEFORE the approval token
+        # is verified (audit 2026-10-22: verification BURNS
+        # the one-time token — a call with bad args or an
+        # over-rate call wasted the owner's one approval).
+        problem = validate_args(tool.schema, args)
+        if problem:
+            raise DispatchRefused(
+                tool_name, f"schema check fail: {problem}")
+        if not self._rate_check(tool_name):
+            raise DispatchRefused(
+                tool_name,
+                f"rate limit — {tool_name} ki had is minute ke "
+                "liye puri ho gayi; thoda ruk kar phir koshish "
+                "karo")
         if tool.is_destructive_class():
             if decision is None:
                 raise DispatchRefused(
@@ -293,16 +307,6 @@ class SkillRegistry:
                 raise DispatchRefused(
                     tool_name,
                     "approval token does not verify for these exact args")
-        problem = validate_args(tool.schema, args)
-        if problem:
-            raise DispatchRefused(
-                tool_name, f"schema check fail: {problem}")
-        if not self._rate_check(tool_name):
-            raise DispatchRefused(
-                tool_name,
-                f"rate limit — {tool_name} ki had is minute ke "
-                "liye puri ho gayi; thoda ruk kar phir koshish "
-                "karo")
         self._log("skill.dispatched", {"skill": skill.name, "tool": tool_name})
         return op(**args)
 

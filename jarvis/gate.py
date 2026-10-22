@@ -113,8 +113,14 @@ class Gate:
         self._key = bytes(secret_key)
         self._now = now_fn
         self.catalog: dict[str, ToolInfo] = {}
-        self._burned_nonces: set[str] = set()
-        self._issued_nonces: set[str] = set()
+        # nonce -> token expiry. The expiry rides along so the
+        # sets can be PRUNED (audit 2026-10-22: both sets grew
+        # forever — every token ever issued or burned, kept
+        # for the life of the process). Pruning an expired
+        # burned nonce is safe: verify_approval rejects an
+        # expired token on its exp BEFORE the burned check.
+        self._burned_nonces: dict[str, int] = {}
+        self._issued_nonces: dict[str, int] = {}
         self._rebuild_nonce_state()
 
     # -- catalog --------------------------------------------------------
@@ -194,7 +200,8 @@ class Gate:
             _canonical_json(payload).encode("utf-8")).decode("ascii")
         sig = hmac.new(self._key, body.encode("ascii"),
                        hashlib.sha256).hexdigest()
-        self._issued_nonces.add(nonce)
+        self._prune_nonces()
+        self._issued_nonces[nonce] = payload["exp"]
         self.journal.append("gate.approval_issued", {
             "tool": tool_name,
             "args_digest": payload["digest"],
@@ -230,7 +237,8 @@ class Gate:
         if not nonce or nonce in self._burned_nonces:
             return False
         # Burn it: in memory AND in the journal (the audit record).
-        self._burned_nonces.add(nonce)
+        self._prune_nonces()
+        self._burned_nonces[nonce] = int(payload.get("exp", 0))
         self.journal.append("gate.approval_consumed", {
             "tool": tool_name,
             "args_digest": payload["digest"],
@@ -239,6 +247,19 @@ class Gate:
         return True
 
     # -- internals --------------------------------------------------------
+
+    def _prune_nonces(self) -> None:
+        """Drop expired entries from both nonce sets. A burned
+        nonce whose token has expired can never verify again
+        anyway (the exp check runs first), so forgetting it
+        reopens nothing."""
+        now = int(self._now())
+        self._issued_nonces = {
+            n: exp for n, exp in self._issued_nonces.items()
+            if exp > now}
+        self._burned_nonces = {
+            n: exp for n, exp in self._burned_nonces.items()
+            if exp > now}
 
     def _rebuild_nonce_state(self) -> None:
         """Rebuild issued/burned nonce sets from the journal so a
@@ -255,9 +276,15 @@ class Gate:
             if not nonce:
                 continue
             if rec.get("kind") == "gate.approval_issued":
-                self._issued_nonces.add(nonce)
+                self._issued_nonces[nonce] = int(
+                    payload.get("exp", 0))
             elif rec.get("kind") == "gate.approval_consumed":
-                self._burned_nonces.add(nonce)
+                # The consumed event carries no exp; borrow it
+                # from the issued record. Unknown exp = keep
+                # forever (today's behaviour — safe side).
+                self._burned_nonces[nonce] = \
+                    self._issued_nonces.get(nonce, 2 ** 62)
+        self._prune_nonces()
 
     def _decide(self, verdict: str, tool_name: str, args: dict,
                 origin_label: str, reason: str,

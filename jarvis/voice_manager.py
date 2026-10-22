@@ -67,6 +67,10 @@ class VoiceManager(VoiceEvents):
         self._turn_end = False
         self._tail_until = 0.0
         self._threads: list = []
+        self._ptt_held = False     # push-to-talk hold: while
+                                   # held, mic blocks pass the
+                                   # wake gate regardless of its
+                                   # sleep state
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -117,7 +121,21 @@ class VoiceManager(VoiceEvents):
         ]
         for t in self._threads:
             t.start()
-        self.session.start()
+        try:
+            self.session.start()
+        except Exception as e:
+            # A session that fails to start must not leave
+            # threads, io and a phantom "active" behind
+            # (audit 2026-10-22: the raise escaped with
+            # everything half-started and no handle).
+            self.active = False
+            try:
+                self.session.stop()
+            except Exception:
+                pass
+            self.session = None
+            self._close_io()
+            return False, f"Voice session start nahi hua: {e}"
         # Voice on = JARVIS is listening (for the wake word if
         # not awake, for speech if awake). Standby comes from
         # the Activity idle rule or from stop(), never early.
@@ -128,6 +146,19 @@ class VoiceManager(VoiceEvents):
         if not self.active:
             return
         self.active = False
+        # The state word must not lie after a stop (audit
+        # 2026-10-22: speaking/level stayed set forever when
+        # voice stopped mid-sentence, and queued audio could
+        # still play out).
+        self.speaking = False
+        self.level = 0.0
+        self._drain_play_queue()
+        self._turn_sent = 0
+        self._turn_played = 0
+        self._turn_end = False
+        self._ptt_held = False
+        if self.gate is not None:
+            self.gate.stop()      # the wake detector's thread
         if self.session is not None:
             try:
                 self.session.stop()
@@ -151,6 +182,15 @@ class VoiceManager(VoiceEvents):
         self.muted = not self.muted
         return self.muted
 
+    def ptt_hold(self, held: bool) -> bool:
+        """Push-to-talk: while held, the mic streams even when
+        the wake gate is asleep — the owner's hand IS the wake
+        signal. Releasing restores the gate exactly as it was."""
+        self._ptt_held = bool(held)
+        if held and self.gate is not None:
+            self.gate.note_user_speech()
+        return self._ptt_held
+
     def interrupt(self):
         if self.session is not None:
             self.session.interrupt()
@@ -168,6 +208,7 @@ class VoiceManager(VoiceEvents):
             "speaking": self.speaking,
             "level": round(float(self.level), 3),
             "muted": self.muted,
+            "ptt_held": self._ptt_held,
             "awake": bool(self.gate and self.gate.awake),
             "wake_word": bool(self.gate and self.gate.enabled),
             "voice": self.config.get("voice_name", "Charon"),
@@ -178,7 +219,8 @@ class VoiceManager(VoiceEvents):
     def _mic_block(self, pcm: bytes):
         if not self.active or self.muted or self.session is None:
             return
-        if self.gate is not None and not self.gate.feed(pcm):
+        if self.gate is not None and not self._ptt_held \
+                and not self.gate.feed(pcm):
             return                      # asleep: stays on this machine
         if self.speaking:
             return                      # never stream our own voice
@@ -293,6 +335,17 @@ class VoiceManager(VoiceEvents):
         self._turn_end = False
         self._turn_sent = 0
         self._turn_played = 0
+        # Playback has caught up with generation: the session
+        # may now commit this turn's transcript WHOLE (the
+        # heard-truncation contract — before this signal, an
+        # interrupt can still cut it to what was played).
+        hook = getattr(self.session, "on_playback_drained",
+                       None)
+        if callable(hook):
+            try:
+                hook()
+            except Exception:
+                pass
         latency = self.io.output_latency if self.io else 0.20
         self._tail_until = self._clock() + latency + TAIL_MARGIN_S
         # A spoken turn ends into listening, awake or not —

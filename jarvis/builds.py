@@ -34,8 +34,40 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import threading
 import time
 from pathlib import Path
+
+# One lock per builds root, shared across BuildStore
+# instances (audit 2026-10-22: the Proceed gate did
+# load-check-save with no lock at all — a double Proceed,
+# UI + chat together, started the executor twice).
+_LOCKS: dict = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(root) -> threading.RLock:
+    key = str(Path(root).resolve())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _LOCKS[key] = lock
+        return lock
+
+
+_ID_OK = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _check_id(build_id: str) -> str:
+    """A build id is ONE path segment — anything else could
+    walk out of the builds root."""
+    bid = str(build_id)
+    if not _ID_OK.match(bid):
+        raise ValueError(f"build id theek nahi hai: {bid!r}")
+    return bid
 
 PLAN_ACTIONS = ("NEW", "MODIFY", "DELETE")
 MAX_SNAPSHOT_FILES = 5000
@@ -50,7 +82,19 @@ def _safe_relpath(path: str) -> bool:
     p = str(path).replace("\\", "/")
     if not p or p.startswith("/") or p.startswith("~"):
         return False
-    return all(part not in ("", "..") for part in p.split("/"))
+    # Windows drive paths — absolute (C:/x, C:\\x) AND
+    # drive-relative (D:x) — are not relative paths at all
+    # (audit 2026-10-22: "C:" survived as an ordinary first
+    # segment and passed).
+    if len(p) >= 2 and p[1] == ":" and p[0].isalpha():
+        return False
+    # "." and empty segments normalize away; what remains must
+    # be real names, none of them "..".
+    parts = [part for part in p.split("/")
+             if part not in ("", ".")]
+    if not parts:
+        return False
+    return all(part != ".." for part in parts)
 
 
 def validate_plan(plan) -> list:
@@ -68,7 +112,10 @@ def validate_plan(plan) -> list:
     if not changes:
         problems.append("changes khali hain — koi file badlegi "
                         "hi nahi to build kaisa")
-    for i, ch in enumerate(changes[:40]):
+    # EVERY change is validated (audit 2026-10-22: the [:40]
+    # and [:12] slices were silent caps — item 41 could be
+    # ../evil.py and never be looked at).
+    for i, ch in enumerate(changes):
         if not isinstance(ch, dict):
             problems.append(f"change {i + 1} object nahi hai")
             continue
@@ -92,7 +139,7 @@ def validate_plan(plan) -> list:
         problems.append("verification plan khali hai — "
                         "safalta kaise saabit hogi, pehle se "
                         "likhna padta hai")
-    for i, item in enumerate(verify[:12]):
+    for i, item in enumerate(verify):
         if not isinstance(item, dict) or \
                 not str(item.get("detail", "")).strip():
             problems.append(f"verification {i + 1}: detail "
@@ -146,26 +193,52 @@ def render_task_md(plan: dict, step_states: list) -> str:
 # Tree snapshots — the plan↔execution binding
 # ------------------------------------------------------------------ #
 
+def _hash_file(path) -> str:
+    """sha256 of the first MAX_HASH_BYTES, STREAMED in chunks
+    (audit 2026-10-22: read_bytes() loaded the whole file —
+    a 2 GB video in the workspace was read fully just to hash
+    its first 2 MB)."""
+    digest = hashlib.sha256()
+    remaining = MAX_HASH_BYTES
+    with open(path, "rb") as fh:
+        while remaining > 0:
+            chunk = fh.read(min(65536, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
 def snapshot_tree(root) -> dict:
     """{relative path: sha256} for the tree under root."""
+    snap, _truncated = snapshot_tree_full(root)
+    return snap
+
+
+def snapshot_tree_full(root):
+    """(snapshot, truncated) — truncated says the file cap
+    cut the walk short, so a diff against this snapshot can
+    miss changes; the walkthrough must say so."""
     root = Path(root)
     out = {}
+    truncated = False
     if not root.exists():
-        return out
+        return out, truncated
     for path in sorted(root.rglob("*")):
-        if len(out) >= MAX_SNAPSHOT_FILES:
-            break
         if not path.is_file() or ".git" in path.parts \
                 or "__pycache__" in path.parts \
                 or path.suffix == ".pyc":
             continue
+        if len(out) >= MAX_SNAPSHOT_FILES:
+            truncated = True
+            continue
         rel = path.relative_to(root).as_posix()
         try:
-            data = path.read_bytes()[:MAX_HASH_BYTES]
+            out[rel] = _hash_file(path)
         except OSError:
             continue
-        out[rel] = hashlib.sha256(data).hexdigest()
-    return out
+    return out, truncated
 
 
 def diff_trees(before: dict, after: dict) -> dict:
@@ -183,22 +256,23 @@ def binding_report(plan: dict, diff: dict) -> dict:
     planned but untouched; extras = changed but never
     planned. Nothing is hidden: all three lists ship in the
     walkthrough."""
-    changed = {"NEW": set(diff["created"]),
-               "MODIFY": set(diff["modified"]),
-               "DELETE": set(diff["deleted"])}
-    # A NEW file later edited still counts as created; a
-    # MODIFY that was actually a create counts too — what
-    # matters is that the planned path changed at all.
-    any_changed = (set(diff["created"]) | set(diff["modified"])
-                   | set(diff["deleted"]))
+    # A NEW/MODIFY counts done ONLY when the path was created
+    # or modified — never when it was DELETED (audit
+    # 2026-10-22: the old any_changed union let a deleted-only
+    # diff score planned NEWs as done). A DELETE counts done
+    # only when the path is actually gone.
+    landed = set(diff["created"]) | set(diff["modified"])
+    deleted = set(diff["deleted"])
+    any_changed = landed | deleted
     done, missing = [], []
     planned_paths = set()
     for ch in plan.get("changes") or []:
         path = str(ch.get("path", "")).replace("\\", "/")
         planned_paths.add(path)
-        hit = path in changed.get(ch.get("action"), set()) \
-            or (ch.get("action") in ("NEW", "MODIFY")
-                and path in any_changed)
+        if ch.get("action") == "DELETE":
+            hit = path in deleted
+        else:
+            hit = path in landed
         (done if hit else missing).append(
             f"[{ch.get('action')}] {path}")
     extras = sorted(p for p in any_changed
@@ -224,8 +298,17 @@ def computed_confidence(verify_results: list,
                  "badlav asal me hue")
     else:
         b_rate, b_txt = 0.0, "plan me badlav hi nahi the"
-    return round(0.5 * v_rate + 0.5 * b_rate, 2), \
-        f"{v_txt}; {b_txt}"
+    score = 0.5 * v_rate + 0.5 * b_rate
+    extras = len(binding.get("extras") or [])
+    if extras:
+        # Unplanned changes dilute the score (audit
+        # 2026-10-22: 50 extras once scored a perfect 1.0).
+        if total:
+            score *= total / (total + extras)
+        else:
+            score = 0.0
+        b_txt += f"; {extras} bina-plan badlav bhi hue"
+    return round(score, 2), f"{v_txt}; {b_txt}"
 
 
 # ------------------------------------------------------------------ #
@@ -239,9 +322,10 @@ class BuildStore:
     def __init__(self, data_dir):
         self.root = Path(data_dir) / "builds"
         self.root.mkdir(parents=True, exist_ok=True)
+        self._lock = _lock_for(self.root)
 
     def _dir(self, build_id: str) -> Path:
-        return self.root / build_id
+        return self.root / _check_id(build_id)
 
     def create(self, build_id: str, goal: str, plan: dict,
                mode: str, workspace: str) -> dict:
@@ -264,18 +348,24 @@ class BuildStore:
         return state
 
     def save(self, state: dict) -> None:
-        d = self._dir(state["id"])
-        d.mkdir(parents=True, exist_ok=True)
-        (d / "state.json").write_text(
-            json.dumps(state, ensure_ascii=False, indent=1),
-            encoding="utf-8")
-        (d / "task.md").write_text(
-            render_task_md(state["plan"],
-                           state["step_states"]),
-            encoding="utf-8")
+        with self._lock:
+            d = self._dir(state["id"])
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / "state.json.tmp"
+            tmp.write_text(
+                json.dumps(state, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+            os.replace(tmp, d / "state.json")
+            (d / "task.md").write_text(
+                render_task_md(state["plan"],
+                               state["step_states"]),
+                encoding="utf-8")
 
     def load(self, build_id: str):
-        path = self._dir(build_id) / "state.json"
+        try:
+            path = self._dir(build_id) / "state.json"
+        except ValueError:
+            return None
         if not path.exists():
             return None
         try:
@@ -283,9 +373,37 @@ class BuildStore:
         except (OSError, json.JSONDecodeError):
             return None
 
+    def claim(self, build_id: str, approve: bool):
+        """Atomically move awaiting_proceed → executing (or
+        denied) and return the state — or None when this call
+        did NOT win the transition (already claimed, unknown,
+        or in any other state). The Proceed gate's whole
+        load-check-save happens under the store lock, so two
+        Proceeds can never both start the executor."""
+        with self._lock:
+            state = self.load(build_id)
+            if not state \
+                    or state.get("status") != "awaiting_proceed":
+                return None
+            state["status"] = "executing" if approve else "denied"
+            self.save(state)
+            return state
+
     def list_builds(self, limit: int = 10) -> list:
+        # LATEST first by state mtime (audit 2026-10-22: the
+        # old sort was by directory NAME — uuid hex — so the
+        # freshest build could sit invisible past the limit
+        # while ancient ones filled the HUD's list).
+        dirs = [d for d in self.root.iterdir() if d.is_dir()]
+
+        def _mtime(d):
+            try:
+                return (d / "state.json").stat().st_mtime
+            except OSError:
+                return 0.0
+
         out = []
-        for d in sorted(self.root.iterdir(), reverse=True):
+        for d in sorted(dirs, key=_mtime, reverse=True):
             state = self.load(d.name)
             if state:
                 out.append({k: state.get(k) for k in

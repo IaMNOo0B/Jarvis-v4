@@ -19,9 +19,15 @@ def _claims(mem):
 
 
 def test_pure_duplicates_merge_to_one(tmp_path):
-    mem = _mem(tmp_path, ["The owner lives in Pune",
-                          "The owner lives in Pune",
-                          "The owner lives in Pune"])
+    # Raw duplicates are written through the store directly:
+    # Memory.learn() dedupes identical claims at the door
+    # (audit fix), so duplicates reach dreaming via imports,
+    # restores and older data — dreaming is the second wall.
+    mem = Memory(tmp_path / "data")
+    for _ in range(3):
+        mem.facts.add(claim="The owner lives in Pune",
+                      source="owner", source_trust="owner",
+                      presented_as="owner")
     report = dream(tmp_path / "data", mem.facts)
     assert report["merged"] == 2
     assert _claims(mem) == ["The owner lives in Pune"]

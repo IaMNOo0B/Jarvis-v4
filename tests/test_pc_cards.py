@@ -52,7 +52,11 @@ def test_volume_two_routes(monkeypatch):
 
     out = pc.op_volume_set(40, runner=flaky)
     assert out["route"].startswith("key-ladder")
-    assert calls["n"] == 2          # route 1 tried, route 2 ran
+    # route 1 tried, route 2 ran, route 2 verified by read-back
+    # (the read-back AudioVol call also fails on this runner, so
+    # the result honestly reports verified=False).
+    assert calls["n"] == 3
+    assert out["verified"] is False
 
 
 def test_card_flow_end_to_end(tmp_path):

@@ -71,6 +71,16 @@ def assert_can_become_fact(record: dict) -> None:
         raise MemoryTrustError("a fact needs a named source (provenance)")
 
 
+def _copy_record(rec: dict) -> dict:
+    """A detached copy — the store's records are append-only
+    and never edited; handing out the live dicts let any
+    caller rewrite history in-process (audit 2026-10-22)."""
+    out = dict(rec)
+    if isinstance(out.get("supersedes"), list):
+        out["supersedes"] = list(out["supersedes"])
+    return out
+
+
 class FactStore:
     """Append-only fact store with provenance and supersession."""
 
@@ -78,21 +88,66 @@ class FactStore:
         self.path = path
         self._lock = threading.Lock()
         self._records: list[dict] = []
+        self.skipped_lines = 0
+        self._stamp = None
         if os.path.exists(path):
             self._load()
 
     def _load(self) -> None:
+        """Tolerant reader (audit 2026-10-22): one torn or
+        foreign line must not brick the whole store — an
+        append-only file's realistic failure is a half-written
+        tail, and bricking Memory bricks app startup. Bad
+        lines are skipped and counted; records whose claimed
+        authority exceeds their channel (a hand-written
+        poisoning attempt) are kept for audit but quarantined
+        out of current_facts."""
+        records = []
+        skipped = 0
         with open(self.path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    self._records.append(json.loads(line))
-                except ValueError as exc:
-                    raise MemoryTrustError(
-                        f"fact store unreadable in {self.path}: {exc}"
-                    ) from exc
+                    rec = json.loads(line)
+                except ValueError:
+                    skipped += 1
+                    continue
+                if not isinstance(rec, dict) or not rec.get("id"):
+                    skipped += 1
+                    continue
+                st = rec.get("source_trust")
+                pa = rec.get("presented_as", st)
+                if st not in TRUST_LEVELS or pa not in TRUST_LEVELS:
+                    skipped += 1
+                    continue
+                if TRUST_LEVELS[pa] > TRUST_LEVELS[st]:
+                    rec["_quarantined"] = True
+                records.append(rec)
+        self._records = records
+        self.skipped_lines = skipped
+        self._restamp()
+
+    def _restamp(self) -> None:
+        try:
+            st = os.stat(self.path)
+            self._stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            self._stamp = None
+
+    def _ensure_fresh(self) -> None:
+        """Another FactStore on the same file (the app builds
+        several Memory objects) must not serve a frozen view:
+        if the file changed since our load, reload it."""
+        try:
+            st = os.stat(self.path)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return
+        if self._stamp is not None and stamp != self._stamp:
+            with self._lock:
+                self._load()
 
     # -- writing ----------------------------------------------------------
 
@@ -126,33 +181,70 @@ class FactStore:
             if supersedes is not None:
                 targets = supersedes if isinstance(supersedes, list) \
                     else [supersedes]
+                resolved = []
                 for target in targets:
-                    if self.get(target) is None:
+                    # Superseding an already-dead record forks
+                    # the chain (two 'current' truths). Redirect
+                    # to the live head that replaced it.
+                    head = self._live_head(target)
+                    if head is None:
                         raise MemoryTrustError(
                             f"cannot supersede unknown fact id "
                             f"{target!r}")
+                    if head not in resolved:
+                        resolved.append(head)
+                record["supersedes"] = (
+                    resolved if isinstance(supersedes, list)
+                    or len(resolved) != 1 else resolved[0])
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
                 os.fsync(f.fileno())
             self._records.append(record)
-            return record
+            self._restamp()
+            return _copy_record(record)
+
+    def _live_head(self, fact_id: str) -> Optional[str]:
+        """The id of the CURRENT record at the end of
+        fact_id's supersession chain (fact_id itself when it
+        is still current), or None when unknown."""
+        known = {r["id"] for r in self._records}
+        if fact_id not in known:
+            return None
+        current = fact_id
+        seen = set()
+        while current not in seen:
+            seen.add(current)
+            nxt = None
+            for rec in self._records:
+                sup = rec.get("supersedes")
+                if sup == current or (isinstance(sup, list)
+                                      and current in sup):
+                    nxt = rec["id"]
+                    break
+            if nxt is None:
+                return current
+            current = nxt
+        return current
 
     # -- reading ------------------------------------------------------------
 
     def get(self, fact_id: str) -> Optional[dict]:
+        self._ensure_fresh()
         for rec in self._records:
             if rec["id"] == fact_id:
-                return rec
+                return _copy_record(rec)
         return None
 
     def history(self) -> list[dict]:
         """Every record ever written, in write order — superseded ones
         included. History is never rewritten."""
-        return list(self._records)
+        self._ensure_fresh()
+        return [_copy_record(r) for r in self._records]
 
     def current_facts(self) -> list[dict]:
         """Only non-superseded records: the facts JARVIS may act on now."""
+        self._ensure_fresh()
         superseded = set()
         for rec in self._records:
             sup = rec.get("supersedes")
@@ -160,16 +252,20 @@ class FactStore:
                 superseded.update(sup)
             elif sup:
                 superseded.add(sup)
-        return [r for r in self._records if r["id"] not in superseded]
+        return [_copy_record(r) for r in self._records
+                if r["id"] not in superseded
+                and not r.get("_quarantined")]
 
     def superseded_by(self, fact_id: str) -> Optional[dict]:
-        """The record that replaced `fact_id`, if any."""
-        for rec in self._records:
-            sup = rec.get("supersedes")
-            if sup == fact_id or (isinstance(sup, list)
-                                  and fact_id in sup):
-                return rec
-        return None
+        """The LIVE record that ultimately replaced
+        `fact_id` — the chain is followed to its head, so a
+        correction flow never quotes a dead replacement as
+        the current truth (audit 2026-10-22)."""
+        self._ensure_fresh()
+        head = self._live_head(fact_id)
+        if head is None or head == fact_id:
+            return None
+        return self.get(head)
 
     def __len__(self) -> int:
         return len(self._records)

@@ -119,19 +119,26 @@ class ToolView:
         if desc_cap is not None and len(desc) > desc_cap:
             desc = desc[:desc_cap].rstrip()
         if names_only:
-            params = {"type": "object", "properties": {}}
+            # The floor rung: the bare object stub, without
+            # the empty properties map — those ~16 chars per
+            # tool pay for the always-present description key
+            # (Pollinations requires it) inside the same hard
+            # budget.
+            params = {"type": "object"}
         else:
             params = self.parameters or \
                 {"type": "object", "properties": {}}
             if compact:
                 params = compact_schema(params)
         fn: Dict[str, Any] = {"name": self.name,
+                              "description": desc,
                               "parameters": params}
-        if desc:
-            # An empty description key is ~17 chars of nothing,
-            # paid once per tool per request — omit it; every
-            # consumer reads description with .get().
-            fn["description"] = desc
+        # The description key is ALWAYS present ("" when the
+        # manifest has none): Pollinations' ToolDescription
+        # schema REQUIRES the key as a string and 400s the
+        # whole request without it — the token-diet omission
+        # killed the keyless fallback on every tool turn
+        # (live /diagnose, 2026-10-22).
         return {"type": "function", "function": fn}
 
 

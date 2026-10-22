@@ -34,11 +34,18 @@ def test_stage_verify_promote_rollback(tmp_path):
     landed = forge.promote(root, entry)
     assert landed["ok"] is True
     assert (root / "jarvis" / "hisaab.py").exists()
-    assert (root / "tests" / "test_forge_hisaab_jodo.py").exists()
+    # The test path rides the entry's UNIQUE slug (audit
+    # 2026-10-22) — read it from the manifest, never guess
+    # it from the feature name.
+    import json as _json
+    test_rel = _json.loads(
+        (entry / "MANIFEST.json").read_text())["test_rel"]
+    assert test_rel.startswith("tests/test_forge_hisaab_jodo_")
+    assert (root / test_rel).exists()
     back = forge.rollback(root, data, staged["slug"])
     assert back["ok"] is True
     assert not (root / "jarvis" / "hisaab.py").exists()
-    assert not (root / "tests" / "test_forge_hisaab_jodo.py").exists()
+    assert not (root / test_rel).exists()
 
 
 def test_bad_paths_and_failing_tests_never_land(tmp_path):

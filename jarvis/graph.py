@@ -44,6 +44,12 @@ _PATTERNS = [
 
 _STOP_SUBJECTS = {"it", "this", "that", "there", "he", "she", "they"}
 
+# A subject containing a verb phrase is a CLAUSE, not an
+# entity: "Aisha is a teacher who lives in Pune" must not
+# mint the subject "Aisha is a teacher who" (audit 2026-10-22).
+_SUBJECT_CLAUSE = re.compile(
+    r"\s+(?:is|are|was|were|has|have|who|which)\s+", re.I)
+
 
 def extract_edges(claim: str) -> list:
     """(subject, predicate, object) triples a claim plainly
@@ -58,6 +64,8 @@ def extract_edges(claim: str) -> list:
         obj = match.group(2).strip(" ,")
         if subject.lower() in _STOP_SUBJECTS or not obj:
             continue
+        if _SUBJECT_CLAUSE.search(subject):
+            continue    # a clause wearing a subject's clothes
         if len(subject.split()) > 6 or len(obj.split()) > 10:
             continue
         edges.append((subject, predicate, obj))
@@ -75,16 +83,34 @@ class KnowledgeGraph:
         self.path = Path(data_dir) / "graph.jsonl"
         self._edges: List[dict] = []
         self._seen_facts: set = set()
+        self._edge_keys: set = set()
+        self.skipped_lines = 0
         if self.path.exists():
+            # Tolerant PER LINE (audit 2026-10-22: one torn
+            # line zeroed the whole graph, and the rebuild
+            # then re-added every fact — duplicating edges).
             try:
-                for line in self.path.read_text(
-                        encoding="utf-8").splitlines():
-                    if line.strip():
-                        row = json.loads(line)
-                        self._edges.append(row)
-                        self._seen_facts.add(row.get("fact_id"))
+                lines = self.path.read_text(
+                    encoding="utf-8").splitlines()
             except Exception:
-                self._edges, self._seen_facts = [], set()
+                lines = []
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, dict):
+                        raise ValueError("row not a dict")
+                except Exception:
+                    self.skipped_lines += 1
+                    continue
+                key = (row.get("fact_id"), row.get("subject"),
+                       row.get("predicate"), row.get("object"))
+                if key in self._edge_keys:
+                    continue
+                self._edge_keys.add(key)
+                self._edges.append(row)
+                self._seen_facts.add(row.get("fact_id"))
 
     def __len__(self) -> int:
         return len(self._edges)
@@ -98,6 +124,10 @@ class KnowledgeGraph:
         added = 0
         for subject, predicate, obj in extract_edges(
                 fact.get("claim", "")):
+            key = (fact_id, subject, predicate, obj)
+            if key in self._edge_keys:
+                continue
+            self._edge_keys.add(key)
             row = {"fact_id": fact_id, "subject": subject,
                    "predicate": predicate, "object": obj,
                    "ts": fact.get("ts")}
@@ -132,15 +162,21 @@ class KnowledgeGraph:
             if current_fact_ids is not None and \
                     edge.get("fact_id") not in current_fact_ids:
                 continue
-            subj, obj = _norm(edge["subject"]), _norm(edge["object"])
-            if needle in subj or needle in obj or (
-                    needle_tokens and needle_tokens <=
-                    set(rag.tokenize(subj + " " + obj))):
+            # Whole-TOKEN matching (audit 2026-10-22: the raw
+            # substring test matched 'fee' inside 'coffee').
+            subj_tokens = set(rag.tokenize(_norm(edge["subject"])))
+            obj_tokens = set(rag.tokenize(_norm(edge["object"])))
+            if needle_tokens and (needle_tokens <= subj_tokens
+                                  or needle_tokens <= obj_tokens):
                 hits.append(edge)
         neighbours = set()
         for edge in hits:
             neighbours.add(edge["subject"])
             neighbours.add(edge["object"])
-        neighbours.discard(entity)
+        # The entity itself leaves the neighbour list by
+        # NORMALIZED comparison — 'Aisha' the query vs 'aisha'
+        # the stored spelling used to survive the discard.
+        neighbours = {n for n in neighbours
+                      if _norm(n) != needle}
         return {"entity": entity, "edges": hits,
                 "neighbours": sorted(neighbours)}

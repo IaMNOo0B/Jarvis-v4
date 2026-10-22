@@ -27,6 +27,7 @@ and everything landed can be taken back.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -36,6 +37,17 @@ from pathlib import Path
 
 ALLOWED_PREFIXES = ("jarvis/", "tests/", "knowledge/")
 FORGE_DIR = "forge"
+
+_ENV_ALLOW = ("PATH", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP",
+              "USERPROFILE", "HOME", "LANG", "PATHEXT", "COMSPEC")
+
+
+def _scrubbed_env() -> dict:
+    """The run_code allowlist, same rails: verification
+    subprocesses never inherit the owner's API keys or
+    session secrets (audit 2026-10-22: forge ran pytest with
+    the full environment)."""
+    return {k: os.environ[k] for k in _ENV_ALLOW if k in os.environ}
 
 
 def _slug(name: str) -> str:
@@ -58,12 +70,13 @@ def _check_paths(files: dict) -> str:
     return ""
 
 
-def _run_tests(cwd: Path, test_rel: str) -> tuple:
+def _run_tests(cwd: Path, test_rel: str,
+               timeout: int = 180) -> tuple:
     try:
         proc = subprocess.run(
             [sys.executable, "-m", "pytest", "-q", test_rel],
             cwd=str(cwd), capture_output=True, text=True,
-            timeout=180)
+            timeout=timeout, env=_scrubbed_env())
         tail = (proc.stdout + proc.stderr).strip()[-500:]
         return proc.returncode == 0, tail
     except Exception as exc:
@@ -75,7 +88,7 @@ def _smoke_import(cwd: Path) -> tuple:
         proc = subprocess.run(
             [sys.executable, "-c", "import jarvis.chat"],
             cwd=str(cwd), capture_output=True, text=True,
-            timeout=60)
+            timeout=60, env=_scrubbed_env())
         return proc.returncode == 0, \
             (proc.stderr or "").strip()[-300:]
     except Exception as exc:
@@ -100,8 +113,12 @@ def stage_feature(data_dir, root, name: str, files: dict,
         target = payload / str(rel).replace("\\", "/")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(str(content), encoding="utf-8")
+    # The test path rides the UNIQUE slug (uuid suffix and
+    # all) — two features with the same name must never share
+    # a test file (audit 2026-10-22: same-name features
+    # overwrote, and rollback deleted, each other's tests).
     test_rel = (f"tests/test_forge_"
-                f"{_slug(name).replace('-', '_')}.py")
+                f"{slug.replace('-', '_')}.py")
     (entry / "test_file.py").write_text(str(test_code),
                                        encoding="utf-8")
     manifest = {"slug": slug, "name": str(name)[:80],
@@ -124,28 +141,49 @@ def _state(entry: Path, manifest: dict) -> None:
 
 
 def verify_staged(root, entry_dir) -> dict:
-    """Sandbox: copy the package, apply the payload, run the
-    feature test + an import smoke. The live tree is only
-    READ (for the copy), never written."""
+    """Sandbox: copy the tree, apply the payload, run the
+    WHOLE test suite (the feature's own test included) + an
+    import smoke. The live tree is only READ (for the copy),
+    never written. Copy/setup failures return a failure dict
+    — they never raise (audit 2026-10-22: a copy error killed
+    the background forge thread silently, and the old run
+    tested ONLY the new feature, so a payload that broke a
+    hundred existing tests still 'verified')."""
     entry = Path(entry_dir)
-    manifest = json.loads((entry / "MANIFEST.json").read_text(
-        encoding="utf-8"))
-    sandbox = entry / "sandbox"
-    if sandbox.exists():
-        shutil.rmtree(sandbox, ignore_errors=True)
-    sandbox.mkdir(parents=True)
-    root = Path(root)
-    shutil.copytree(root / "jarvis", sandbox / "jarvis")
-    payload = entry / "payload"
-    for path in payload.rglob("*"):
-        if path.is_file():
-            dest = sandbox / path.relative_to(payload)
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(path, dest)
-    test_target = sandbox / manifest["test_rel"]
-    test_target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(entry / "test_file.py", test_target)
-    ok, tail = _run_tests(sandbox, manifest["test_rel"])
+    try:
+        manifest = json.loads((entry / "MANIFEST.json").read_text(
+            encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "stage": "manifest",
+                "detail": f"{type(exc).__name__}: {exc}"}
+    try:
+        sandbox = entry / "sandbox"
+        if sandbox.exists():
+            shutil.rmtree(sandbox, ignore_errors=True)
+        root = Path(root)
+        shutil.copytree(
+            root, sandbox,
+            ignore=shutil.ignore_patterns(
+                ".git", "__pycache__", "*.pyc", "data"))
+        payload = entry / "payload"
+        for path in payload.rglob("*"):
+            if path.is_file():
+                dest = sandbox / path.relative_to(payload)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(path, dest)
+        test_target = sandbox / manifest["test_rel"]
+        test_target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(entry / "test_file.py", test_target)
+    except Exception as exc:
+        manifest["status"] = "verify-failed"
+        manifest["verify_tail"] = f"{type(exc).__name__}: {exc}"
+        try:
+            _state(entry, manifest)
+        except Exception:
+            pass
+        return {"ok": False, "stage": "copy",
+                "detail": manifest["verify_tail"]}
+    ok, tail = _run_tests(sandbox, "tests", timeout=600)
     if not ok:
         manifest["status"] = "verify-failed"
         manifest["verify_tail"] = tail
@@ -198,8 +236,21 @@ def promote(root, entry_dir, runner=None) -> dict:
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, dest)
             landed.append(rel)
+        # The live TEST file gets the same backup discipline
+        # as every payload file (audit 2026-10-22: it was
+        # overwritten bare, and rollback then DELETED whatever
+        # had been there — another feature's test included).
         live_test = root / manifest["test_rel"]
         live_test.parent.mkdir(parents=True, exist_ok=True)
+        test_rel_path = Path(manifest["test_rel"])
+        if live_test.exists():
+            keep = backup / test_rel_path
+            keep.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(live_test, keep)
+        else:
+            marker = backup / (manifest["test_rel"] + ".NEW")
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("", encoding="utf-8")
         shutil.copyfile(entry / "test_file.py", live_test)
         ok, tail = run(root, manifest["test_rel"])
         if not ok:
@@ -240,9 +291,17 @@ def _restore(root, entry: Path, manifest: dict) -> None:
             dest = root / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, dest)
-    live_test = root / manifest["test_rel"]
-    if live_test.exists():
-        live_test.unlink()
+    # The test file rides the same backup records as the
+    # payload (restored above when it pre-existed, deleted via
+    # its .NEW marker when it did not). Only a legacy entry —
+    # promoted before test files were backed up — falls back
+    # to removing the landed test outright.
+    test_rel = manifest["test_rel"]
+    if not (backup / test_rel).exists() \
+            and not (backup / (test_rel + ".NEW")).exists():
+        live_test = root / test_rel
+        if live_test.exists():
+            live_test.unlink()
 
 
 def rollback(root, data_dir, slug: str) -> dict:

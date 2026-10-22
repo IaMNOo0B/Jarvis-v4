@@ -16,6 +16,37 @@ ranks above one a single route happened to surface.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, wait
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+_TRACKING_PARAMS = {"fbclid", "gclid", "dclid", "mc_cid",
+                    "mc_eid", "ref", "referrer", "source"}
+
+
+def _normalize_url(url: str) -> str:
+    """One canonical form per page (audit 2026-10-22: the
+    same page arrived as 3 'different' hits — case, www,
+    trailing slash, fragment and tracking params all made
+    false duplicates, defeating the agreement ranking)."""
+    try:
+        parts = urlsplit(str(url).strip())
+    except Exception:
+        return str(url).strip()
+    host = (parts.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    netloc = host
+    if parts.port:
+        netloc = f"{host}:{parts.port}"
+    path = parts.path
+    if len(path) > 1 and path.endswith("/"):
+        path = path.rstrip("/")
+    elif path == "/":
+        path = ""       # root slash carries no information
+    query = [(k, v) for k, v in parse_qsl(parts.query)
+             if not k.lower().startswith("utm_")
+             and k.lower() not in _TRACKING_PARAMS]
+    return urlunsplit((parts.scheme.lower() or "https", netloc,
+                       path, urlencode(query), ""))
 
 
 def run_parallel(jobs: dict, timeout: float = 30.0):
@@ -43,10 +74,19 @@ def run_parallel(jobs: dict, timeout: float = 30.0):
             except Exception as exc:  # a route died; others live
                 failures[name] = f"{type(exc).__name__}: {exc}"
                 continue
-            if isinstance(result, dict) and (
+            # A route that returns None or an ok:False dict
+            # FAILED, whatever else it carries (audit
+            # 2026-10-22: both landed in oks and were merged
+            # as findings).
+            if result is None:
+                failures[name] = "route ne kuch nahi diya"
+            elif isinstance(result, dict) and (
+                    result.get("ok") is False
+                    or (result.get("error")
+                        and result.get("ok") is not True)):
+                failures[name] = str(
                     result.get("error")
-                    and result.get("ok") is not True):
-                failures[name] = str(result["error"])[:200]
+                    or "route ne ok:False diya")[:200]
             else:
                 oks[name] = result if isinstance(result, dict) \
                     else {"value": result}
@@ -64,9 +104,10 @@ def merge_hits(route_hits, cap: int = 12):
     by_url, order = {}, []
     for route, hits in route_hits:
         for hit in hits or []:
-            url = str(hit.get("url") or "").strip()
-            if not url:
+            raw_url = str(hit.get("url") or "").strip()
+            if not raw_url:
                 continue
+            url = _normalize_url(raw_url)
             if url not in by_url:
                 by_url[url] = {
                     "title": str(hit.get("title") or url)[:160],
@@ -80,6 +121,11 @@ def merge_hits(route_hits, cap: int = 12):
                 entry["via"].append(route)
             if not entry["snippet"] and hit.get("snippet"):
                 entry["snippet"] = str(hit["snippet"])[:300]
+            # A later duplicate with a real title upgrades an
+            # entry whose title was just the URL placeholder.
+            if entry["title"] == entry["url"] \
+                    and hit.get("title"):
+                entry["title"] = str(hit["title"])[:160]
     merged = [by_url[u] for u in order]
     merged.sort(key=lambda e: -len(e["via"]))
     return merged[:cap]

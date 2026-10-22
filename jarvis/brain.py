@@ -104,7 +104,14 @@ def _normalize_tool_call(raw: Any) -> Optional[Dict[str, Any]]:
             args = {"_raw": args}
     if not isinstance(args, dict):
         args = {"value": args}
-    return {"name": str(name), "args": args}
+    out = {"name": str(name), "args": args}
+    # Preserve the provider's call id when it minted one —
+    # Gemini's thoughtSignature echo depends on the SAME id
+    # coming back in the next request's functionCall part.
+    cid = raw.get("id") or fn.get("id")
+    if cid:
+        out["id"] = str(cid)
+    return out
 
 
 def normalize_reply(raw: Any) -> ProviderReply:
@@ -140,6 +147,8 @@ def normalize_reply(raw: Any) -> ProviderReply:
 # ---------------------------------------------------------------------------
 # CompletionAudit helpers
 # ---------------------------------------------------------------------------
+
+_FRAMED_RESULT_CAP = 4000
 
 _ACTION_PATTERNS = (
     re.compile(r"\b(open|launch|start|run|set|create|make|write|note|"
@@ -400,6 +409,15 @@ class Brain:
             # Spotlighting: unforgeable HMAC markers inside the
             # framing, so the data cannot fake its own end.
             text = ifc_mod.mark_outside(text, key)
+        if len(text) > _FRAMED_RESULT_CAP:
+            # A giant tool result must not eat the whole next
+            # prompt (audit 2026-10-22: framed results were
+            # unbounded — one huge page read pushed the turn
+            # over budget and the owner got silence).
+            text = (text[:_FRAMED_RESULT_CAP]
+                    + "\n[… tool ka jawab kata — poora "
+                      f"{len(text)} chars tha; chhota hissa "
+                      "upar hai]")
         return (f'<tool_output tool="{name}" origin="tool:{name}" '
                 f'trust="untrusted">\n{text}\n</tool_output>')
 
@@ -516,12 +534,17 @@ class Brain:
                 final_text = reply.content
                 break
 
-            # Assistant turn carrying the requested calls.
+            # Assistant turn carrying the requested calls. The
+            # provider's own call id is kept when it minted one
+            # (Gemini's thoughtSignature echo is keyed by it);
+            # the brain's call_<round>_<i> shape is the fallback.
+            call_ids = [str(c.get("id") or f"call_{rounds}_{i}")
+                        for i, c in enumerate(reply.tool_calls)]
             assistant_msg: Dict[str, Any] = {
                 "role": "assistant",
                 "content": reply.content or "",
                 "tool_calls": [
-                    {"id": f"call_{rounds}_{i}", "type": "function",
+                    {"id": call_ids[i], "type": "function",
                      "function": {"name": c["name"],
                                   "arguments": json.dumps(
                                       c["args"], ensure_ascii=False)}}
@@ -538,7 +561,7 @@ class Brain:
             planned = []
             planned_execs = 0
             for i, call in enumerate(reply.tool_calls):
-                call_id = f"call_{rounds}_{i}"
+                call_id = call_ids[i]
                 key = (call["name"] + "|" + json.dumps(
                     call["args"], sort_keys=True, ensure_ascii=False,
                     default=str))
@@ -594,6 +617,7 @@ class Brain:
                 if p["refusal"] is not None:
                     messages.append({"role": "tool",
                                      "tool_call_id": p["call_id"],
+                                     "name": p["call"]["name"],
                                      "content": p["refusal"]})
                     continue
                 result = results[idx]
@@ -604,6 +628,7 @@ class Brain:
                                               ok=err is None, error=err))
                 messages.append({"role": "tool",
                                  "tool_call_id": p["call_id"],
+                                 "name": call["name"],
                                  "content": self._frame_tool_result(
                                      call["name"], result)})
 

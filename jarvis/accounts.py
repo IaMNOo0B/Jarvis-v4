@@ -24,7 +24,9 @@ The book keeps the hisaab; the channel tools do the sending.
 
 from __future__ import annotations
 
+import copy
 import json
+import os
 import threading
 import time
 import uuid
@@ -34,11 +36,30 @@ CHANNELS = ("email", "instagram", "threads", "facebook")
 DEFAULT_CAPS = {"email": 200, "instagram": 80,
                 "threads": 20, "facebook": 30}
 
+# One lock per accounts file, shared across AccountBook
+# instances (audit 2026-10-22: chat.py builds a fresh book per
+# call, each with its OWN lock — the pick/record pair and the
+# cap were only ever guarded per-instance, which is to say
+# not guarded at all).
+_LOCKS: dict = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    key = str(Path(path).resolve())
+    with _LOCKS_GUARD:
+        lock = _LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _LOCKS[key] = lock
+        return lock
+
 
 class AccountBook:
     def __init__(self, data_dir):
         self._path = Path(data_dir) / "accounts.json"
-        self._lock = threading.Lock()
+        self._lock = _lock_for(self._path)
+        self._last_good: dict = {}
 
     # -- storage ------------------------------------------------------
     def _load(self) -> dict:
@@ -46,26 +67,42 @@ class AccountBook:
             data = json.loads(self._path.read_text(
                 encoding="utf-8"))
             if isinstance(data, dict):
+                self._last_good = copy.deepcopy(data)
                 return data
         except Exception:
             pass
-        return {}
+        # A corrupt read must never become a wiped book on the
+        # next save: serve the last good state this process saw.
+        return copy.deepcopy(self._last_good)
 
     def _save(self, book: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(
+        tmp = self._path.with_suffix(".json.tmp")
+        tmp.write_text(
             json.dumps(book, ensure_ascii=False, indent=1),
             encoding="utf-8")
+        os.replace(tmp, self._path)
+        self._last_good = copy.deepcopy(book)
 
     @staticmethod
     def _today() -> str:
         return time.strftime("%Y-%m-%d")
 
     def _fresh(self, row: dict) -> dict:
-        """Day rollover: yesterday's count never haunts today."""
+        """Day rollover: yesterday's count never haunts today —
+        and neither does yesterday's daily-cap rest (its reason
+        text lingered in the overview and a stale rest_until
+        confused eligibility long after midnight). A HARD rest
+        (provider warning, set via rest()) keeps its bench
+        until its own time is up."""
         if row.get("sent_day") != self._today():
             row["sent_day"] = self._today()
             row["sent_count"] = 0
+            if row.get("rest_reason") == "roz ki had puri":
+                row["rest_until"] = 0.0
+            row["rest_reason"] = "" \
+                if float(row.get("rest_until", 0)) <= time.time() \
+                else row.get("rest_reason", "")
         return row
 
     # -- CRUD -----------------------------------------------------------
@@ -85,6 +122,17 @@ class AccountBook:
                "rest_reason": "", "added_ts": time.time()}
         with self._lock:
             book = self._load()
+            # The same address on the same channel twice is
+            # one identity with a DOUBLE cap — refused
+            # (audit 2026-10-22: nothing stopped it).
+            wanted = str(address).strip().lower()
+            for existing in book.values():
+                if existing.get("channel") == channel and \
+                        str(existing.get("address", "")).strip(
+                        ).lower() == wanted:
+                    raise ValueError(
+                        "yeh khaata is channel par pehle se juda "
+                        "hai, sir")
             book[row["id"]] = row
             self._save(book)
         return dict(row)
@@ -145,15 +193,50 @@ class AccountBook:
             if row is None:
                 return {}
             self._fresh(row)
-            row["sent_count"] = int(row.get("sent_count", 0)) + 1
-            if row["sent_count"] >= int(row.get("cap", 0)):
-                tomorrow = time.localtime(time.time() + 86400)
-                row["rest_until"] = time.mktime(time.struct_time(
-                    (tomorrow.tm_year, tomorrow.tm_mon,
-                     tomorrow.tm_mday, 0, 5, 0, 0, 0, -1)))
-                row["rest_reason"] = "roz ki had puri"
+            # The cap is re-checked HERE, under the lock —
+            # pick() alone was advisory, and two senders who
+            # both picked the last slot both recorded, ending
+            # over the cap (audit probe: 4 counted sends
+            # against cap=2).
+            if int(row.get("sent_count", 0)) \
+                    >= int(row.get("cap", 0)):
+                out = dict(row)
+                out["ok"] = False
+                out["capped"] = True
+                return out
+            self._count_send(row)
             self._save(book)
             return dict(row)
+
+    def _count_send(self, row: dict) -> None:
+        """Increment + bench at the cap. Caller holds the lock
+        and saves."""
+        row["sent_count"] = int(row.get("sent_count", 0)) + 1
+        if row["sent_count"] >= int(row.get("cap", 0)):
+            tomorrow = time.localtime(time.time() + 86400)
+            row["rest_until"] = time.mktime(time.struct_time(
+                (tomorrow.tm_year, tomorrow.tm_mon,
+                 tomorrow.tm_mday, 0, 5, 0, 0, 0, -1)))
+            row["rest_reason"] = "roz ki had puri"
+
+    def pick_and_record(self, channel: str):
+        """Pick the least-used eligible account AND count the
+        send in one lock hold — the pair can no longer be
+        raced by a second sender between pick and record."""
+        with self._lock:
+            book = self._load()
+            rows = [self._fresh(dict(r)) for r in book.values()
+                    if r.get("channel") == channel]
+            candidates = [r for r in rows if self.eligible(r)]
+            if not candidates:
+                return None
+            candidates.sort(key=lambda r: (int(r["sent_count"]),
+                                           r["added_ts"]))
+            live = book[candidates[0]["id"]]
+            self._fresh(live)
+            self._count_send(live)
+            self._save(book)
+            return dict(live)
 
     def rest(self, account_id: str, seconds: float,
              reason: str = "") -> bool:
