@@ -933,6 +933,63 @@ def _json_from_reply(text: str):
     return None
 
 
+def _critic_once(parts, task_text, subtask, content, summary,
+                 skeptic: bool = False):
+    """One cold judgement of a team subtask's output. The
+    skeptic variant (Santa, ECC Wave B) is a SECOND,
+    independent reviewer whose job is to find the failure
+    the first critic would wave through; it shares no
+    context with the first — separate Brain, separate call."""
+    brain = _team_brain(parts, with_tools=False)
+    if skeptic:
+        head = ("You are the SECOND reviewer (skeptic) — you "
+                "did NOT write this code and you have NOT "
+                "seen any other review. Your job is to find "
+                "why this subtask output FAILS its brief: "
+                "missing behaviour, wrong assumptions, "
+                "unproven claims. Pass it ONLY if the hunt "
+                "finds nothing real. ")
+    else:
+        head = ("You are the CRITIC — you did NOT write this "
+                "code; judge it cold. ")
+    reply = brain.respond([], (
+        head
+        + f"Subtask: {subtask['title']} — {subtask['brief']}\n"
+        f"Worker ki summary: {summary}\nFiles:\n{content}\n"
+        "Reply with ONLY JSON: {\"ok\": true} or "
+        "{\"ok\": false, \"issues\": \"kya kharab hai, saaf "
+        "shabdon me\"}")).reply
+    verdict = _json_from_reply(reply)
+    if not isinstance(verdict, dict) or "ok" not in verdict:
+        return {"ok": False,
+                "issues": "critic ka jawab samajh nahi "
+                          "aaya — dobara koshish karo"}
+    return verdict
+
+
+def _dual_critic(parts, task_text, subtask, content, summary):
+    """Santa dual review for team merges (ECC Wave B): the
+    critic's verdict AND an independent skeptic pass —
+    the subtask passes only when BOTH say ok (team.py's
+    `ok is True` rule applies to the combined verdict).
+    A split keeps both objections in the issues, so the
+    repair round knows exactly what to fix."""
+    first = _critic_once(parts, task_text, subtask, content,
+                         summary)
+    second = _critic_once(parts, task_text, subtask, content,
+                          summary, skeptic=True)
+    if first.get("ok") is True and second.get("ok") is True:
+        return {"ok": True}
+    issues = []
+    if first.get("ok") is not True:
+        issues.append("[critic] " + str(
+            first.get("issues", "ok nahi kaha"))[:280])
+    if second.get("ok") is not True:
+        issues.append("[shak-guard] " + str(
+            second.get("issues", "ok nahi kaha"))[:280])
+    return {"ok": False, "issues": " · ".join(issues)[:600]}
+
+
 def _team_ops(holder, data_dir):
     """delegate_team (jarvis/team.py): a coding task split by a
     planner into file-owned subtasks, worked in parallel
@@ -981,22 +1038,10 @@ def _team_ops(holder, data_dir):
             return _delegated_summary(parts, order)
 
         def critic(task_text, subtask, content, summary):
-            brain = _team_brain(parts, with_tools=False)
-            reply = brain.respond([], (
-                "You are the CRITIC — you did NOT write this "
-                "code; judge it cold. Subtask: "
-                f"{subtask['title']} — {subtask['brief']}\n"
-                f"Worker ki summary: {summary}\nFiles:\n"
-                f"{content}\nReply with ONLY JSON: "
-                "{\"ok\": true} or {\"ok\": false, \"issues\": "
-                "\"kya kharab hai, saaf shabdon me\"}")).reply
-            verdict = _json_from_reply(reply)
-            if not isinstance(verdict, dict) \
-                    or "ok" not in verdict:
-                return {"ok": False,
-                        "issues": "critic ka jawab samajh nahi "
-                                  "aaya — dobara koshish karo"}
-            return verdict
+            # Santa dual review: critic + independent
+            # skeptic; merge needs both (see _dual_critic).
+            return _dual_critic(parts, task_text, subtask,
+                                content, summary)
 
         def _run():
             from .team import run_team
@@ -1990,6 +2035,28 @@ def _run_mission_app(parts, data_dir, mission_id: str,
                 cal.resolve(did, landed)
         except Exception:
             pass
+    # The instinct feed (ECC Wave B): a mission that LANDED
+    # reinforces its pattern; one that did not is negative
+    # evidence against it. Same trigger/action pair, so a
+    # repeated goal's record accumulates honestly.
+    try:
+        from .instincts import InstinctBook
+        _book = InstinctBook(data_dir)
+        _trigger = "mission: " + goal[:80]
+        _action = "kadam-dar-kadam mission pura karna"
+        if outcome["state"] == "done":
+            _book.observe(
+                _trigger, _action, "mission",
+                f"mission done ({outcome['steps_taken']} "
+                f"kadam): {goal[:60]}")
+        else:
+            _book.observe(
+                _trigger, _action, "mission",
+                f"mission {outcome['state']}: "
+                f"{str(outcome.get('note', ''))[:80]}",
+                negative=True)
+    except Exception:
+        pass
     _task_log(data_dir, {"id": mission_id, "kind": "mission",
                          "task": goal[:500],
                          "status": outcome["state"],
@@ -2071,9 +2138,12 @@ def _plan_for_build(parts, goal: str, workspace: str):
         '["kadam 1", "..."], "verification": [{"kind": '
         '"command|check", "detail": "command items me woh '
         'shell command jo safalta saabit kare; check items me '
-        'woh jaanch jo ek parakhne wala kare"}]}\n'
-        "Verification plan lazmi hai — safalta KAISE saabit "
-        "hogi, pehle se tay karo.")
+        'woh jaanch jo ek parakhne wala kare"}], "rubric": '
+        '[{"name": "kasauti ka naam", "pass_when": "ye sach '
+        'ho to criterion pura mana jayega"}]}\n'
+        "Verification plan aur rubric dono lazmi hain — "
+        "safalta KAISE saabit hogi aur DONE ka matlab KYA "
+        "hai, pehle se tay karo.")
     problems = ["plan JSON hi nahi mila"]
     for _attempt in range(2):
         try:
@@ -2091,7 +2161,8 @@ def _plan_for_build(parts, goal: str, workspace: str):
                     "changes": parsed.get("changes") or [],
                     "steps": parsed.get("steps") or [],
                     "verification":
-                        parsed.get("verification") or []}
+                        parsed.get("verification") or [],
+                    "rubric": parsed.get("rubric") or []}
             problems = validate_plan(plan)
             if not problems:
                 return plan, []
@@ -2100,20 +2171,40 @@ def _plan_for_build(parts, goal: str, workspace: str):
     return None, problems
 
 
-def _build_check(parts, goal: str, item: dict, context: str):
+def _build_check(parts, goal: str, item: dict, context: str,
+                 framing: str = "judge"):
     """The critic for a verification 'check' item: a fresh
     no-tools Brain judges ONE declared check against the
     real build context (steps + diff). Fail-closed: a check
     that cannot be judged counts as not passed, with the
-    reason named."""
+    reason named.
+
+    Two framings (Santa, ECC Wave B): the plain 'judge'
+    weighs the evidence; the 'skeptic' is paid to find why
+    the check FAILS and may pass it only when the hunt
+    comes up empty. Neither sees the other's verdict —
+    fresh context, fresh Brain, every call."""
     from .brain import Brain
-    prompt = (
-        f"BUILD GOAL: {goal}\nJAANCH: {item.get('detail')}\n"
-        f"ASAL HAAL:\n{context}\n"
-        "Sirf upar diye asal haal ki bina par faisla do — "
-        "andaza nahi.\n"
-        'Reply ONLY with JSON: {"ok": true|false, "note": '
-        '"ek line saboot ke saath"}')
+    if framing == "skeptic":
+        prompt = (
+            f"BUILD GOAL: {goal}\nJAANCH: {item.get('detail')}\n"
+            f"ASAL HAAL:\n{context}\n"
+            "Tum DOOSRE parakhne wale ho (shak-guard) — "
+            "tumhara kaam is jaanch ke FAIL hone ki wajah "
+            "dhoondhna hai: khaamiyan, adhoori baatein, bina "
+            "saboot ke daave, jo mile pakdo. ok SIRF tab "
+            "true do jab dhundhne par bhi koi asal khaami "
+            "na mile.\n"
+            'Reply ONLY with JSON: {"ok": true|false, '
+            '"note": "jo khaami mili, ya safai ka saboot"}')
+    else:
+        prompt = (
+            f"BUILD GOAL: {goal}\nJAANCH: {item.get('detail')}\n"
+            f"ASAL HAAL:\n{context}\n"
+            "Sirf upar diye asal haal ki bina par faisla do — "
+            "andaza nahi.\n"
+            'Reply ONLY with JSON: {"ok": true|false, "note": '
+            '"ek line saboot ke saath"}')
     try:
         brain = Brain(parts.chain, [], parts.dispatch,
                       parts.journal, parts.memory, audit=False)
@@ -2125,6 +2216,79 @@ def _build_check(parts, goal: str, item: dict, context: str):
     except Exception:
         pass
     return {"ok": False, "note": "jaanch chal nahi payi"}
+
+
+RUBRIC_MAX_REPAIRS = 2
+
+
+def _build_rubric_eval(parts, plan: dict, evidence: str):
+    """The GAN evaluator (ECC Wave B): scores the plan's
+    rubric against the EVIDENCE — step summaries, the real
+    diff, verification outcomes — never against the
+    builder's claims. Fail-closed per criterion: a
+    criterion the evaluator does not mark met with
+    `met: true` (strict boolean) counts as UNMET."""
+    from .brain import Brain
+    rubric = plan.get("rubric") or []
+    crit_text = "\n".join(
+        f"- {c.get('name')}: {c.get('pass_when')}"
+        for c in rubric if isinstance(c, dict))
+    prompt = (
+        f"BUILD GOAL: {plan['goal']}\n"
+        f"RUBRIC (kasauti):\n{crit_text}\n"
+        f"SABOOT (asal haal):\n{evidence}\n"
+        "Har criterion ko SIRF upar ke saboot ki bina par "
+        "aanko: met tabhi jab saboot use pura saabit kare. "
+        "Andaza ya builder ke daave par met nahi dena.\n"
+        'Reply ONLY with JSON: {"criteria": [{"name": '
+        '"...", "met": true|false, "note": "saboot wali '
+        'ek line"}]}')
+    parsed = None
+    try:
+        brain = Brain(parts.chain, [], parts.dispatch,
+                      parts.journal, parts.memory, audit=False)
+        out = brain.respond([], prompt)
+        parsed = _json_from_reply(str(out.reply))
+    except Exception:
+        parsed = None
+    by_name = {}
+    if isinstance(parsed, dict):
+        for row in parsed.get("criteria") or []:
+            if isinstance(row, dict) and row.get("name"):
+                by_name[str(row["name"])] = row
+    results = []
+    for crit in rubric:
+        if not isinstance(crit, dict):
+            continue
+        name = str(crit.get("name", ""))
+        row = by_name.get(name)
+        if row is None:
+            results.append(
+                {"name": name, "met": False,
+                 "note": "evaluator ne is criterion ka "
+                         "jawab nahi diya"})
+        else:
+            results.append(
+                {"name": name, "met": row.get("met") is True,
+                 "note": str(row.get("note", ""))[:200]})
+    return results
+
+
+def _build_check_dual(parts, goal: str, item: dict,
+                      context: str):
+    """Santa dual review (ECC Wave B): the check is judged
+    TWICE, independently — a plain judge and a skeptic —
+    and passes only on UNANIMITY. A split verdict fails
+    the check, with BOTH notes kept as the evidence, so
+    the walkthrough shows exactly who objected and why."""
+    first = _build_check(parts, goal, item, context)
+    second = _build_check(parts, goal, item, context,
+                          framing="skeptic")
+    ok = bool(first["ok"]) and bool(second["ok"])
+    note = (f"[parakh-1] {first['note']} · "
+            f"[shak-guard] {second['note']}")
+    return {"ok": ok, "note": note[:480],
+            "reviewers": [first, second]}
 
 
 def _run_build_app(parts, data_dir, build_id: str) -> None:
@@ -2174,59 +2338,125 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
             state["step_states"][i] = "failed"
         summaries.append(str(summary)[:300])
         store.save(state)
-    after_snap, after_truncated = snapshot_tree_full(workspace)
-    diff = diff_trees(baseline, after_snap)
-    binding = binding_report(plan, diff)
-    snapshot_truncated = base_truncated or after_truncated
+    repair_notes = []
+
+    def _assess():
+        """One full judgement round: snapshot → diff →
+        binding → the plan's Verification Plan actually run
+        (checks judged Santa-style, twice) → the rubric
+        scored by the GAN evaluator. Judgement only — it
+        never touches the workspace, so it can run again
+        after a repair round on fresh evidence."""
+        after_snap, after_truncated = snapshot_tree_full(
+            workspace)
+        diff = diff_trees(baseline, after_snap)
+        binding = binding_report(plan, diff)
+        truncated = base_truncated or after_truncated
+        context = ("Kadam: "
+                   + " | ".join(summaries + repair_notes)
+                   + "\nBadlav: created="
+                   + ", ".join(diff["created"])
+                   + "; modified=" + ", ".join(diff["modified"])
+                   + "; deleted=" + ", ".join(diff["deleted"]))
+        results = []
+        for item in plan.get("verification") or []:
+            if item.get("kind") == "command":
+                code = (
+                    "import subprocess, json\n"
+                    f"_p = subprocess.run({item['detail']!r}, "
+                    "shell=True, capture_output=True, "
+                    "text=True, timeout=110)\n"
+                    "print(json.dumps({'exit': _p.returncode, "
+                    "'out': (_p.stdout + _p.stderr)[-800:]}))")
+                evidence = ""
+                ok = False
+                try:
+                    res = parts.dispatch("run_code", {
+                        "code": code, "timeout": 120,
+                        "cwd": str(workspace)})
+                    raw = str(res.get("stdout") or "")
+                    for line in reversed(raw.splitlines()):
+                        try:
+                            got = json.loads(line)
+                            ok = got.get("exit") == 0
+                            evidence = str(
+                                got.get("out", ""))[:300]
+                            break
+                        except (ValueError, AttributeError):
+                            continue
+                except Exception as exc:
+                    evidence = f"{type(exc).__name__}: {exc}"
+                results.append(
+                    {"kind": "command",
+                     "detail": item["detail"], "ok": ok,
+                     "evidence": evidence})
+            else:
+                got = _build_check_dual(parts, plan["goal"],
+                                        item, context)
+                results.append(
+                    {"kind": "check", "detail": item["detail"],
+                     "ok": got["ok"], "evidence": got["note"]})
+        rubric_results = []
+        if plan.get("rubric"):
+            evidence = (
+                context + "\nVerification: " + "; ".join(
+                    f"{r['kind']}:{r['detail']}="
+                    f"{'ok' if r['ok'] else 'FAIL'}"
+                    for r in results))
+            rubric_results = _build_rubric_eval(
+                parts, plan, evidence)
+        return diff, binding, results, rubric_results, \
+            truncated
+
     state["status"] = "verifying"
     store.save(state)
-    verify_results = []
-    for item in plan.get("verification") or []:
-        if item.get("kind") == "command":
-            code = (
-                "import subprocess, json\n"
-                f"_p = subprocess.run({item['detail']!r}, "
-                "shell=True, capture_output=True, text=True, "
-                "timeout=110)\n"
-                "print(json.dumps({'exit': _p.returncode, "
-                "'out': (_p.stdout + _p.stderr)[-800:]}))")
-            evidence = ""
-            ok = False
-            try:
-                res = parts.dispatch("run_code", {
-                    "code": code, "timeout": 120,
-                    "cwd": str(workspace)})
-                raw = str(res.get("stdout") or "")
-                for line in reversed(raw.splitlines()):
-                    try:
-                        got = json.loads(line)
-                        ok = got.get("exit") == 0
-                        evidence = str(got.get("out", ""))[:300]
-                        break
-                    except (ValueError, AttributeError):
-                        continue
-            except Exception as exc:
-                evidence = f"{type(exc).__name__}: {exc}"
-            verify_results.append(
-                {"kind": "command", "detail": item["detail"],
-                 "ok": ok, "evidence": evidence})
-        else:
-            context = ("Kadam: " + " | ".join(summaries)
-                       + "\nBadlav: created="
-                       + ", ".join(diff["created"])
-                       + "; modified="
-                       + ", ".join(diff["modified"])
-                       + "; deleted="
-                       + ", ".join(diff["deleted"]))
-            got = _build_check(parts, plan["goal"], item,
-                                context)
-            verify_results.append(
-                {"kind": "check", "detail": item["detail"],
-                 "ok": got["ok"], "evidence": got["note"]})
+    diff, binding, verify_results, rubric_results, \
+        snapshot_truncated = _assess()
+    state["binding"] = binding
+    state["verification"] = verify_results
+    state["rubric"] = rubric_results
+    store.save(state)
+
+    # GAN repair loop (ECC Wave B): an unmet criterion is
+    # not yet a failure — the worker gets a focused repair
+    # round aimed ONLY at the unmet criteria (max
+    # RUBRIC_MAX_REPAIRS), then the whole judgement runs
+    # again from fresh evidence.
+    repairs_used = 0
+    while plan.get("rubric") and not _is_stopped(data_dir):
+        unmet = [r for r in rubric_results if not r["met"]]
+        if not unmet or repairs_used >= RUBRIC_MAX_REPAIRS:
+            break
+        repairs_used += 1
+        work = (f"BUILD REPAIR. GOAL: {plan['goal']}\n"
+                f"WORKSPACE: {workspace}\n"
+                "Pichhli koshish me ye rubric criteria "
+                "adhoore rahe:\n"
+                + "\n".join(f"- {r['name']}: {r['note']}"
+                            for r in unmet)
+                + "\nSirf inhi ko pura karo — files isi "
+                  "workspace me badlo. Ant me ek-do line "
+                  "me batao kya theek kiya.")
+        try:
+            fixed = _delegated_summary(parts, work)
+        except Exception as exc:
+            fixed = (f"repair crash: {type(exc).__name__}: "
+                     f"{exc}")
+        repair_notes.append(
+            f"repair {repairs_used}: {str(fixed)[:240]}")
+        diff, binding, verify_results, rubric_results, \
+            snapshot_truncated = _assess()
+        state["binding"] = binding
+        state["verification"] = verify_results
+        state["rubric"] = rubric_results
+        state["repairs"] = repairs_used
+        store.save(state)
+
     confidence, justification = computed_confidence(
-        verify_results, binding)
+        verify_results, binding, rubric_results)
+    unmet_final = [r for r in rubric_results if not r["met"]]
     all_ok = all(r["ok"] for r in verify_results) \
-        and not binding["missing"]
+        and not binding["missing"] and not unmet_final
     state["status"] = "done" if all_ok else "failed"
     state["confidence"] = confidence
     state["finished"] = time.time()
@@ -2239,6 +2469,10 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
                if not r["ok"]]
         if bad:
             bits.append("verification fail: " + "; ".join(bad))
+        if unmet_final:
+            bits.append("rubric adhoora: "
+                        + ", ".join(r["name"]
+                                    for r in unmet_final))
         state["note"] = "; ".join(bits)[:300]
     lines = [f"# Walkthrough — {plan['goal']}", "",
              f"**Confidence: {confidence}** — {justification}",
@@ -2261,6 +2495,16 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
     lines += [f"- [{'x' if r['ok'] else '!'}] ({r['kind']}) "
               f"{r['detail']} — {r['evidence'][:160]}"
               for r in verify_results]
+    if rubric_results:
+        lines += ["", "## Rubric (kasauti — evaluator ke "
+                      "ank)"]
+        lines += [f"- [{'x' if r['met'] else '!'}] "
+                  f"{r['name']} — {r['note'][:160]}"
+                  for r in rubric_results]
+        if repairs_used:
+            lines.append(
+                f"- Repair rounds: {repairs_used} — "
+                "adhoore criteria ko nishana banaya gaya")
     if state["note"]:
         lines += ["", f"## Note\n{state['note']}"]
     store.write_walkthrough(build_id, "\n".join(lines) + "\n")
@@ -3130,10 +3374,43 @@ def _run_guarded(ledger, session_id, name, args, execute, journal):
     return result, False
 
 
+FACTS_FIELDS = ("change", "current", "verify")
+FACTS_MIN_LEN = 10
+
+_FACT_TEACHING = (
+    "GateGuard: {name} ek destructive tool hai — pehle "
+    "teen tathya (facts) do, phir chalega. Apni tool call "
+    "ke args me ye jodo: \"facts\": {{\"change\": \"kya "
+    "badlega — ek saaf jumla\", \"current\": \"abhi ki "
+    "asal haalat kya hai\", \"verify\": \"kaam ke baad "
+    "safalta kaise napoge\"}}. Har fact kam se kam 10 "
+    "akshar ka asal jumla ho — bina sahi facts ke ye call "
+    "nahi chalega, aur andaz se bhare facts bhi nahi "
+    "chalenge.")
+
+
+def _facts_problem(facts):
+    """None when the facts object is fit to proceed; else
+    the exact defect. GateGuard's three facts (ECC): what
+    will CHANGE, what is CURRENTLY true, how success will
+    be VERIFIED — each a real sentence, not a token."""
+    if not isinstance(facts, dict):
+        return "facts object hi nahi hai"
+    for field in FACTS_FIELDS:
+        value = facts.get(field)
+        if not isinstance(value, str) \
+                or len(value.strip()) < FACTS_MIN_LEN:
+            return (f"facts.{field} khali ya bahut chhota "
+                    "hai (kam se kam 10 akshar ka saaf "
+                    "jumla chahiye)")
+    return None
+
+
 def make_dispatch(gate, registry, journal, allowances,
                   pass_decision=False, refused_exc=(), ledger=None,
                   session_id="", approval_sink=None,
-                  calibrator=None, degraded=False):
+                  calibrator=None, degraded=False,
+                  guardrails=None):
     """The gate-mediated dispatch every tool call flows through.
 
     Journals tool.call (with the gate verdict) and tool.result — the
@@ -3165,9 +3442,117 @@ def make_dispatch(gate, registry, journal, allowances,
                 return bool(getattr(tool, "destructive", False))
         return name in guarded
 
+    def _is_destructive_class(name) -> bool:
+        """The GATE's class test, mirrored here for the
+        fact-gate: manifest destructive flag OR a
+        destructive-class permission — the same set the
+        gate sends to approval cards (skills.Tool's
+        is_destructive_class). A registry without tool
+        records falls back to the ledger-guarded set."""
+        tools = getattr(registry, "_tools", None)
+        if isinstance(tools, dict):
+            tool = tools.get(name)
+            if tool is not None:
+                checker = getattr(tool,
+                                  "is_destructive_class", None)
+                if callable(checker):
+                    try:
+                        return bool(checker())
+                    except Exception:
+                        pass
+                return bool(getattr(tool, "destructive", False))
+        return name in guarded
+
     def _dispatch_once(name, args=None, origin="owner",
-                       approved_decision=None):
+                       approved_decision=None, _fact_gate=False):
         args = dict(args or {})
+        if guardrails is not None:
+            # Hookify guardrails (ECC Wave B): the owner's
+            # ACCEPTED standing rules stop a call BEFORE the
+            # gate — before cards, before everything, even a
+            # card approved earlier (the card predates the
+            # rule, or the rule would not exist). A guardrail
+            # denial is a decision, not a failure: gate_denied
+            # is set, so it never falls back and is never
+            # learned from.
+            try:
+                rule = guardrails.match_for(name, args)
+            except Exception:
+                rule = None
+            if rule:
+                journal.append("tool.call", {
+                    "tool": name, "args": args,
+                    "gate_verdict": "guardrail",
+                    "origin": origin,
+                    "via_card": approved_decision is not None,
+                    "guardrail_id": rule.get("id")})
+                journal.append("guardrail.denied", {
+                    "tool": name,
+                    "guardrail_id": rule.get("id"),
+                    "match": rule.get("match")})
+                result = {
+                    "ok": False, "gate_denied": True,
+                    "guardrail_id": rule.get("id"),
+                    "error": (
+                        f"Guardrail {rule.get('id')} ne rok "
+                        f"diya, sir — owner ka laagu usool "
+                        f"'{rule.get('match')}' is call par "
+                        "lagta hai. Usool hatana ho to "
+                        f"/guardrails drop {rule.get('id')} "
+                        "karein.")}
+                journal.append("tool.result", {
+                    "tool": name, "ok": False,
+                    "needs_approval": False,
+                    "guardrail_id": rule.get("id")})
+                return result
+        if approved_decision is None and _fact_gate \
+                and _is_destructive_class(name):
+            # GateGuard fact-gate (ECC Wave B): a destructive
+            # call from the conversational BRAIN must first
+            # PRESENT its facts — what changes, what is true
+            # now, how it will verify. No facts, no run: the
+            # call is stopped BEFORE the gate (no approval
+            # card is created or consumed) and the result
+            # TEACHES the exact retry shape, so the brain's
+            # next call carries them. With facts, they are
+            # journaled (tool.facts) and stripped — the gate,
+            # the card, the idempotency ledger and the op all
+            # see the same clean args.
+            #
+            # The marking is the _fact_gate flag, carried
+            # ONLY by the conversational brain's dispatch
+            # wrapper (build_app's _brain_dispatch). It
+            # cannot ride the origin string: origin is an
+            # IFC trust label and the gate originates actions
+            # only for 'owner'/'trusted' — an invented
+            # 'brain' origin is denied outright (proven in
+            # tests). Everything unmarked is exempt: worker
+            # brains and internal system dispatches (they
+            # answer to their own verification stacks), the
+            # owner's own execute_tool hands, and
+            # card-approved re-dispatch. GateGuard
+            # disciplines the model, not the owner.
+            problem = _facts_problem(args.get("facts"))
+            if problem is not None:
+                journal.append("tool.call", {
+                    "tool": name, "args": args,
+                    "gate_verdict": "needs_facts",
+                    "origin": origin, "via_card": False})
+                journal.append("tool.result", {
+                    "tool": name, "ok": False,
+                    "needs_approval": False,
+                    "needs_facts": True})
+                return {"ok": False, "needs_facts": True,
+                        "error": _FACT_TEACHING.format(
+                            name=name)
+                        + f" (khaami: {problem})"}
+            facts = args["facts"]
+            args = {k: v for k, v in args.items()
+                    if k != "facts"}
+            journal.append("tool.facts", {
+                "tool": name, "origin": origin,
+                "facts": {k: str(facts[k])[:300]
+                          for k in FACTS_FIELDS}})
         if approved_decision is not None:
             # The owner approved this exact call on a card: the
             # fresh decision (with its one-time token) rides in;
@@ -3260,7 +3645,8 @@ def make_dispatch(gate, registry, journal, allowances,
         dispatch."""
         if calibrator is None or not isinstance(result, dict):
             return
-        if result.get("gate_denied") or result.get("needs_approval"):
+        if result.get("gate_denied") or result.get("needs_approval") \
+                or result.get("needs_facts"):
             return
         try:
             tool = registry._tools.get(name) \
@@ -3279,15 +3665,18 @@ def make_dispatch(gate, registry, journal, allowances,
             pass
 
     def dispatch(name, args=None, origin="owner",
-                 approved_decision=None, _depth=0):
+                 approved_decision=None, _depth=0,
+                 _fact_gate=False):
         result = _dispatch_routed(name, args, origin,
-                                  approved_decision, _depth)
+                                  approved_decision, _depth,
+                                  _fact_gate)
         if _depth == 0:
             _learn_outcome(name, result)
         return result
 
     def _dispatch_routed(name, args=None, origin="owner",
-                         approved_decision=None, _depth=0):
+                         approved_decision=None, _depth=0,
+                         _fact_gate=False):
         """One call, with the owner's route doctrine on top:
         the latest route runs first; on an honest failure the
         preserved older/alternate route is TRIED — never
@@ -3297,19 +3686,22 @@ def make_dispatch(gate, registry, journal, allowances,
         decision, not a failure. Depth-capped, so a chain
         (scrape -> fetch -> tor) resolves in at most 3 hops."""
         result = _dispatch_once(name, args, origin,
-                                approved_decision)
+                                approved_decision,
+                                _fact_gate=_fact_gate)
         if _depth >= 2 or approved_decision is not None:
             return result
         if not isinstance(result, dict) or _result_ok(result):
             return result
-        if result.get("needs_approval") or result.get("gate_denied"):
+        if result.get("needs_approval") or result.get("gate_denied") \
+                or result.get("needs_facts"):
             return result
         fallback = FALLBACK_ROUTES.get(name)
         if not fallback:
             return result
         try:
             alt = _dispatch_routed(fallback, args, origin=origin,
-                                   _depth=_depth + 1)
+                                   _depth=_depth + 1,
+                                   _fact_gate=_fact_gate)
         except Exception:
             return result
         if isinstance(alt, dict) and _result_ok(alt):
@@ -3494,11 +3886,13 @@ class _LearnedMemory:
     so they carry owner trust and are labelled with their source file."""
 
     def __init__(self, memory, learned: LearnedStore,
-                 user_model=None, calibrator=None):
+                 user_model=None, calibrator=None,
+                 instincts=None):
         self._memory = memory
         self._learned = learned
         self._user_model = user_model
         self._calibrator = calibrator
+        self._instincts = instincts
 
     def __getattr__(self, name):
         return getattr(self._memory, name)
@@ -3536,6 +3930,16 @@ class _LearnedMemory:
             # states starts corrected.
             try:
                 lines.extend(self._calibrator.feedback_lines())
+            except Exception:
+                pass
+        if self._instincts is not None:
+            # The instinct return path (ECC Wave B): learned
+            # trigger->action patterns with earned confidence
+            # ride beside the calibration lines — at most 2,
+            # so they advise without crowding.
+            try:
+                lines.extend(
+                    self._instincts.context_lines(query))
             except Exception:
                 pass
         lines.extend(self._memory.excerpts(query, k=k))
@@ -3668,6 +4072,8 @@ class AppParts:
     rules_text: str = ""
     rules_source: str = ""
     calibrator: object = None
+    instincts: object = None
+    guardrails: object = None
 
 
 UPGRADE_MANIFEST = {
@@ -4155,8 +4561,11 @@ def build_app(data_dir, *, chain=None, modules=None,
     user_model = UserModel(data_dir)
     from .calibration import Calibrator
     calibrator = Calibrator(data_dir)
+    from .instincts import InstinctBook
+    instincts = InstinctBook(data_dir)
     memory = _LearnedMemory(memory, learned, user_model=user_model,
-                            calibrator=calibrator)
+                            calibrator=calibrator,
+                            instincts=instincts)
     learned.scan()   # ingest anything he dropped in while JARVIS was off
 
     registry = _build_registry(modules, gate, journal, memory, data_dir)
@@ -4419,6 +4828,8 @@ def build_app(data_dir, *, chain=None, modules=None,
     activity = Activity()
     from .confirmations import ConfirmationBook
     _card_book = ConfirmationBook(data_dir)
+    from .guardrails import GuardrailBook
+    guardrail_book = GuardrailBook(data_dir)
     dispatch = _activity_dispatch(
         make_dispatch(gate, registry, journal, allowances,
                       pass_decision=pass_decision,
@@ -4426,7 +4837,8 @@ def build_app(data_dir, *, chain=None, modules=None,
                       session_id=session_id,
                       approval_sink=_card_book.add,
                       calibrator=calibrator,
-                      degraded=skills_mod is _defaults),
+                      degraded=skills_mod is _defaults,
+                      guardrails=guardrail_book),
         activity)
     tool_schemas = registry.advertised_tools(allowances)
     # The ONE rules file (the owner's standing order): the brain's
@@ -4435,8 +4847,16 @@ def build_app(data_dir, *, chain=None, modules=None,
     from .rules import chat_protocol, load_rules
     _rules_text, _rules_source = load_rules(
         Path(__file__).resolve().parent.parent)
+    def _brain_dispatch(name, args=None, **kwargs):
+        # The conversational brain's own dispatch: identical
+        # to parts.dispatch except for the _fact_gate
+        # marking — the GateGuard fact-gate in make_dispatch
+        # keys on it (see there for why the marking cannot
+        # ride the IFC origin string).
+        return dispatch(name, args, _fact_gate=True, **kwargs)
+
     brain = _resolve_module(modules, "brain").Brain(
-        chain, tool_schemas, dispatch, journal, memory,
+        chain, tool_schemas, _brain_dispatch, journal, memory,
         protocol=chat_protocol(_rules_text))
     try:
         brain.spotlight_key = str(spotlight_key).encode("utf-8")
@@ -4451,6 +4871,8 @@ def build_app(data_dir, *, chain=None, modules=None,
                      learned=learned, activity=activity,
                      user_model=user_model,
                      calibrator=calibrator,
+                     instincts=instincts,
+                     guardrails=guardrail_book,
                      rules_text=_rules_text,
                      rules_source=_rules_source)
     parts_holder["parts"] = parts
@@ -4525,6 +4947,16 @@ class ChatApp:
         self.rules_text = parts.rules_text
         self.rules_source = parts.rules_source
         self.calibrator = parts.calibrator
+        if getattr(parts, "instincts", None) is not None:
+            self.instincts = parts.instincts
+        else:
+            from .instincts import InstinctBook
+            self.instincts = InstinctBook(self.data_dir)
+        if getattr(parts, "guardrails", None) is not None:
+            self.guardrails = parts.guardrails
+        else:
+            from .guardrails import GuardrailBook
+            self.guardrails = GuardrailBook(self.data_dir)
         self.voice_manager = None
         self.history: list = []
         self.incognito = False
@@ -5165,6 +5597,60 @@ class ChatApp:
                     + self.rules_text)
         if text == "/calibration":
             return self.calibrator.report()
+        if text == "/instincts":
+            rows = self.instincts.all()
+            if not rows:
+                return ("Koi instinct nahi hai abhi, sir — "
+                        "seekhe hue pattern (trigger → action, "
+                        "bharose ke saath) yahaan dikhenge.")
+            lines = ["Seekhe hue patterns (instincts), sir:"]
+            for r in rows[:15]:
+                lines.append(
+                    f"- [{r.get('domain', '')}] (bharosa "
+                    f"{float(r.get('confidence', 0)):.2f}, "
+                    f"{r.get('scope', 'session')}) jab "
+                    f"{str(r.get('trigger', ''))[:60]} — "
+                    f"{str(r.get('action', ''))[:60]} · saboot "
+                    f"{len(r.get('evidence') or [])}")
+            return "\n".join(lines)
+        if text == "/instincts prune":
+            counts = self.instincts.maintain()
+            return ("Instincts ki safai ho gayi, sir — decay: "
+                    f"{counts['decayed']}, promote: "
+                    f"{counts['promoted']}, prune: "
+                    f"{counts['pruned']}.")
+        if text == "/guardrails":
+            rows = self.guardrails.list()
+            if not rows:
+                return ("Koi guardrail nahi hai, sir — na "
+                        "koi candidate, na koi laagu usool.")
+            lines = ["Guardrails, sir (candidate kuch nahi "
+                     "rokta; sirf LAAGU usool rokta hai):"]
+            for r in rows[-15:]:
+                state = ("LAAGU" if r.get("status")
+                         == "accepted" else "candidate")
+                lines.append(
+                    f"- {r.get('id')} [{state}] tool="
+                    f"{r.get('tool')} match="
+                    f"'{r.get('match')}' — "
+                    f"\"{str(r.get('source', ''))[:70]}\"")
+            lines.append("Laagu karne ke liye: /guardrails "
+                         "accept <id> · Hatane ke liye: "
+                         "/guardrails drop <id>")
+            return "\n".join(lines)
+        if text.startswith("/guardrails accept "):
+            gid = text[len("/guardrails accept "):].strip()
+            row = self.guardrails.accept(gid)
+            if row is None:
+                return f"Guardrail {gid} nahi mila, sir."
+            return (f"Guardrail {gid} laagu ho gaya, sir — "
+                    f"'{row.get('match')}' wali call ab "
+                    "dispatch par hi rukegi.")
+        if text.startswith("/guardrails drop "):
+            gid = text[len("/guardrails drop "):].strip()
+            if self.guardrails.drop(gid):
+                return f"Guardrail {gid} hata diya, sir."
+            return f"Guardrail {gid} nahi mila, sir."
         if text == "/forge":
             from .forge import list_entries
             rows = list_entries(self.data_dir)
@@ -5779,6 +6265,24 @@ class ChatApp:
                     or getattr(self.chain, "name", None) or "unknown")
         if correction is not None:
             self._store_lesson(correction, evidence_text=text)
+            # The instinct feed (ECC Wave B): a correction is
+            # also a PATTERN — next time the same wrong shape
+            # shows up, the learned trigger->action rides
+            # into the brain's context with its confidence.
+            try:
+                self.instincts.observe(
+                    "owner correction: "
+                    + str(correction["wrong"])[:80],
+                    str(correction["correct"])[:200],
+                    "correction",
+                    str(correction.get("lesson")
+                        or text)[:300])
+            except Exception:
+                pass
+        if not self.incognito:
+            guard_note = self._mine_guardrail(text)
+            if guard_note:
+                reply = reply + "\n\n" + guard_note
         if not self.incognito:
             self._note_turn_signals(text, reply, stopped_reason)
 
@@ -5933,6 +6437,36 @@ class ChatApp:
         except Exception as exc:
             self.journal.append("correction.lesson_failed", {
                 "error": f"{type(exc).__name__}: {exc}"})
+
+    def _mine_guardrail(self, text: str):
+        """Hookify mining (ECC Wave B): a prohibition the
+        owner states in plain words becomes a CANDIDATE
+        guardrail. Candidates enforce nothing — only his
+        /guardrails accept makes one law. Returns a short
+        note for the reply when a NEW candidate was mined,
+        else None. Mining can never break a turn."""
+        try:
+            if str(text).lstrip().startswith("/"):
+                return None
+            from .guardrails import mine_guardrail
+            found = mine_guardrail(text)
+            if not found:
+                return None
+            tool, match, form = found
+            row, created = self.guardrails.add_candidate(
+                tool, match, str(text)[:200], form=form)
+            if not created:
+                return None
+            self.journal.append("guardrail.candidate", {
+                "id": row["id"], "match": match, "tool": tool,
+                "form": form})
+            return ("📌 Ek hifazati usool pehchana hai, sir "
+                    f"— '{match}' par rok ka candidate "
+                    f"banaya hai ({row['id']}). /guardrails "
+                    "me dekh kar accept karein to laagu "
+                    "hoga; abhi kuch nahi ruka.")
+        except Exception:
+            return None
 
     # -- fast path ------------------------------------------------------------
 

@@ -27,6 +27,9 @@ PLAN = {
                       "detail": "python3 -c \"print(42)\""},
                      {"kind": "check",
                       "detail": "calc.py me add function hai"}],
+    "rubric": [{"name": "add function kaam karta hai",
+                "pass_when": "calc.py me add(a, b) hai aur "
+                             "uska test pass hota hai"}],
 }
 
 
@@ -72,6 +75,12 @@ class _Chain:
         text = json.dumps(messages)
         if "planner ho" in text:
             return {"content": json.dumps(PLAN),
+                    "tool_calls": []}
+        if "RUBRIC (kasauti)" in text:
+            return {"content": json.dumps({"criteria": [
+                {"name": "add function kaam karta hai",
+                 "met": True,
+                 "note": "add maujood, test pass"}]}),
                     "tool_calls": []}
         if "JAANCH" in text:
             return {"content": '{"ok": true, "note": '

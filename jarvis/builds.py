@@ -149,6 +149,24 @@ def validate_plan(plan) -> list:
                 f"verification {i + 1}: kind "
                 f"{item.get('kind')!r} — command ya check "
                 "chahiye")
+    # The GAN rubric (ECC Wave B): verification says HOW
+    # success will be checked; the rubric says WHAT DONE
+    # MEANS — criteria the finished work is scored against
+    # by a separate evaluator, written BEFORE building.
+    rubric = plan.get("rubric") or []
+    if not rubric:
+        problems.append("rubric khali hai — safalta ki "
+                        "kasauti (kam se kam ek criterion) "
+                        "pehle se likhni padti hai")
+    for i, crit in enumerate(rubric):
+        if not isinstance(crit, dict) \
+                or not str(crit.get("name", "")).strip():
+            problems.append(f"rubric {i + 1}: name khali hai")
+        elif not str(crit.get("pass_when", "")).strip():
+            problems.append(
+                f"rubric {i + 1}: pass_when khali hai — "
+                "criterion kab pura mana jayega, ye likhna "
+                "padta hai")
     return problems
 
 
@@ -171,6 +189,12 @@ def render_plan_md(plan: dict) -> str:
     for item in plan.get("verification") or []:
         lines.append(f"- ({item.get('kind')}) "
                      f"{item.get('detail')}")
+    rubric = plan.get("rubric") or []
+    if rubric:
+        lines += ["", "## Rubric (safalta ki kasauti)", ""]
+        for crit in rubric:
+            lines.append(f"- **{crit.get('name')}**: "
+                         f"{crit.get('pass_when')}")
     lines.append("")
     return "\n".join(lines)
 
@@ -281,10 +305,15 @@ def binding_report(plan: dict, diff: dict) -> dict:
 
 
 def computed_confidence(verify_results: list,
-                        binding: dict) -> tuple:
-    """(score, justification) — never a vibe. Half the score
-    is the verification pass rate, half is how much of the
-    plan actually landed; the justification names both."""
+                        binding: dict,
+                        rubric_results: list = None) -> tuple:
+    """(score, justification) — never a vibe. Without a
+    rubric: half verification pass rate, half how much of
+    the plan actually landed. With rubric results (GAN,
+    ECC Wave B) the rubric's met-ratio takes a fifth of
+    the weight: 0.4 verification + 0.4 binding + 0.2
+    rubric — a build that passes its checks but misses
+    what DONE meant cannot score a perfect 1.0."""
     if verify_results:
         passed = sum(1 for r in verify_results if r.get("ok"))
         v_rate = passed / len(verify_results)
@@ -298,7 +327,14 @@ def computed_confidence(verify_results: list,
                  "badlav asal me hue")
     else:
         b_rate, b_txt = 0.0, "plan me badlav hi nahi the"
-    score = 0.5 * v_rate + 0.5 * b_rate
+    if rubric_results:
+        met = sum(1 for r in rubric_results if r.get("met"))
+        r_rate = met / len(rubric_results)
+        score = 0.4 * v_rate + 0.4 * b_rate + 0.2 * r_rate
+        v_txt += (f"; rubric {met}/{len(rubric_results)} "
+                  "pure")
+    else:
+        score = 0.5 * v_rate + 0.5 * b_rate
     extras = len(binding.get("extras") or [])
     if extras:
         # Unplanned changes dilute the score (audit
