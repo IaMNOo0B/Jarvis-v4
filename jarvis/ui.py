@@ -1005,6 +1005,51 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
     return ThreadingHTTPServer((host, port), Handler)
 
 
+def _write_startup_error(data_dir, exc) -> None:
+    """Leave the crash evidence in files the owner can paste back:
+    <data dir>/startup-error.txt AND ./startup-error.txt (the app
+    folder, where the launcher runs). Never raises — a failure to
+    record a failure must not become a second failure."""
+    import time as _time
+    import traceback as _traceback
+    text = (f"--- {_time.strftime('%Y-%m-%d %H:%M:%S')} ---\n"
+            + "".join(_traceback.format_exception(
+                type(exc), exc, exc.__traceback__)))
+    targets = []
+    for target in (Path(data_dir) / "startup-error.txt",
+                   Path.cwd() / "startup-error.txt"):
+        if target not in targets:
+            targets.append(target)
+    for target in targets:
+        try:
+            with target.open("a", encoding="utf-8") as fh:
+                fh.write(text)
+        except Exception:
+            pass
+    print("JARVIS could not start — the reason was saved to "
+          "startup-error.txt in the JARVIS folder. Paste that "
+          "file's contents back for a fix.")
+
+
+def _start_background_services(app) -> None:
+    """Scheduler / telegram / auto-watch start AFTER the server
+    exists, each behind its own guard: a side service that raises
+    or hangs at startup must never again keep the UI itself from
+    opening (owner's PC, 2026-10-22: the app would not open at
+    all and no evidence survived anywhere he could reach)."""
+    from .chat import start_scheduler, start_telegram
+    for name, starter in (("auto-watch", _maybe_auto_watch),
+                          ("scheduler", start_scheduler),
+                          ("telegram", start_telegram)):
+        try:
+            starter(app)
+        except Exception as exc:  # the UI opening outranks it
+            _write_startup_error(app.data_dir, exc)
+            print(f"JARVIS: {name} did not start "
+                  f"({type(exc).__name__}: {exc}) — the app "
+                  "itself is running.")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="jarvis.ui", description="JARVIS v4 app UI (local web).")
@@ -1014,11 +1059,12 @@ def main(argv=None) -> int:
                         help="do not open the browser automatically")
     args = parser.parse_args(argv)
 
-    app = ChatApp(Path(args.data_dir))
-    _maybe_auto_watch(app)
-    from .chat import start_scheduler, start_telegram
-    start_scheduler(app)
-    start_telegram(app)
+    data_dir = Path(args.data_dir)
+    try:
+        app = ChatApp(data_dir)
+    except Exception as exc:
+        _write_startup_error(data_dir, exc)
+        return 1
 
     def _heartbeat():
         # The supervisor (jarvis/supervisor.py) watches this file:
@@ -1032,7 +1078,11 @@ def main(argv=None) -> int:
     threading.Thread(target=_heartbeat, daemon=True,
                      name="jarvis-heartbeat").start()
     host = ui_bind_host(app)
-    server = build_server(app, host=host, port=args.port)
+    try:
+        server = build_server(app, host=host, port=args.port)
+    except Exception as exc:
+        _write_startup_error(data_dir, exc)
+        return 1
     url = f"http://{host}:{args.port}/"
     print(f"JARVIS UI — {url}")
     if host != "127.0.0.1":
@@ -1042,6 +1092,7 @@ def main(argv=None) -> int:
               "127.0.0.1.")
     if not args.no_open:
         webbrowser.open(url)
+    _start_background_services(app)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
