@@ -101,11 +101,15 @@ class FactStore:
             source: str,
             source_trust: str,
             presented_as: Optional[str] = None,
-            supersedes: Optional[str] = None) -> dict:
+            supersedes: Optional[str] = None,
+            evidence: Optional[str] = None) -> dict:
         """Append one fact. Runs the poisoning guard first.
 
         `supersedes` names the id of the record this one corrects; the
-        old record stays in history untouched. Returns the stored record.
+        old record stays in history untouched. `evidence` is the
+        verbatim owner quote the claim rests on (Dodaios's evidence
+        rule) — stored with the record so any fact can be traced
+        back to the words that support it. Returns the record.
         """
         record = {
             "id": uuid.uuid4().hex,
@@ -115,12 +119,18 @@ class FactStore:
             "presented_as": presented_as or source_trust,
             "ts": datetime.now(timezone.utc).isoformat(),
             "supersedes": supersedes,
+            "evidence": evidence,
         }
         assert_can_become_fact(record)
         with self._lock:
-            if supersedes is not None and self.get(supersedes) is None:
-                raise MemoryTrustError(
-                    f"cannot supersede unknown fact id {supersedes!r}")
+            if supersedes is not None:
+                targets = supersedes if isinstance(supersedes, list) \
+                    else [supersedes]
+                for target in targets:
+                    if self.get(target) is None:
+                        raise MemoryTrustError(
+                            f"cannot supersede unknown fact id "
+                            f"{target!r}")
             with open(self.path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
                 f.flush()
@@ -143,14 +153,21 @@ class FactStore:
 
     def current_facts(self) -> list[dict]:
         """Only non-superseded records: the facts JARVIS may act on now."""
-        superseded = {r["supersedes"] for r in self._records
-                      if r.get("supersedes")}
+        superseded = set()
+        for rec in self._records:
+            sup = rec.get("supersedes")
+            if isinstance(sup, list):
+                superseded.update(sup)
+            elif sup:
+                superseded.add(sup)
         return [r for r in self._records if r["id"] not in superseded]
 
     def superseded_by(self, fact_id: str) -> Optional[dict]:
         """The record that replaced `fact_id`, if any."""
         for rec in self._records:
-            if rec.get("supersedes") == fact_id:
+            sup = rec.get("supersedes")
+            if sup == fact_id or (isinstance(sup, list)
+                                  and fact_id in sup):
                 return rec
         return None
 

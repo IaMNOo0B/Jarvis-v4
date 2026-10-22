@@ -58,6 +58,8 @@ class VoiceManager(VoiceEvents):
         self.speaking = False
         self.active = False
         self._play_q: queue.Queue = queue.Queue()
+        self._turn_sent = 0        # bytes handed to playback this turn
+        self._turn_played = 0      # bytes actually written to the speaker
         self._turn_end = False
         self._tail_until = 0.0
         self._threads: list = []
@@ -83,7 +85,8 @@ class VoiceManager(VoiceEvents):
         if wake_on:
             try:
                 detector = OpenWakeWordDetector(
-                    on_detect=lambda: self.gate and self.gate.wake())
+                    on_detect=lambda: self.gate and self.gate.wake(),
+                    model=str(cfg.get("wake_model", "") or ""))
             except WakeUnavailable as e:
                 self._notify(f"Wake word unavailable: {e}")
                 wake_on = False
@@ -185,7 +188,16 @@ class VoiceManager(VoiceEvents):
     # -- session events (playback side) ------------------------------------------
 
     def on_audio(self, pcm: bytes):
+        self._turn_sent += len(pcm)
         self._play_q.put(pcm)
+
+    def heard_fraction(self):
+        """Played / sent for the current spoken turn — the measure
+        LiveSession.interrupt() truncates the remembered answer by.
+        None when nothing was sent (no honest measure exists)."""
+        if self._turn_sent <= 0:
+            return None
+        return max(0.0, min(1.0, self._turn_played / self._turn_sent))
 
     def on_turn_audio_end(self):
         self._turn_end = True
@@ -193,6 +205,8 @@ class VoiceManager(VoiceEvents):
     def on_interrupted(self):
         self._drain_play_queue()
         self._turn_end = False
+        self._turn_sent = 0
+        self._turn_played = 0
         if self.speaking:
             self.speaking = False
             self._set_activity("listening")
@@ -200,6 +214,23 @@ class VoiceManager(VoiceEvents):
     def on_transcript(self, role: str, text: str):
         if role == "user" and self.gate is not None:
             self.gate.note_user_speech()
+        if role == "user":
+            # The scrub gate (jarvis/scrub.py): a secret's
+            # SHAPE in the owner's own speech never reaches
+            # history or memory — the words are replaced, the
+            # owner is told, and anything playing drains.
+            from .scrub import REDACTED, find_secret_shapes
+            shapes = find_secret_shapes(text)
+            if shapes:
+                self._drain_play_queue()
+                self._notify(
+                    "Suraksha: aapki baat me "
+                    + "/".join(shapes)
+                    + " ki shakal mili — woh hisaab me NAHI "
+                      "likha gaya. Aisi cheezein bol kar mat "
+                      "diya karo, sir; keys Settings se dalti "
+                      "hain.")
+                text = REDACTED
         if self._on_transcript:
             self._on_transcript(role, text)
 
@@ -239,6 +270,7 @@ class VoiceManager(VoiceEvents):
                 self._set_activity("speaking")
             try:
                 self.io.write(bytes(batch))
+                self._turn_played += len(batch)
             except Exception:
                 pass
             if self.guard is not None:
@@ -249,6 +281,8 @@ class VoiceManager(VoiceEvents):
     def _finish_speaking(self):
         self.speaking = False
         self._turn_end = False
+        self._turn_sent = 0
+        self._turn_played = 0
         latency = self.io.output_latency if self.io else 0.20
         self._tail_until = self._clock() + latency + TAIL_MARGIN_S
         self._set_activity(

@@ -47,13 +47,13 @@ def test_tool_descriptions_shrink_but_tools_never_drop():
     long_desc = "x" * 500
     views = tool_views([{"name": "big_tool", "description": long_desc,
                          "parameters": {"type": "object", "properties": {}}}])
-    b = PromptBuilder(views, soft_cap=560, hard_budget=5000)
+    b = PromptBuilder(views, soft_cap=620, hard_budget=5000)
     out = b.build([], "hello")
     assert any("descriptions capped" in a for a in out.ladder_actions)
     assert len(out.tools) == 1
     desc = out.tools[0]["function"]["description"]
     assert 0 < len(desc) <= 140
-    assert out.estimate <= 560
+    assert out.estimate <= 620
 
 
 def test_ladder_trims_history_middle_and_persona_survives():

@@ -36,7 +36,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
+from collections import deque
 from typing import Callable, Optional
+
+from .validate import validate_args
+
+# NOVA's rate discipline: a per-tool sliding window. Generous
+# for real work, a hard wall for a runaway loop — the second
+# wall behind the brain's LoopGuard.
+RATE_LIMIT = 240          # calls
+RATE_WINDOW = 60.0        # seconds
 
 QUARANTINED = "quarantined"
 APPROVED = "approved"
@@ -102,6 +112,29 @@ class SkillRegistry:
         self.journal = journal
         self._skills: dict[str, _Skill] = {}
         self._tools: dict[str, _Tool] = {}   # tool name -> _Tool
+        self._rate: dict[str, deque] = {}    # tool name -> call times
+
+    # -- rate limiting (NOVA) --------------------------------------------
+    def _rate_check(self, tool_name: str) -> bool:
+        now = time.monotonic()
+        hits = self._rate.setdefault(tool_name, deque())
+        while hits and hits[0] <= now - RATE_WINDOW:
+            hits.popleft()
+        if len(hits) >= RATE_LIMIT:
+            return False
+        hits.append(now)
+        return True
+
+    def rate_stats(self) -> dict:
+        """Calls inside the current window, per tool — the
+        rate-limit tracker the owner can inspect."""
+        now = time.monotonic()
+        out = {}
+        for name, hits in self._rate.items():
+            live = [t for t in hits if t > now - RATE_WINDOW]
+            if live:
+                out[name] = len(live)
+        return out
 
     # -- registration & lifecycle ----------------------------------------
 
@@ -260,6 +293,16 @@ class SkillRegistry:
                 raise DispatchRefused(
                     tool_name,
                     "approval token does not verify for these exact args")
+        problem = validate_args(tool.schema, args)
+        if problem:
+            raise DispatchRefused(
+                tool_name, f"schema check fail: {problem}")
+        if not self._rate_check(tool_name):
+            raise DispatchRefused(
+                tool_name,
+                f"rate limit — {tool_name} ki had is minute ke "
+                "liye puri ho gayi; thoda ruk kar phir koshish "
+                "karo")
         self._log("skill.dispatched", {"skill": skill.name, "tool": tool_name})
         return op(**args)
 

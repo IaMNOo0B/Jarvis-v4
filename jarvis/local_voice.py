@@ -26,10 +26,12 @@ from __future__ import annotations
 
 import importlib.util
 import queue
+import re
 import struct
 import subprocess
 import tempfile
 import threading
+import unicodedata
 import wave
 from pathlib import Path
 from typing import Callable, Optional
@@ -216,20 +218,93 @@ def _wav_to_pcm24k(path: str) -> bytes:
     return resample_pcm(frames, rate, SPEAKER_RATE)
 
 
+def clean_for_speech(text: str) -> str:
+    """Make written text speakable (Sentient's clean_for_speech
+    pattern, reimplemented): code fences vanish entirely, links
+    keep only their words, bare URLs are deleted (nobody can listen
+    to one), markdown unwraps, table pipes become commas, symbols
+    and emoji are dropped, whitespace is tamed."""
+    s = str(text or "")
+    s = re.sub(r"```.*?```", " ", s, flags=re.S)          # code fences
+    s = re.sub(r"`([^`]*)`", r"\1", s)                    # inline code
+    s = re.sub(r"!\[([^\]]*)\]\([^)]*\)", r"\1", s)       # images -> alt
+    s = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", s)        # links -> text
+    s = re.sub(r"https?://\S+|www\.\S+", " ", s)          # bare URLs
+    s = re.sub(r"<[^>]+>", " ", s)                        # HTML tags
+    s = re.sub(r"^\s*[-*_]{3,}\s*$", " ", s, flags=re.M)   # hr lines
+    s = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", s)           # headers
+    s = re.sub(r"(?m)^\s*>\s?", "", s)                    # quotes
+    s = re.sub(r"(?m)^\s*[-*+]\s+", "", s)                # bullets
+    s = re.sub(r"(\*\*|\*|__|_)", "", s)                  # emphasis
+    s = s.replace("|", ", ").replace("&", " and ")
+    s = s.replace("—", ", ").replace("–", ", ")
+    s = "".join(ch for ch in s
+                if unicodedata.category(ch) != "So")      # emoji/symbols
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\s+([,.!?;:])", r"\1", s)
+    s = re.sub(r",\s*,", ",", s)
+    return s.strip()
+
+
+_ABBREVIATIONS = {
+    "mr", "mrs", "ms", "dr", "st", "vs", "eg", "ie", "no", "approx",
+    "dept", "fig", "jan", "feb", "mar", "apr", "jun", "jul", "aug",
+    "sep", "sept", "oct", "nov", "dec",
+}
+
+
+def split_sentences(text: str) -> list:
+    """Split into speakable sentences. Guards the two classic
+    traps: a decimal point is not a boundary (3.5 stays whole),
+    and an abbreviation's dot is not a boundary (Dr. Rao)."""
+    s = str(text or "").strip()
+    if not s:
+        return []
+    out, start = [], 0
+    for i, ch in enumerate(s):
+        if ch not in ".!?…":
+            continue
+        if ch == ".":
+            prev = s[i - 1] if i > 0 else ""
+            nxt = s[i + 1] if i + 1 < len(s) else ""
+            if prev.isdigit() and nxt.isdigit():
+                continue                      # decimal point
+            word = re.search(r"([A-Za-z]+)$", s[:i])
+            if word and word.group(1).lower() in _ABBREVIATIONS:
+                continue                      # abbreviation
+        rest = s[i + 1:]
+        if rest and not rest[0].isspace():
+            continue                          # mid-word punctuation
+        piece = s[start:i + 1].strip()
+        if piece:
+            out.append(piece)
+        start = i + 1
+    tail = s[start:].strip()
+    if tail:
+        out.append(tail)
+    return out
+
+
 class LocalPipelineSession:
     """The Live-session contract over local parts. `respond` is
     the app's chat turn: STT text in, spoken reply out."""
+
+    ACKS = ("On it, sir.", "Right away, sir.", "One moment, sir.",
+            "Working on it, sir.")
 
     def __init__(self, events: Optional[VoiceEvents] = None, *,
                  stt: Optional[WhisperSTT] = None,
                  tts: Optional[SystemTTS] = None,
                  respond: Optional[Callable[[str], str]] = None,
-                 vad: Optional[EnergyVAD] = None):
+                 vad: Optional[EnergyVAD] = None,
+                 ack_delay: float = 0.6):
         self.events = events or VoiceEvents()
         self.stt = stt
         self.tts = tts
         self.respond = respond
         self.vad = vad or EnergyVAD()
+        self.ack_delay = max(0.0, float(ack_delay))
+        self._ack_idx = 0
         self.connected = False
         self._queue: queue.Queue = queue.Queue()
         self._stop = threading.Event()
@@ -267,6 +342,70 @@ class LocalPipelineSession:
         self._drop_pending.set()
         self.events.on_interrupted()
 
+    def _respond_with_ack(self, text):
+        """Race the brain against the ACK delay (the Dodaios
+        Ack-Brain pattern; OpenAI's spoken preambles say the same):
+        if no reply lands within `ack_delay`, a short canned
+        acknowledgment is spoken first so a long task never starts
+        in silence. A fast reply suppresses the ACK entirely —
+        the gate is what makes it polite instead of noisy."""
+        if self.ack_delay <= 0 or self.respond is None:
+            return self.respond(text)
+        box: dict = {}
+
+        def _run():
+            try:
+                box["reply"] = self.respond(text)
+            except Exception as exc:  # surfaced to _loop's handler
+                box["error"] = exc
+
+        worker = threading.Thread(target=_run, daemon=True,
+                                  name="jarvis-ack-race")
+        worker.start()
+        worker.join(self.ack_delay)
+        if worker.is_alive():
+            self._speak_ack()
+            worker.join()
+        if "error" in box:
+            raise box["error"]
+        return box.get("reply")
+
+    def _speak_reply(self, reply):
+        """Speak the reply sentence by sentence (the Dodaios study's
+        measured #1 latency lever): the first sentence is synthesized
+        and playing while the rest is still being made, instead of
+        the whole reply being synthesized up front. The text is
+        cleaned for speech first — a URL or a markdown table read
+        aloud raw is unintelligible. Interrupt is honoured between
+        sentences."""
+        text = clean_for_speech(str(reply))
+        if not text:
+            return
+        for sentence in split_sentences(text):
+            if self._drop_pending.is_set():
+                return
+            pcm = self.tts.speak(sentence)
+            if self._drop_pending.is_set():
+                return
+            for piece in chunk_pcm(pcm, ms=50, rate=SPEAKER_RATE):
+                self.events.on_audio(piece)
+
+    def _speak_ack(self):
+        """Speak one rotating canned acknowledgment (never ends the
+        turn — the real reply follows in the same turn)."""
+        if self._drop_pending.is_set() or self.tts is None:
+            return
+        ack = self.ACKS[self._ack_idx % len(self.ACKS)]
+        self._ack_idx += 1
+        try:
+            pcm = self.tts.speak(ack)
+        except Exception:
+            return
+        if self._drop_pending.is_set():
+            return
+        for piece in chunk_pcm(pcm, ms=50, rate=SPEAKER_RATE):
+            self.events.on_audio(piece)
+
     def _loop(self):
         while not self._stop.is_set():
             try:
@@ -284,15 +423,12 @@ class LocalPipelineSession:
                     text = str(payload)
                 if not text:
                     continue
-                reply = self.respond(text)
+                reply = self._respond_with_ack(text)
                 if self._drop_pending.is_set() or not reply:
                     continue        # cut: the answer is never spoken
-                pcm = self.tts.speak(str(reply))
+                self._speak_reply(reply)
                 if self._drop_pending.is_set():
                     continue
-                for piece in chunk_pcm(pcm, ms=50,
-                                       rate=SPEAKER_RATE):
-                    self.events.on_audio(piece)
                 self.events.on_turn_audio_end()
             except Exception:
                 # A failed local turn must not kill the pipeline;

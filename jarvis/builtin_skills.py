@@ -22,6 +22,7 @@ Stdlib only.
 from __future__ import annotations
 
 import html
+import json
 import os
 import re
 import subprocess
@@ -80,58 +81,173 @@ def _memory_ops(memory):
         return {"stored": text,
                 "note": "no document store attached; kept as a fact"}
 
+    def learn_url(url: str):
+        """"Learn this page" in ONE step: fetch the page in code,
+        store its readable text into the learned store, where the
+        inbox pipeline chunks and indexes it — the page becomes
+        searchable knowledge, not a one-turn glimpse."""
+        fetched = op_web_fetch(str(url), max_chars=20000)
+        if fetched.get("error"):
+            return {"ok": False, "error": fetched["error"]}
+        content = str(fetched.get("content")
+                      or fetched.get("text") or "")
+        if not content.strip():
+            return {"ok": False,
+                    "error": "page se padhne layak text nahi mila, "
+                             "sir"}
+        fn = getattr(store, "learn_text", None)
+        if callable(fn):
+            result = fn(content, title=str(url))
+            out = result if isinstance(result, dict) else {}
+            out.update({"ok": True, "learned_from": str(url),
+                        "chars": len(content)})
+            return out
+        store.remember(content[:500])
+        return {"ok": True, "learned_from": str(url),
+                "note": "no document store attached; kept the gist "
+                        "as a fact"}
+
     return {"remember_fact": remember_fact,
             "recall_memory": recall_memory,
-            "learn_text": learn_text}
+            "learn_text": learn_text,
+            "learn_url": learn_url}
 
 
 _DDG_HTML = "https://html.duckduckgo.com/html/?q="
+_DDG_LITE = "https://lite.duckduckgo.com/lite/?q="
+_BING = "https://www.bing.com/search?q="
 _RESULT_LINK_RE = re.compile(
     r'class="result__a"[^>]*href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>',
     re.S)
 _RESULT_SNIPPET_RE = re.compile(
     r'class="result__snippet"[^>]*>(?P<snippet>.*?)</(?:a|td)>', re.S)
+_LITE_LINK_RE = re.compile(
+    r"class='result-link'[^>]*href=\"(?P<url>[^\"]+)\"[^>]*>"
+    r"(?P<title>.*?)</a>", re.S)
+_LITE_SNIPPET_RE = re.compile(
+    r"class='result-snippet'[^>]*>(?P<snippet>.*?)</td>", re.S)
+_BING_BLOCK_RE = re.compile(
+    r'<li class="b_algo".*?<h2><a[^>]*href="(?P<url>[^"]+)"[^>]*>'
+    r'(?P<title>.*?)</a></h2>(?P<rest>.*?)</li>', re.S)
+_BING_SNIPPET_RE = re.compile(r"<p[^>]*>(?P<snippet>.*?)</p>", re.S)
 _TAG_RE = re.compile(r"<[^>]+>")
+# A realistic browser UA: several search engines quietly serve a
+# block page to obvious bot agents (that, not "no internet", is
+# what an empty result list usually means).
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+       "AppleWebKit/537.36 (KHTML, like Gecko) "
+       "Chrome/124.0 Safari/537.36")
 
 
 def _clean(fragment: str) -> str:
     return html.unescape(_TAG_RE.sub("", fragment)).strip()
 
 
-def _real_target(ddg_url: str) -> str:
-    """DuckDuckGo wraps result links; unwrap to the real target."""
-    parsed = urllib.parse.urlparse(html.unescape(ddg_url))
-    qs = urllib.parse.parse_qs(parsed.query)
-    if "uddg" in qs:
-        return qs["uddg"][0]
-    return html.unescape(ddg_url)
-
-
-def op_web_search(query: str, limit: int = 5):
-    """Real search via DuckDuckGo's HTML endpoint. Honest errors."""
-    url = _DDG_HTML + urllib.parse.quote_plus(query)
-    request = urllib.request.Request(
-        url, headers={"User-Agent": "JARVIS-v4/1.0 (stdlib urllib)"})
+def _real_target(url: str) -> str:
+    """DuckDuckGo wraps result links in a redirect (uddg=...)."""
     try:
-        with urllib.request.urlopen(request, timeout=8) as response:
-            page = response.read().decode("utf-8", errors="replace")
-    except Exception as exc:  # network down, blocked, timeout — say so
-        return {"error": f"web_search failed: {type(exc).__name__}: {exc}"}
-    links = list(_RESULT_LINK_RE.finditer(page))
-    snippets = [_clean(m.group("snippet"))
-                for m in _RESULT_SNIPPET_RE.finditer(page)]
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        if "uddg" in query:
+            return query["uddg"][0]
+    except Exception:
+        pass
+    return url
+
+
+def _fetch_page(url: str, timeout: int = 8) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def _bing_target(url: str) -> str:
+    """Bing wraps result links in a /ck/a redirect whose `u`
+    parameter carries the real URL (base64url, 'a1'-prefixed).
+    Unwrap it — a brain following the wrapper gets a tracker
+    page, not the result."""
+    try:
+        query = urllib.parse.parse_qs(
+            urllib.parse.urlparse(html.unescape(url)).query)
+        raw = (query.get("u") or [""])[0]
+        if raw.startswith("a1"):
+            import base64
+            padded = raw[2:] + "=" * (-len(raw[2:]) % 4)
+            decoded = base64.urlsafe_b64decode(padded).decode(
+                "utf-8", errors="strict")
+            if decoded.startswith(("http://", "https://")):
+                return decoded
+    except Exception:
+        pass
+    return html.unescape(url)
+
+
+def _parse_bing(page: str, limit: int) -> list:
     results = []
-    for i, match in enumerate(links[:limit]):
+    for match in _BING_BLOCK_RE.finditer(page):
+        snippet = _BING_SNIPPET_RE.search(match.group("rest"))
+        results.append({
+            "title": _clean(match.group("title")),
+            "url": _bing_target(match.group("url")),
+            "snippet": _clean(snippet.group("snippet")) if snippet
+                       else "",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _parse_ddg(page: str, limit: int, lite: bool = False) -> list:
+    link_re = _LITE_LINK_RE if lite else _RESULT_LINK_RE
+    snip_re = _LITE_SNIPPET_RE if lite else _RESULT_SNIPPET_RE
+    snippets = [_clean(m.group("snippet"))
+                for m in snip_re.finditer(page)]
+    results = []
+    for i, match in enumerate(link_re.finditer(page)):
         results.append({
             "title": _clean(match.group("title")),
             "url": _real_target(match.group("url")),
             "snippet": snippets[i] if i < len(snippets) else "",
         })
-    if not results:
-        return {"error": "web_search failed: no results parsed from "
-                         "DuckDuckGo HTML (page shape may have changed)",
-                "results": []}
-    return {"results": results}
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _search_backends(query: str, limit: int, fetch) -> list:
+    """(name, url, parser) in the order they are tried. Bing goes
+    first: it answers from datacenter and residential IPs alike,
+    where DuckDuckGo often serves a block page with zero results
+    (live-verified 2026-10-22 from the build VM)."""
+    q = urllib.parse.quote_plus(query)
+    return [
+        ("bing", _BING + q, lambda p: _parse_bing(p, limit)),
+        ("duckduckgo", _DDG_HTML + q,
+         lambda p: _parse_ddg(p, limit)),
+        ("duckduckgo-lite", _DDG_LITE + q,
+         lambda p: _parse_ddg(p, limit, lite=True)),
+    ]
+
+
+def op_web_search(query: str, limit: int = 5, fetch=None):
+    """Search the web through three backends in turn — the first
+    that returns real results wins. A single search engine going
+    quiet must never again read as 'no internet': if every backend
+    fails, the error names each one and why."""
+    fetch = fetch or _fetch_page
+    tried = []
+    for name, url, parse in _search_backends(query, limit, fetch):
+        try:
+            page = fetch(url)
+        except Exception as exc:  # network down, timeout — next one
+            tried.append(f"{name}: {type(exc).__name__}")
+            continue
+        results = parse(page)
+        if results:
+            return {"results": results, "backend": name}
+        tried.append(f"{name}: no results (blocked page?)")
+    return {"error": "web_search failed on every backend — "
+                     + "; ".join(tried),
+            "results": []}
 
 
 _SCRIPT_STYLE_RE = re.compile(r"<(script|style)[^>]*>.*?</\1>",
@@ -158,7 +274,7 @@ def op_web_fetch(url: str, max_chars: int = 12000):
         return {"error": "web_fetch failed: the address must start "
                          "with http:// or https://"}
     request = urllib.request.Request(
-        target, headers={"User-Agent": "JARVIS-v4/1.0 (stdlib urllib)"})
+        target, headers={"User-Agent": _UA})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             raw = response.read(2_000_000)
@@ -173,6 +289,193 @@ def op_web_fetch(url: str, max_chars: int = 12000):
     text = text.strip()
     return {"url": target, "text": text[:max_chars],
             "truncated": len(text) > max_chars}
+
+
+_TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.I | re.S)
+_META_DESC_RE = re.compile(
+    r'<meta[^>]+name="description"[^>]+content="([^"]*)"', re.I)
+_HEADING_RE = re.compile(r"<h([1-3])[^>]*>(.*?)</h\1>", re.I | re.S)
+_LINK_RE = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+                      re.I | re.S)
+
+
+def op_web_scrape(url: str, max_chars: int = 12000):
+    """A page taken apart, not just read: title, description,
+    headings, links and the readable text — the scraper half of
+    internet access, for when the brain needs a page's structure
+    (prices in headings, links to follow), not only its prose."""
+    target = str(url).strip()
+    if not target.startswith(("http://", "https://")):
+        return {"error": "web_scrape failed: the address must "
+                         "start with http:// or https://"}
+    try:
+        page = _fetch_page(target, timeout=10)
+    except Exception as exc:
+        return {"error": f"web_scrape failed: "
+                         f"{type(exc).__name__}: {exc}"}
+    title = _TITLE_RE.search(page)
+    desc = _META_DESC_RE.search(page)
+    headings = [_clean(h.group(2)) for h in
+                _HEADING_RE.finditer(page)]
+    links, seen = [], set()
+    for match in _LINK_RE.finditer(page):
+        absolute = urllib.parse.urljoin(target, match.group(1))
+        label = _clean(match.group(2))
+        if absolute.startswith(("http://", "https://")) \
+                and absolute not in seen and label:
+            seen.add(absolute)
+            links.append({"text": label[:80], "url": absolute})
+        if len(links) >= 40:
+            break
+    return {"ok": True, "url": target,
+            "title": _clean(title.group(1)) if title else "",
+            "description": html.unescape(desc.group(1)).strip()
+                           if desc else "",
+            "headings": [h for h in headings if h][:20],
+            "links": links,
+            "text": _html_to_text(page).strip()[:max_chars]}
+
+
+_BROWSER_ENGINES = {
+    "google": "https://www.google.com/search?q=",
+    "bing": "https://www.bing.com/search?q=",
+    "duckduckgo": "https://duckduckgo.com/?q=",
+}
+
+
+def op_search_browser(query: str, engine: str = "google"):
+    """Search through the REAL browser — the road plain HTTP
+    cannot take: Google's results only exist after its scripts
+    run (live-verified 2026-10-22: the fetched page holds no
+    results at all). The controlled Chrome/Edge opens the
+    engine's results page and its text comes back."""
+    base = _BROWSER_ENGINES.get(str(engine).lower())
+    if base is None:
+        return {"error": f"search_browser failed: engine "
+                         f"'{engine}' nahi hai — google, bing ya "
+                         "duckduckgo bolo, sir"}
+    url = base + urllib.parse.quote_plus(str(query))
+    opened = op_browser_open(url)
+    if opened.get("error"):
+        return {"ok": False, "error": opened["error"]}
+    page = op_browser_text(12000)
+    if page.get("error"):
+        return {"ok": False, "error": page["error"]}
+    return {"ok": True, "engine": str(engine).lower(), "url": url,
+            "results_text": page.get("text", "")}
+
+
+def _json_get(url: str, ua: str, timeout: int = 10):
+    request = urllib.request.Request(url, headers={"User-Agent": ua})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8",
+                                                  errors="replace"))
+
+
+def op_wikipedia(query: str):
+    """Wikipedia, through its own API — the encyclopedia road:
+    search, then the top article's plain-text extract. Keyless,
+    structured, and citable (the article URL rides along)."""
+    api = "https://en.wikipedia.org/w/api.php"
+    ua = "JARVIS-v4/1.0 (personal assistant; owner use)"
+    try:
+        found = _json_get(
+            api + "?action=query&list=search&srlimit=5&format=json"
+            "&srsearch=" + urllib.parse.quote_plus(str(query)), ua)
+        hits = ((found.get("query") or {}).get("search")) or []
+        if not hits:
+            return {"ok": False,
+                    "error": f"Wikipedia par '{query}' nahi mila, "
+                             "sir"}
+        title = hits[0]["title"]
+        page = _json_get(
+            api + "?action=query&prop=extracts&explaintext=1"
+            "&format=json&titles="
+            + urllib.parse.quote_plus(title), ua)
+        pages = ((page.get("query") or {}).get("pages")) or {}
+        extract = ""
+        for value in pages.values():
+            extract = str(value.get("extract") or "")
+            break
+    except Exception as exc:
+        return {"ok": False,
+                "error": f"wikipedia failed: "
+                         f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "title": title,
+            "url": "https://en.wikipedia.org/wiki/"
+                   + urllib.parse.quote(title.replace(" ", "_")),
+            "extract": extract[:6000],
+            "more": [h["title"] for h in hits[1:]]}
+
+
+def op_github_search(query: str, limit: int = 5):
+    """GitHub's public search — the code road: repositories by
+    relevance, with stars and descriptions, keyless."""
+    try:
+        data = _json_get(
+            "https://api.github.com/search/repositories?per_page="
+            + str(max(1, min(10, int(limit)))) + "&q="
+            + urllib.parse.quote_plus(str(query)), "JARVIS-v4")
+    except Exception as exc:
+        return {"ok": False,
+                "error": f"github search failed: "
+                         f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "repos": [{
+        "name": item.get("full_name", ""),
+        "stars": item.get("stargazers_count", 0),
+        "description": item.get("description") or "",
+        "url": item.get("html_url", ""),
+    } for item in (data.get("items") or [])]}
+
+
+def op_github_repo(full_name: str):
+    """One repository read properly: its facts plus its README —
+    how JARVIS studies a project before learning from it (the
+    Reverse-Engineer-Anything habit: source evidence first)."""
+    name = str(full_name).strip().strip("/")
+    if name.count("/") != 1:
+        return {"ok": False,
+                "error": "repo ka naam 'owner/repo' jaisa chahiye, "
+                         "sir"}
+    try:
+        meta = _json_get(f"https://api.github.com/repos/{name}",
+                         "JARVIS-v4")
+        readme = ""
+        try:
+            request = urllib.request.Request(
+                f"https://api.github.com/repos/{name}/readme",
+                headers={"User-Agent": "JARVIS-v4",
+                         "Accept": "application/vnd.github.raw+json"})
+            with urllib.request.urlopen(request, timeout=10) as resp:
+                readme = resp.read().decode("utf-8",
+                                            errors="replace")
+        except Exception:
+            readme = ""
+    except Exception as exc:
+        return {"ok": False,
+                "error": f"github repo failed: "
+                         f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "name": meta.get("full_name", name),
+            "stars": meta.get("stargazers_count", 0),
+            "language": meta.get("language") or "",
+            "description": meta.get("description") or "",
+            "url": meta.get("html_url", ""),
+            "readme": readme[:8000]}
+
+
+def op_web_fetch_tor(url: str, max_chars: int = 12000):
+    """Fetch a page through Tor (the owner's local Tor proxy,
+    ports 9050/9150) — the private road, and the only road to
+    .onion addresses. No Tor running -> an honest error, never a
+    silent clearnet fallback."""
+    from jarvis.tornet import fetch_via_tor
+    text, error = fetch_via_tor(str(url).strip())
+    if text is None:
+        return {"ok": False, "error": error}
+    if text.lstrip().startswith("<"):
+        text = _html_to_text(text)
+    return {"ok": True, "via": "tor", "url": str(url),
+            "text": text.strip()[:max_chars]}
 
 
 # ----------------------------------------------------------------------
@@ -413,6 +716,21 @@ def op_browser_click(text: str):
     return _click(text)
 
 
+def op_browser_snapshot(max_chars: int = 12000):
+    from jarvis.browser_cdp import op_browser_snapshot as _snap
+    return _snap(max_chars)
+
+
+def op_browser_screenshot():
+    from jarvis.browser_cdp import op_browser_screenshot as _shot
+    return _shot()
+
+
+def op_browser_click_ref(ref: str, confirm: bool = False):
+    from jarvis.browser_cdp import op_browser_click_ref as _click_ref
+    return _click_ref(ref, confirm)
+
+
 def op_browser_type(text: str, into: str = ""):
     from jarvis.browser_cdp import op_browser_type as _type
     return _type(text, into)
@@ -490,6 +808,16 @@ MEMORY_MANIFEST = {
                        "required": ["text"],
                        "additionalProperties": False},
         },
+        {
+            "name": "learn_url",
+            "op": "learn_url",
+            "permission": "memory.write",
+            "schema": {"type": "object",
+                       "properties": {"url": {"type": "string",
+                                              "minLength": 1}},
+                       "required": ["url"],
+                       "additionalProperties": False},
+        },
     ],
 }
 
@@ -518,6 +846,69 @@ WEB_MANIFEST = {
                                                     "minimum": 500,
                                                     "maximum": 40000}},
                        "required": ["url"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "web_scrape",
+            "op": "web_scrape",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"url": {"type": "string", "minLength": 1},
+                                      "max_chars": {"type": "integer",
+                                                    "minimum": 500,
+                                                    "maximum": 40000}},
+                       "required": ["url"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "search_browser",
+            "op": "search_browser",
+            "permission": "browser.control",
+            "schema": {"type": "object",
+                       "properties": {"query": {"type": "string", "minLength": 1},
+                                      "engine": {"type": "string"}},
+                       "required": ["query"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "web_fetch_tor",
+            "op": "web_fetch_tor",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"url": {"type": "string", "minLength": 1},
+                                      "max_chars": {"type": "integer",
+                                                    "minimum": 500,
+                                                    "maximum": 40000}},
+                       "required": ["url"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "wikipedia",
+            "op": "wikipedia",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"query": {"type": "string", "minLength": 1}},
+                       "required": ["query"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "github_search",
+            "op": "github_search",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"query": {"type": "string", "minLength": 1},
+                                      "limit": {"type": "integer",
+                                                "minimum": 1, "maximum": 10}},
+                       "required": ["query"],
+                       "additionalProperties": False},
+        },
+        {
+            "name": "github_repo",
+            "op": "github_repo",
+            "permission": "net.outbound",
+            "schema": {"type": "object",
+                       "properties": {"full_name": {"type": "string", "minLength": 3}},
+                       "required": ["full_name"],
                        "additionalProperties": False},
         },
     ],
@@ -688,6 +1079,32 @@ BROWSER_MANIFEST = {
             "schema": {"type": "object", "properties": {},
                        "additionalProperties": False},
         },
+        {
+            "name": "browser_snapshot",
+            "op": "browser_snapshot",
+            "permission": "browser.control",
+            "schema": {"type": "object",
+                       "properties": {"max_chars": {"type": "integer"}},
+                       "additionalProperties": False},
+        },
+        {
+            "name": "browser_screenshot",
+            "op": "browser_screenshot",
+            "permission": "browser.control",
+            "schema": {"type": "object", "properties": {},
+                       "additionalProperties": False},
+        },
+        {
+            "name": "browser_click_ref",
+            "op": "browser_click_ref",
+            "permission": "browser.control",
+            "schema": {"type": "object",
+                       "properties": {"ref": {"type": "string",
+                                              "minLength": 2},
+                                      "confirm": {"type": "boolean"}},
+                       "required": ["ref"],
+                       "additionalProperties": False},
+        },
     ],
 }
 
@@ -727,7 +1144,17 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
     registry.register(TIME_MANIFEST, ops={"time_now": op_time_now})
     registry.register(MEMORY_MANIFEST, ops=_memory_ops(memory))
     registry.register(WEB_MANIFEST, ops={"web_search": op_web_search,
-                                         "web_fetch": op_web_fetch})
+                                         "web_fetch": op_web_fetch,
+                                         "web_scrape": op_web_scrape,
+                                         "search_browser":
+                                             op_search_browser,
+                                         "web_fetch_tor":
+                                             op_web_fetch_tor,
+                                         "wikipedia": op_wikipedia,
+                                         "github_search":
+                                             op_github_search,
+                                         "github_repo":
+                                             op_github_repo})
     registry.register(KNOWLEDGE_MANIFEST,
                       ops={"knowledge_search": op_knowledge_search})
     registry.register(FILES_MANIFEST,
@@ -744,7 +1171,10 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
                            "browser_text": op_browser_text,
                            "browser_click": op_browser_click,
                            "browser_type": op_browser_type,
-                           "browser_status": op_browser_status})
+                           "browser_status": op_browser_status,
+                           "browser_snapshot": op_browser_snapshot,
+                           "browser_screenshot": op_browser_screenshot,
+                           "browser_click_ref": op_browser_click_ref})
     registry.register(PC_MANIFEST, ops={"open_app": op_open_app})
     for manifest in ALL_MANIFESTS:
         registry.approve(manifest["name"])

@@ -80,15 +80,21 @@ class OpenWakeWordDetector:
     inference on a daemon thread fed by a bounded queue."""
 
     def __init__(self, on_detect: Callable[[], None],
-                 threshold: float = DEFAULT_THRESHOLD):
+                 threshold: float = DEFAULT_THRESHOLD,
+                 model: str = ""):
         try:
             from openwakeword.model import Model
         except Exception as e:
             raise WakeUnavailable(
                 "openwakeword is not installed — the voice pack in "
                 f"setup.bat installs it ({e})") from e
-        self._model = Model(wakeword_models=[WAKE_MODEL],
-                            inference_framework="onnx")
+        # A custom wake phrase is a trained model: config
+        # voice.wake_model names a bundled model ("hey_jarvis",
+        # "alexa", ...) or a path to the owner's own .onnx —
+        # his 'hello jarvis' plan rides exactly here.
+        self._model = Model(
+            wakeword_models=[str(model).strip() or WAKE_MODEL],
+            inference_framework="onnx")
         self._threshold = float(threshold)
         self._on_detect = on_detect
         self._queue: queue.Queue = queue.Queue(maxsize=50)

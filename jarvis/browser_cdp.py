@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shutil
 import socket
 import struct
@@ -310,6 +311,181 @@ def op_browser_open(url: str):
             return {"error": f"browser_open failed: {exc}"}
     return {"opened": target, "title": _current["title"],
             "url": _current["url"]}
+
+
+# ---------------------------------------------------------------------------
+# Snapshots + click risk (Sentient's browser pattern): visible
+# interactive elements get stable refs (e1, e2, ...) the brain can
+# point at exactly, and a click's risk is classified from its label
+# plus the text of the card around it BEFORE anything is clicked.
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_JS = """
+(() => {
+  const out = {elements: [], text: ''};
+  const els = document.querySelectorAll(
+    'a, button, [role="button"], input, select, textarea, [onclick]');
+  let n = 0;
+  for (const el of els) {
+    if (n >= 300) break;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 || r.height === 0) continue;
+    const label = (el.innerText || el.value || el.placeholder ||
+      el.getAttribute('aria-label') || '').trim()
+      .replace(/\\s+/g, ' ').slice(0, 80);
+    n += 1;
+    const ref = 'e' + n;
+    el.setAttribute('data-jarvis-ref', ref);
+    const holder = el.closest('div, section, li, form');
+    const card = holder ? (holder.innerText || '')
+      .replace(/\\s+/g, ' ').slice(0, 160) : '';
+    const form = el.closest('form');
+    out.elements.push({ref, tag: el.tagName.toLowerCase(),
+      type: el.getAttribute('type') || '', label, card,
+      form: form ? 'yes' : ''});
+  }
+  out.total = n;
+  const body = document.body ? document.body.innerText : '';
+  const main = document.querySelector('main, article');
+  out.text = (main && main.innerText.length > body.length * 0.3)
+    ? main.innerText : body;
+  return JSON.stringify(out);
+})()"""
+
+_RISKY_CLICK_RE = re.compile(
+    r"\b(buy|pay|purchase|checkout|place order|order now|subscribe|"
+    r"delete|remove|confirm|transfer|send|post|publish|cancel|"
+    r"unsubscribe|sign up|signup|register|book now)\b", re.I)
+_PAYMENT_SIGNAL_RE = re.compile(
+    r"(cvv|cvc|billing|payment method|\$|€|£|₹|\brs\.?\s*\d|"
+    r"per month|/month|\d+\s*(rupees|dollars))", re.I)
+
+
+def classify_click_risk(label: str, context: str = "") -> str:
+    """'high' when the click smells like money or commitment: a
+    risky verb in the label, or payment signals around it. A bare
+    'Subscribe' is a purchase UNLESS the surrounding text proves
+    it is free and carries no money signals (Sentient's rule)."""
+    label = str(label or "")
+    text = f"{label} {context or ''}"
+    if _RISKY_CLICK_RE.search(label):
+        if re.search(r"subscribe", label, re.I) \
+                and re.search(r"\bfree\b", text, re.I) \
+                and not _PAYMENT_SIGNAL_RE.search(text):
+            return "low"
+        return "high"
+    if _PAYMENT_SIGNAL_RE.search(label):
+        return "high"
+    return "low"
+
+
+def _format_snapshot(data: dict, max_chars: int = 12000) -> dict:
+    elements, lines = [], []
+    budget = int(max_chars * 0.65)      # elements get ~65% (Sentient)
+    used = 0
+    for el in data.get("elements", []):
+        risk = classify_click_risk(el.get("label", ""),
+                                   el.get("card", ""))
+        line = (f"[{el.get('ref', '?')}] {el.get('tag', '')} "
+                f"\"{el.get('label', '')}\""
+                + (" [form]" if el.get("form") else "")
+                + (" [RISKY]" if risk == "high" else ""))
+        if used + len(line) > budget:
+            break
+        used += len(line) + 1
+        lines.append(line)
+        elements.append({"ref": el.get("ref"), "tag": el.get("tag"),
+                         "label": el.get("label"), "risk": risk})
+    total = int(data.get("total", len(data.get("elements", []))))
+    if total > len(elements):
+        lines.append(f"... {total - len(elements)} more elements "
+                     f"not shown")
+    text_budget = max(0, max_chars - used)
+    text = str(data.get("text", ""))[:text_budget]
+    return {"elements": elements, "lines": lines, "text": text,
+            "truncated": len(str(data.get("text", ""))) > text_budget}
+
+
+def op_browser_snapshot(max_chars: int = 12000):
+    with _lock:
+        try:
+            session = _ensure_session()
+            raw = session.evaluate(SNAPSHOT_JS)
+            _refresh_current(session)
+        except (WSError, OSError) as exc:
+            return {"error": f"browser_snapshot failed: {exc}"}
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except ValueError:
+        return {"error": "browser_snapshot failed: page snapshot "
+                         "samajh nahi aaya"}
+    out = _format_snapshot(data, max_chars=max_chars)
+    return {"url": _current["url"], "title": _current["title"],
+            "elements": out["elements"], "snapshot": out["lines"],
+            "text": out["text"], "truncated": out["truncated"]}
+
+
+def op_browser_click_ref(ref: str, confirm: bool = False):
+    """Click the element a snapshot tagged. Risk is classified
+    BEFORE the click: a high-risk click without confirm=True is
+    refused, with the reason, so the brain can ask the owner."""
+    ref = str(ref).strip()
+    if not re.fullmatch(r"e\d{1,3}", ref):
+        return {"error": f"browser_click_ref failed: '{ref}' koi "
+                         "snapshot ref nahi hai (e1, e2, ...)"}
+    probe = f"""
+(() => {{
+  const el = document.querySelector('[data-jarvis-ref="{ref}"]');
+  if (!el) return null;
+  const holder = el.closest('div, section, li, form');
+  return JSON.stringify({{label: (el.innerText || el.value || ''),
+    card: holder ? (holder.innerText || '') : ''}});
+}})()"""
+    with _lock:
+        try:
+            session = _ensure_session()
+            raw = session.evaluate(probe)
+            info = json.loads(raw) if raw else None
+            if info is None:
+                return {"error": f"browser_click_ref failed: ref "
+                                 f"{ref} page par nahi mila — naya "
+                                 "snapshot lo"}
+            risk = classify_click_risk(info.get("label", ""),
+                                       info.get("card", ""))
+            if risk == "high" and not confirm:
+                return {"ok": False, "risk": "high",
+                        "label": info.get("label", ""),
+                        "error": "yeh click risky hai (paisa ya "
+                                 "commitment wala) — owner se confirm "
+                                 "karke confirm=True ke saath bhejo"}
+            clicked = session.evaluate(
+                f"document.querySelector('[data-jarvis-ref=\"{ref}\""
+                "]).click(); 'clicked'")
+            time.sleep(0.6)
+            _refresh_current(session)
+        except (WSError, OSError) as exc:
+            return {"error": f"browser_click_ref failed: {exc}"}
+    return {"clicked": info.get("label", ""), "risk": risk,
+            "url": _current["url"], "title": _current["title"]}
+
+
+def op_browser_screenshot():
+    """The page as pixels: a PNG through CDP Page.captureScreenshot,
+    base64 out — the vision tools' raw material."""
+    with _lock:
+        try:
+            session = _ensure_session()
+            result = session.call("Page.captureScreenshot",
+                                  {"format": "png"})
+            _refresh_current(session)
+        except (WSError, OSError) as exc:
+            return {"error": f"browser_screenshot failed: {exc}"}
+    data = (result or {}).get("data")
+    if not data:
+        return {"error": "browser_screenshot failed: page ne koi "
+                         "tasveer nahi di"}
+    return {"ok": True, "png_b64": data, "url": _current["url"],
+            "title": _current["title"]}
 
 
 def op_browser_text(max_chars: int = 12000):

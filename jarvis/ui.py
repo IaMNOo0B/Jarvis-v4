@@ -110,6 +110,20 @@ PAGE = """<!DOCTYPE html>
   #npanel .nitem:last-child { border-bottom:none; }
   #npanel .ntitle { color:#ffe1a1; }
   #npanel .nempty { color:rgba(180,210,245,.55); }
+  #spanel { display:none; width:min(760px, 94vw); max-height:44vh;
+    overflow:auto; margin:0 auto 8px; padding:10px 14px;
+    background:rgba(10,22,38,.92); border:1px solid rgba(120,200,255,.25);
+    border-radius:10px; font-size:13px; color:#cfe8ff; }
+  #spanel .stitle { color:#ffe1a1; margin-bottom:6px; }
+  #spanel .srow { display:flex; gap:6px; flex-wrap:wrap; margin:5px 0; }
+  #spanel input { flex:1 1 130px; background:rgba(20,40,66,.9);
+    border:1px solid rgba(120,200,255,.3); border-radius:6px;
+    color:#eaf6ff; padding:6px 8px; font-size:13px; }
+  #spanel button { background:rgba(40,110,180,.85); color:#fff;
+    border:none; border-radius:6px; padding:6px 14px; cursor:pointer; }
+  #spanel .pname { min-width:110px; color:#9fd8ff; align-self:center; }
+  #spanel .pstat { color:rgba(180,210,245,.6); align-self:center; }
+  #smsg { color:#ffd479; margin-top:6px; min-height:16px; }
 </style>
 </head>
 <body>
@@ -134,7 +148,46 @@ PAGE = """<!DOCTYPE html>
     </div>
   </div>
   <div id="npanel"></div>
-  <div class="icons"><span>◉ CHAT</span><span>▣ TOOLS</span><span>◎ MEMORY</span><span id="bell">🔔 <span id="ncount">0</span></span><span id="voiceBtn" style="cursor:pointer">♪ VOICE · OFF</span><span id="muteBtn" style="cursor:pointer;display:none">🎙 MIC</span><span id="cutBtn" style="cursor:pointer;display:none">✋ CUT</span></div>
+  <div id="spanel">
+    <div class="stitle">⚙ API KEYS — ek key set karo, JARVIS restart ke baad woh brain kaam karega. Key kabhi screen par wapas nahi dikhti.</div>
+    <div id="presetRows"></div>
+    <div class="stitle" style="margin-top:10px">Naya provider (OpenAI-compatible):</div>
+    <div class="srow">
+      <input id="cpName" placeholder="Naam (jaise: myprovider)" autocomplete="off">
+      <input id="cpUrl" placeholder="Base URL (https://…)" autocomplete="off">
+      <input id="cpModel" placeholder="Model" autocomplete="off">
+      <input id="cpKey" placeholder="API key" type="password" autocomplete="off">
+      <button id="cpSet">SET</button>
+    </div>
+    <div class="stitle" style="margin-top:12px">📱 TELEGRAM — phone se JARVIS:</div>
+    <div class="srow"><span class="pstat" id="tgStatus">…</span></div>
+    <div class="srow">
+      <input id="tgToken" placeholder="Bot token (BotFather se)" type="password" autocomplete="off">
+      <button id="tgSet">SET</button>
+      <button id="tgPair">PAIR CODE</button>
+      <button id="tgToggle">BAND/CHALU</button>
+    </div>
+    <div class="srow"><span class="pstat" id="tgCode"></span></div>
+    <div class="stitle" style="margin-top:12px">👥 ACCOUNTS — saare khaate, ek hisaab (jitne bhi do, rotation + roz ki had ke saath):</div>
+    <div id="accList"></div>
+    <div class="srow">
+      <select id="accChannel">
+        <option value="email">email</option>
+        <option value="instagram">instagram</option>
+        <option value="threads">threads</option>
+        <option value="facebook">facebook</option>
+      </select>
+      <input id="accLabel" placeholder="Naam (label)" autocomplete="off">
+      <input id="accAddress" placeholder="Email / @handle" autocomplete="off">
+    </div>
+    <div class="srow">
+      <input id="accSecret" placeholder="App password (email ke liye)" type="password" autocomplete="off">
+      <input id="accCap" placeholder="Roz ki had" type="number" min="1" style="max-width:90px">
+      <button id="accAdd">ADD</button>
+    </div>
+    <div id="smsg"></div>
+  </div>
+  <div class="icons"><span>◉ CHAT</span><span>▣ TOOLS</span><span>◎ MEMORY</span><span id="bell">🔔 <span id="ncount">0</span></span><span id="keysBtn" style="cursor:pointer">⚙ KEYS</span><span id="voiceBtn" style="cursor:pointer">♪ VOICE · OFF</span><span id="pttBtn" style="cursor:pointer" title="Push-to-talk: dabaye rakho, bolo, chhodo">⌨ PTT · OFF</span><span id="muteBtn" style="cursor:pointer;display:none">🎙 MIC</span><span id="cutBtn" style="cursor:pointer;display:none">✋ CUT</span></div>
 <script>
   const log = document.getElementById('log');
   const input = document.getElementById('text');
@@ -194,6 +247,9 @@ PAGE = """<!DOCTYPE html>
       muteBtn.style.display = v.active ? '' : 'none';
       muteBtn.textContent = v.muted ? '🔇 MUTED' : '🎙 MIC';
       cutBtn.style.display = v.speaking ? '' : 'none';
+      pttOn = !!s.ptt;
+      pttBtn.textContent = pttOn ? '⌨ PTT · ON (Space dabaye rakho)'
+                                  : '⌨ PTT · OFF';
     } catch (e) { /* state line is decoration; never break chat */ }
   }
   bell.addEventListener('click', async () => {
@@ -226,6 +282,175 @@ PAGE = """<!DOCTYPE html>
     } catch (e) { /* voice controls are additive; never break chat */ }
   }
   voiceBtn.addEventListener('click', () => voiceAction('toggle'));
+  const pttBtn = document.getElementById('pttBtn');
+  let pttOn = false;
+  let pttHeld = false;
+  pttBtn.addEventListener('click', async () => {
+    try {
+      await fetch('/api/ptt', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: !pttOn }) });
+      refreshState();
+    } catch (e) { /* additive control */ }
+  });
+  // Push-to-talk: Space dabaye rakho to mic khula, chhodo to
+  // band — sirf tab jab kahin type na ho raha ho.
+  document.addEventListener('keydown', (e) => {
+    if (!pttOn || pttHeld || e.code !== 'Space' || e.repeat) { return; }
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA'
+              || t.tagName === 'SELECT')) { return; }
+    e.preventDefault();
+    pttHeld = true;
+    voiceAction('start');
+  });
+  document.addEventListener('keyup', (e) => {
+    if (!pttOn || !pttHeld || e.code !== 'Space') { return; }
+    pttHeld = false;
+    voiceAction('stop');
+  });
+  const spanel = document.getElementById('spanel');
+  const smsg = document.getElementById('smsg');
+  async function loadKeys() {
+    try {
+      const r = await fetch('/api/keys');
+      const data = await r.json();
+      const rows = document.getElementById('presetRows');
+      rows.innerHTML = '';
+      for (const p of (data.presets || [])) {
+        const row = document.createElement('div');
+        row.className = 'srow';
+        row.innerHTML = '<span class="pname"></span>'
+          + '<span class="pstat"></span>'
+          + '<input type="password" placeholder="API key" autocomplete="off">'
+          + '<button>SET</button>';
+        row.querySelector('.pname').textContent = p.name;
+        row.querySelector('.pstat').textContent =
+          p.keys > 0 ? ('✓ ' + p.keys + ' key set') : 'koi key nahi';
+        const inp = row.querySelector('input');
+        row.querySelector('button').addEventListener('click',
+          () => setKey({ name: p.name, key: inp.value }));
+        rows.appendChild(row);
+      }
+      for (const c of (data.custom || [])) {
+        const row = document.createElement('div');
+        row.className = 'srow';
+        row.innerHTML = '<span class="pname"></span><span class="pstat"></span>';
+        row.querySelector('.pname').textContent = c.name + ' (custom)';
+        row.querySelector('.pstat').textContent =
+          c.model + ' @ ' + c.base_url
+          + (c.has_key ? ' · ✓ key set' : ' · key gayab!');
+        rows.appendChild(row);
+      }
+    } catch (e) { /* panel just stays empty */ }
+  }
+  async function setKey(payload) {
+    smsg.textContent = 'Set kar raha hoon…';
+    try {
+      const r = await fetch('/api/keys', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload) });
+      const out = await r.json();
+      smsg.textContent = out.ok ? (out.note || 'Set ho gaya')
+                                : ('Nahi hua: ' + (out.error || '?'));
+      if (out.ok) { loadKeys(); }
+    } catch (e) { smsg.textContent = 'Nahi hua: server se jawab nahi'; }
+  }
+  document.getElementById('keysBtn').addEventListener('click', () => {
+    const open = spanel.style.display === 'block';
+    spanel.style.display = open ? 'none' : 'block';
+    if (!open) { loadKeys(); loadTelegram(); loadAccounts(); }
+  });
+  document.getElementById('cpSet').addEventListener('click', () => {
+    setKey({ name: document.getElementById('cpName').value,
+             base_url: document.getElementById('cpUrl').value,
+             model: document.getElementById('cpModel').value,
+             key: document.getElementById('cpKey').value });
+  });
+  let tgEnabled = true;
+  async function loadTelegram() {
+    try {
+      const r = await fetch('/api/telegram');
+      const s = await r.json();
+      tgEnabled = !!s.enabled;
+      document.getElementById('tgStatus').textContent =
+        'Token: ' + (s.token_set ? 'set hai ✓' : 'nahi hai')
+        + ' · Phone: ' + (s.bound ? ('juda hai (' + (s.bound_name || '') + ')') : 'juda nahi')
+        + ' · Haal: ' + (s.enabled ? 'chalu' : 'band');
+    } catch (e) { /* status just stays blank */ }
+  }
+  async function tgAction(payload, after) {
+    smsg.textContent = 'Kar raha hoon…';
+    try {
+      const r = await fetch('/api/telegram', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload) });
+      const out = await r.json();
+      smsg.textContent = out.ok ? (out.note || 'Ho gaya')
+                                : ('Nahi hua: ' + (out.error || '?'));
+      if (out.ok && after) { after(out); }
+      loadTelegram();
+    } catch (e) { smsg.textContent = 'Nahi hua: server se jawab nahi'; }
+  }
+  document.getElementById('tgSet').addEventListener('click', () =>
+    tgAction({ action: 'token',
+               token: document.getElementById('tgToken').value }));
+  document.getElementById('tgPair').addEventListener('click', () =>
+    tgAction({ action: 'pair' }, (out) => {
+      document.getElementById('tgCode').textContent =
+        'Pair code: ' + out.code + ' — phone se bot ko yehi bhejo (10 minute valid)';
+    }));
+  document.getElementById('tgToggle').addEventListener('click', () =>
+    tgAction({ action: 'toggle', enabled: !tgEnabled }));
+  async function loadAccounts() {
+    try {
+      const r = await fetch('/api/accounts');
+      const s = await r.json();
+      const box = document.getElementById('accList');
+      box.innerHTML = '';
+      (s.accounts || []).forEach((a) => {
+        const row = document.createElement('div');
+        row.className = 'srow';
+        const name = document.createElement('span');
+        name.className = 'pname';
+        name.textContent = a.channel + ' · ' + (a.label || a.address);
+        const stat = document.createElement('span');
+        stat.className = 'pstat';
+        stat.textContent = a.sent_today + '/' + a.cap + ' aaj · '
+          + (a.enabled ? (a.eligible ? 'taiyaar' : ('rest: ' + (a.rest_reason || 'had'))) : 'band');
+        const tog = document.createElement('button');
+        tog.textContent = a.enabled ? 'BAND' : 'CHALU';
+        tog.addEventListener('click', () =>
+          accAction({ action: 'toggle', id: a.id, enabled: !a.enabled }));
+        const del = document.createElement('button');
+        del.textContent = '✕';
+        del.addEventListener('click', () =>
+          accAction({ action: 'remove', id: a.id }));
+        row.appendChild(name); row.appendChild(stat);
+        row.appendChild(tog); row.appendChild(del);
+        box.appendChild(row);
+      });
+    } catch (e) { /* list just stays as-is */ }
+  }
+  async function accAction(payload) {
+    smsg.textContent = 'Kar raha hoon…';
+    try {
+      const r = await fetch('/api/accounts', { method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload) });
+      const out = await r.json();
+      smsg.textContent = out.ok ? (out.note || 'Ho gaya')
+                                : ('Nahi hua: ' + (out.error || '?'));
+      loadAccounts();
+    } catch (e) { smsg.textContent = 'Nahi hua: server se jawab nahi'; }
+  }
+  document.getElementById('accAdd').addEventListener('click', () =>
+    accAction({ action: 'add',
+      channel: document.getElementById('accChannel').value,
+      label: document.getElementById('accLabel').value,
+      address: document.getElementById('accAddress').value,
+      secret: document.getElementById('accSecret').value,
+      cap: parseInt(document.getElementById('accCap').value || '0', 10) }));
   muteBtn.addEventListener('click', () => voiceAction('mute'));
   cutBtn.addEventListener('click', () => voiceAction('interrupt'));
   setInterval(refreshState, 20000);
@@ -260,6 +485,19 @@ PAGE = """<!DOCTYPE html>
 """
 
 
+def ui_bind_host(app: ChatApp) -> str:
+    """Where the UI listens. Loopback by default — the owner's
+    PC only. config ui.bind_host may widen it (his Tailscale
+    address, or 0.0.0.0 on his own network): phone access is
+    HIS call, made in config, never a silent default."""
+    try:
+        host = str(app.config.get("ui", "bind_host",
+                                  "127.0.0.1")).strip()
+        return host or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+
+
 def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
     """An HTTP server bound to one ChatApp. Turns are serialized —
     the core is single-conversation by design."""
@@ -278,6 +516,21 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.wfile.write(body)
 
         def do_GET(self):
+            if self.path == "/api/keys":
+                with lock:
+                    settings = app.provider_settings()
+                self._json(200, settings)
+                return
+            if self.path == "/api/telegram":
+                with lock:
+                    status = app.telegram_status()
+                self._json(200, status)
+                return
+            if self.path == "/api/accounts":
+                with lock:
+                    rows = app.accounts_overview()
+                self._json(200, {"accounts": rows})
+                return
             if self.path == "/api/notifications":
                 try:
                     _due_reminder_notifications(app.data_dir)
@@ -313,6 +566,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                                  "activity": app.activity.state,
                                  "tool": app.activity.tool,
                                  "voice": voice,
+                                 "ptt": app.push_to_talk(),
                                  "notifications":
                                      _unread_count(app.data_dir)})
                 return
@@ -324,6 +578,91 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.wfile.write(body)
 
         def do_POST(self):
+            if self.path == "/api/ptt":
+                try:
+                    size = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(
+                        self.rfile.read(size).decode("utf-8"))
+                except Exception:
+                    self._json(400, {"ok": False,
+                                     "error": "bad request"})
+                    return
+                with lock:
+                    out = app.set_push_to_talk(
+                        bool(payload.get("enabled", False)))
+                self._json(200 if out.get("ok") else 400, out)
+                return
+            if self.path == "/api/accounts":
+                try:
+                    size = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(
+                        self.rfile.read(size).decode("utf-8"))
+                except Exception:
+                    self._json(400, {"ok": False,
+                                     "error": "bad request"})
+                    return
+                action = str(payload.get("action", ""))
+                with lock:
+                    if action == "add":
+                        out = app.add_account(
+                            str(payload.get("channel", "")),
+                            str(payload.get("label", "")),
+                            str(payload.get("address", "")),
+                            str(payload.get("secret", "")),
+                            int(payload.get("cap", 0) or 0))
+                    elif action == "toggle":
+                        out = app.set_account_enabled(
+                            str(payload.get("id", "")),
+                            bool(payload.get("enabled", True)))
+                    elif action == "remove":
+                        out = app.remove_account(
+                            str(payload.get("id", "")))
+                    else:
+                        out = {"ok": False,
+                               "error": "unknown action"}
+                self._json(200 if out.get("ok") else 400, out)
+                return
+            if self.path == "/api/telegram":
+                try:
+                    size = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(
+                        self.rfile.read(size).decode("utf-8"))
+                except Exception:
+                    self._json(400, {"ok": False,
+                                     "error": "bad request"})
+                    return
+                action = str(payload.get("action", ""))
+                with lock:
+                    if action == "token":
+                        out = app.set_telegram_token(
+                            str(payload.get("token", "")))
+                    elif action == "pair":
+                        out = app.telegram_pair_code()
+                    elif action == "toggle":
+                        out = app.set_telegram_enabled(
+                            bool(payload.get("enabled", True)))
+                    else:
+                        out = {"ok": False,
+                               "error": "unknown action"}
+                self._json(200 if out.get("ok") else 400, out)
+                return
+            if self.path == "/api/keys":
+                try:
+                    size = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(
+                        self.rfile.read(size).decode("utf-8"))
+                except Exception:
+                    self._json(400, {"ok": False,
+                                     "error": "bad request"})
+                    return
+                with lock:
+                    out = app.set_provider(
+                        str(payload.get("name", "")),
+                        str(payload.get("key", "")),
+                        base_url=str(payload.get("base_url", "")),
+                        model=str(payload.get("model", "")))
+                self._json(200 if out.get("ok") else 400, out)
+                return
             if self.path == "/api/notifications/read":
                 _mark_notifications_read(app.data_dir)
                 self._json(200, {"ok": True})
@@ -342,6 +681,10 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                     elif action == "interrupt":
                         message = app.handle_command(
                             "/voice interrupt")
+                    elif action == "start":
+                        message = app.start_voice()
+                    elif action == "stop":
+                        message = app.stop_voice()
                     else:
                         status = app.voice_status()
                         message = (app.stop_voice()
@@ -398,9 +741,30 @@ def main(argv=None) -> int:
 
     app = ChatApp(Path(args.data_dir))
     _maybe_auto_watch(app)
-    server = build_server(app, port=args.port)
-    url = f"http://127.0.0.1:{args.port}/"
+    from .chat import start_scheduler, start_telegram
+    start_scheduler(app)
+    start_telegram(app)
+
+    def _heartbeat():
+        # The supervisor (jarvis/supervisor.py) watches this file:
+        # a live process with a stale heartbeat is a HUNG app.
+        from .supervisor import write_heartbeat
+        import time as _time
+        while True:
+            write_heartbeat(app.data_dir)
+            _time.sleep(10)
+
+    threading.Thread(target=_heartbeat, daemon=True,
+                     name="jarvis-heartbeat").start()
+    host = ui_bind_host(app)
+    server = build_server(app, host=host, port=args.port)
+    url = f"http://{host}:{args.port}/"
     print(f"JARVIS UI — {url}")
+    if host != "127.0.0.1":
+        print("Note: UI is reachable beyond this PC (config "
+              "ui.bind_host). On a private tailnet that is the "
+              "point; on an open network, set it back to "
+              "127.0.0.1.")
     if not args.no_open:
         webbrowser.open(url)
     try:

@@ -258,3 +258,18 @@ def test_ui_voice_endpoints(voice_app):
     finally:
         app.stop_voice()
         server.shutdown()
+
+
+def test_manager_heard_fraction_counts_played_over_sent():
+    from jarvis.voice_manager import VoiceManager
+    manager = VoiceManager(session_factory=lambda events: None,
+                           io_factory=lambda cfg: FakeIO(),
+                           config={})
+    assert manager.heard_fraction() is None      # nothing sent yet
+    manager.on_audio(b"x" * 1000)
+    manager.on_audio(b"y" * 1000)
+    assert manager.heard_fraction() == 0.0       # sent, none played
+    manager._turn_played = 500
+    assert manager.heard_fraction() == 0.25
+    manager.on_interrupted()                     # counters reset
+    assert manager.heard_fraction() is None

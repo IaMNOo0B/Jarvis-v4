@@ -161,3 +161,96 @@ def test_app_local_engine_without_whisper_says_so(tmp_path,
     msg = app.handle_command("/voice")
     assert "faster-whisper" in msg
     assert app.voice_status()["active"] is False
+
+
+# -- the ACK race (Dodaios Ack-Brain / spoken preambles) -------------------------
+
+class RecordingTTS:
+    def __init__(self):
+        self.spoken = []
+
+    def speak(self, text):
+        self.spoken.append(text)
+        return block(rate=24000, samples=4800)
+
+
+def test_ack_suppressed_when_the_reply_is_fast():
+    tts = RecordingTTS()
+    session = LocalPipelineSession(
+        Sink(), tts=tts, respond=lambda text: "Four.",
+        ack_delay=0.5)
+    assert session._respond_with_ack("2+2?") == "Four."
+    assert tts.spoken == []            # no ACK: the gate suppressed it
+
+
+def test_ack_spoken_when_the_reply_is_slow():
+    tts = RecordingTTS()
+
+    def slow(text):
+        time.sleep(0.3)
+        return "Done, sir."
+
+    session = LocalPipelineSession(
+        Sink(), tts=tts, respond=slow, ack_delay=0.05)
+    assert session._respond_with_ack("do the long thing") == "Done, sir."
+    assert tts.spoken == ["On it, sir."]     # exactly one ACK, first in rotation
+
+
+def test_ack_disabled_at_zero_delay():
+    tts = RecordingTTS()
+
+    def slow(text):
+        time.sleep(0.1)
+        return "Done."
+
+    session = LocalPipelineSession(
+        Sink(), tts=tts, respond=slow, ack_delay=0)
+    assert session._respond_with_ack("x") == "Done."
+    assert tts.spoken == []
+
+
+# -- speech cleaning + sentence streaming (Wave 1.5) ------------------------------
+
+from jarvis.local_voice import clean_for_speech, split_sentences
+
+
+def test_clean_for_speech_strips_what_ears_cannot_use():
+    raw = ("**Done**, sir — see [the report](https://x.example/r) "
+           "or https://y.example/raw for `details`.\n"
+           "```python\nprint('never read this aloud')\n```\n"
+           "| A | B |\nAll good 👍")
+    out = clean_for_speech(raw)
+    assert "http" not in out
+    assert "print" not in out
+    assert "the report" in out
+    assert "**" not in out and "`" not in out
+    assert "|" not in out
+    assert "👍" not in out
+
+
+def test_split_sentences_guards_decimals_and_abbreviations():
+    assert split_sentences("It is 3.5 km away. Dr. Rao agrees! "
+                           "Shall we go?") == [
+        "It is 3.5 km away.", "Dr. Rao agrees!", "Shall we go?"]
+    assert split_sentences("One only") == ["One only"]
+    assert split_sentences("") == []
+
+
+def test_local_turn_streams_sentence_by_sentence():
+    sink = Sink()
+    tts = RecordingTTS()
+    session = LocalPipelineSession(
+        sink, stt=FakeSTT(), tts=tts,
+        respond=lambda text: "First part here. Second part follows!",
+        ack_delay=0)
+    session.start()
+    try:
+        for _ in range(4):
+            session.send_audio(block())
+        for _ in range(11):
+            session.send_audio(SILENCE)
+        assert wait_for(lambda: sink.ends == 1)
+        assert tts.spoken == ["First part here.",
+                              "Second part follows!"]
+    finally:
+        session.stop()

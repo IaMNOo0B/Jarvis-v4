@@ -27,6 +27,8 @@ if errorlevel 1 (
     exit /b 1
 )
 
-python -m jarvis.ui
+rem The supervisor launches the UI and restarts it if it ever
+rem crashes or hangs (bounded: 3 restarts per 10 minutes).
+python -m jarvis.supervisor
 echo.
 pause

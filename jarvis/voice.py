@@ -41,6 +41,7 @@ import json
 import socket
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional
 
 from .live_ws import WSClosed, WSConnection, WSError
@@ -98,7 +99,8 @@ def live_model(models=LIVE_MODELS) -> str:
 def build_setup(*, model: str, system_instruction: str, tools=None,
                 voice: str = DEFAULT_VOICE, resume_handle=None,
                 proactive: bool = False, tuning: Optional[dict] = None,
-                thinking: bool = False) -> dict:
+                thinking: bool = False,
+                thinking_level: Optional[str] = None) -> dict:
     """The setup message, mirroring Mark-LVI's _build_config —
     tuning rides separately so a rejected preview field can be shed
     wholesale on reconnect."""
@@ -120,7 +122,11 @@ def build_setup(*, model: str, system_instruction: str, tools=None,
         setup["tools"] = decls
     if proactive:
         setup["proactivity"] = {"proactiveAudio": True}
-    if thinking:
+    if thinking_level in ("low", "medium", "high"):
+        # The thinking variant's routing knob (Google's Live
+        # guidance): fast rung thinks low, hard turns think high.
+        setup["thinkingConfig"] = {"thinkingLevel": thinking_level}
+    elif thinking:
         setup["thinkingConfig"] = {"thinkingBudget": -1}
     if tuning:
         detect = {}
@@ -187,11 +193,37 @@ class _TranscriptBuffer:
     def clear(self):
         self.text, self._last = "", ""
 
+    def heard(self, fraction) -> str:
+        """The heard prefix of the buffered text: `fraction` of the
+        characters, cut back to a word boundary. No measurement
+        (None) or a zero fraction keeps nothing; >= 1 keeps all."""
+        text = self.text.strip()
+        self.clear()
+        if not text or fraction is None:
+            return ""
+        if fraction >= 1.0:
+            return text
+        if fraction <= 0.0:
+            return ""
+        piece = text[:int(len(text) * fraction)]
+        if " " in piece:
+            piece = piece[:piece.rfind(" ")].rstrip(" ,;:")
+        return piece.strip()
+
 
 class _Reconnect(Exception):
     def __init__(self, keep_context: bool = True):
         super().__init__("reconnect")
         self.keep_context = keep_context
+
+
+_RETRYABLE_HINTS = ("rate", "429", "timeout", "timed out", "503",
+                    "502", "unavailable", "temporarily", "try again")
+
+
+def _retryable(message: str) -> bool:
+    low = str(message).lower()
+    return any(hint in low for hint in _RETRYABLE_HINTS)
 
 
 class LiveSession:
@@ -206,6 +238,8 @@ class LiveSession:
                  tools=None, voice: str = DEFAULT_VOICE,
                  models=LIVE_MODELS, proactive: bool = True,
                  tuning: Optional[dict] = None,
+                 thinking_level: Optional[str] = None,
+                 destructive_tools=frozenset(),
                  ws_factory: Optional[Callable[[str], object]] = None,
                  on_session_end: Optional[Callable[[list], None]] = None,
                  clock: Callable[[], float] = time.monotonic):
@@ -217,6 +251,8 @@ class LiveSession:
         self.voice = valid_voice(voice)
         self.models = tuple(models)
         self.tuning = tuning
+        self.thinking_level = thinking_level
+        self._destructive_tools = frozenset(destructive_tools)
         self._ws_factory = ws_factory
         self._on_session_end = on_session_end
         self._clock = clock
@@ -271,13 +307,28 @@ class LiveSession:
             "turnComplete": True}})
         self._arm_stall()
 
-    def interrupt(self):
+    def interrupt(self, heard_fraction=None):
         """Hard drain: what is queued stops, what still arrives is
-        discarded, and the cut answer is never logged (the repo's
-        rule — the brain must not remember words never heard)."""
+        discarded. The cut answer is remembered only up to what was
+        actually HEARD — OpenAI's truncate rule, and the owner's
+        own doctrine (record what was spoken, not what was
+        generated): when the playback side reports a heard fraction
+        (played bytes / sent bytes), that prefix of the transcript
+        is logged and the unheard tail dropped; with no measurement
+        nothing is logged (the repo's original rule)."""
         self._interrupted = True
         self._in_buf.clear()
-        self._out_buf.clear()
+        if heard_fraction is None:
+            probe = getattr(self.events, "heard_fraction", None)
+            if callable(probe):
+                try:
+                    heard_fraction = probe()
+                except Exception:
+                    heard_fraction = None
+        said = self._out_buf.heard(heard_fraction)
+        if said:
+            self._turns.append(("assistant", said))
+            self.events.on_transcript("assistant", said)
         self.events.on_interrupted()
 
     # -- plumbing -----------------------------------------------------------
@@ -380,7 +431,8 @@ class LiveSession:
             tools=self.tools, voice=self.voice,
             resume_handle=self._resume_handle,
             proactive=self._enhanced,
-            tuning=self.tuning if self._tuned else None)
+            tuning=self.tuning if self._tuned else None,
+            thinking_level=self.thinking_level)
         ws.send_text(json.dumps(setup))
         while not self._stop.is_set():
             try:
@@ -449,21 +501,48 @@ class LiveSession:
                 self._turns.append(("assistant", said))
                 self.events.on_transcript("assistant", said)
 
+    def _run_one_tool(self, fn: dict) -> dict:
+        """One tool call -> one STRUCTURED function response
+        (Google's developer-guide shape): status / retryable /
+        message alongside the result. An empty or bare response
+        invites the model to repeat the call; a structured one
+        tells it exactly what happened."""
+        name = str(fn.get("name") or "")
+        args = fn.get("args") or {}
+        try:
+            result = self.dispatch(name, args)
+        except Exception as e:  # a tool must never kill the call
+            result = {"error": f"Tool '{name}' failed: {e}"}
+        if isinstance(result, dict) and result.get("error"):
+            message = str(result["error"])
+            payload = {"result": message, "status": "error",
+                       "retryable": _retryable(message),
+                       "message": message}
+        else:
+            text = result if isinstance(result, str) \
+                else json.dumps(result, ensure_ascii=False,
+                                default=str)
+            payload = {"result": text, "status": "ok",
+                       "retryable": False, "message": "done"}
+        return {"id": fn.get("id"), "name": name,
+                "response": payload}
+
     def _handle_tool_call(self, call: dict):
-        responses = []
-        for fn in call.get("functionCalls") or []:
-            name = str(fn.get("name") or "")
-            args = fn.get("args") or {}
-            try:
-                result = self.dispatch(name, args)
-                text = result if isinstance(result, str) \
-                    else json.dumps(result, ensure_ascii=False,
-                                    default=str)
-            except Exception as e:  # a tool must never kill the call
-                text = f"Tool '{name}' failed: {e}"
-            responses.append({"id": fn.get("id"), "name": name,
-                              "response": {"result": text}})
+        fns = call.get("functionCalls") or []
+        # Parallel execution (the GPT-Realtime/Gemini pattern):
+        # independent calls in one model turn run together and
+        # their responses return in ONE toolResponse. A batch
+        # containing a destructive tool stays sequential — order
+        # and the idempotency guard matter more than speed there.
+        if len(fns) > 1 and not any(
+                str(fn.get("name") or "") in self._destructive_tools
+                for fn in fns):
+            with ThreadPoolExecutor(
+                    max_workers=min(4, len(fns))) as pool:
+                responses = list(pool.map(self._run_one_tool, fns))
+        else:
+            responses = [self._run_one_tool(fn) for fn in fns]
         if responses:
             self._send({"toolResponse": {"functionResponses":
-                                          responses}})
+                                        responses}})
             self._arm_stall()

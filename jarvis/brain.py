@@ -358,6 +358,11 @@ class Brain:
                                   "error": err, "label": labeled.label,
                                   "origin": labeled.origin,
                                   "injection_signals": signals})
+        key = getattr(self, "spotlight_key", b"")
+        if key:
+            # Spotlighting: unforgeable HMAC markers inside the
+            # framing, so the data cannot fake its own end.
+            text = ifc_mod.mark_outside(text, key)
         return (f'<tool_output tool="{name}" origin="tool:{name}" '
                 f'trust="untrusted">\n{text}\n</tool_output>')
 

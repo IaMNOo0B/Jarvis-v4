@@ -261,6 +261,12 @@ def _cfg_walk(config: Any, path: Sequence[str]) -> Any:
             return None
         if isinstance(cur, Mapping):
             cur = cur.get(key)
+        elif isinstance(getattr(cur, "_data", None), Mapping):
+            # The app's Config object keeps its sections in _data —
+            # walk THROUGH it. Without this, config["providers"]
+            # (and every other section) was invisible to the chain
+            # and only built-in defaults ever applied.
+            cur = cur._data.get(key)
         else:
             cur = getattr(cur, key, None)
     return cur
@@ -599,6 +605,28 @@ class GeminiProvider(_HTTPProvider):
                 last_error = e
                 continue
             return self._reply(data, model)
+        raise last_error or ProviderDown("gemini: no model answered")
+
+    def generate_content(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """One raw generateContent call over the model ladder —
+        the vision path's door (inlineData image parts ride the
+        same rungs, rests and error classes as chat). Returns the
+        parsed response dict; raises ProviderDown when no rung
+        answers."""
+        last_error: Optional[ProviderError] = None
+        for model in self._rungs():
+            url = (f"{self.base_url}/v1beta/models/{model}"
+                   ":generateContent")
+            try:
+                return self._post_json(
+                    url, payload,
+                    headers={"x-goog-api-key": self.api_key})
+            except ProviderHTTPError as e:
+                rest = _GEMINI_REST_S.get(e.status)
+                if rest:
+                    self._rested_until[model] = self._clock() + rest
+                last_error = e
+                continue
         raise last_error or ProviderDown("gemini: no model answered")
 
     @staticmethod

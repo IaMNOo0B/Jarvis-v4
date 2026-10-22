@@ -254,3 +254,119 @@ def test_send_text_shape():
         assert msg["turns"][0]["parts"][0]["text"] == "good morning"
     finally:
         session.stop()
+
+
+# -- heard-truncation (Wave 1.6: record what was spoken) -------------------------
+
+from jarvis.voice import _TranscriptBuffer
+
+
+def test_buffer_heard_prefix_math():
+    buf = _TranscriptBuffer()
+    buf.add("The capital of Australia is Canberra, sir, and it is "
+            "a planned city.")
+    assert buf.heard(None) == ""                 # no measure: old rule
+    buf.add("The capital of Australia is Canberra, sir, and it is "
+            "a planned city.")
+    assert buf.heard(0.0) == ""
+    buf.add("The capital of Australia is Canberra, sir, and it is "
+            "a planned city.")
+    full = buf.heard(1.0)
+    assert full.startswith("The capital") and full.endswith("city.")
+    buf.add("The capital of Australia is Canberra, sir, and more.")
+    part = buf.heard(0.75)
+    assert part and "Canberra" in part
+    assert not part.endswith(("is", "and", ","))  # word-boundary cut
+
+
+def test_interrupt_logs_only_the_heard_prefix():
+    sink = Sink()
+    session = LiveSession(api_key="key", events=sink,
+                          dispatch=lambda n, a: {"ok": True})
+    session._out_buf.add("The capital of Australia is Canberra, "
+                         "sir, and it is a planned city.")
+    session.interrupt(heard_fraction=0.6)
+    assert sink.interrupts == 1
+    assert len(sink.transcripts) == 1
+    role, text = sink.transcripts[0]
+    assert role == "assistant"
+    assert "Canberra" in text and "planned" not in text
+    assert session._turns == [("assistant", text)]
+
+
+def test_interrupt_without_a_measure_logs_nothing():
+    sink = Sink()
+    session = LiveSession(api_key="key", events=sink,
+                          dispatch=lambda n, a: {"ok": True})
+    session._out_buf.add("Something long that was cut early.")
+    session.interrupt()
+    assert sink.transcripts == []
+    assert session._turns == []
+
+
+def test_interrupt_probes_the_events_sink_for_the_fraction():
+    sink = Sink()
+    sink.heard_fraction = lambda: 0.3
+    session = LiveSession(api_key="key", events=sink,
+                          dispatch=lambda n, a: {"ok": True})
+    session._out_buf.add("Alpha bravo charlie delta echo foxtrot "
+                         "golf hotel india juliet.")
+    session.interrupt()
+    assert len(sink.transcripts) == 1
+    assert "Alpha" in sink.transcripts[0][1]
+    assert "juliet" not in sink.transcripts[0][1]
+
+
+# -- structured responses, parallel exec, thinkingLevel (Wave 3) -----------------
+
+def test_tool_responses_are_structured():
+    sink = Sink()
+    session = LiveSession(
+        api_key="key", events=sink,
+        dispatch=lambda n, a: {"ok": True, "value": 7})
+    out = session._run_one_tool({"id": "1", "name": "time_now",
+                                 "args": {}})
+    assert out["response"]["status"] == "ok"
+    assert out["response"]["retryable"] is False
+    assert "7" in out["response"]["result"]
+
+    failing = LiveSession(
+        api_key="key", events=sink,
+        dispatch=lambda n, a: {"error": "rate limit 429, try again"})
+    out2 = failing._run_one_tool({"id": "2", "name": "web_search",
+                                  "args": {}})
+    assert out2["response"]["status"] == "error"
+    assert out2["response"]["retryable"] is True
+    assert out2["response"]["message"]
+
+
+def test_parallel_batch_runs_together_unless_destructive():
+    import threading as _t
+    order = []
+    lock = _t.Lock()
+
+    def dispatch(name, args):
+        with lock:
+            order.append(name)
+        return {"ok": True}
+
+    sink = Sink()
+    session = LiveSession(api_key="key", events=sink,
+                          dispatch=dispatch,
+                          destructive_tools=frozenset({"wipe"}))
+    sent = []
+    session._send = lambda payload: sent.append(payload)
+    session._handle_tool_call({"functionCalls": [
+        {"id": "1", "name": "read_a", "args": {}},
+        {"id": "2", "name": "read_b", "args": {}}]})
+    responses = sent[0]["toolResponse"]["functionResponses"]
+    assert [r["name"] for r in responses] == ["read_a", "read_b"]
+    assert sorted(order) == ["read_a", "read_b"]
+
+
+def test_thinking_level_rides_the_setup():
+    setup = build_setup(model="m", system_instruction="x",
+                        thinking_level="high")["setup"]
+    assert setup["thinkingConfig"] == {"thinkingLevel": "high"}
+    setup2 = build_setup(model="m", system_instruction="x")["setup"]
+    assert "thinkingConfig" not in setup2

@@ -24,6 +24,8 @@ from __future__ import annotations
 import base64
 import binascii
 import codecs
+import hashlib
+import hmac
 import re
 import unicodedata
 from dataclasses import dataclass, field
@@ -189,3 +191,47 @@ def screen(content: LabeledContent) -> dict:
         "normalized_text": normalized,
         "injection_signals": signals,
     }
+
+
+# ---------------------------------------------------------------------------
+# Spotlighting — unforgeable delimiters for outside content (Sentient's
+# pattern): the closing marker carries an HMAC code of the body under a
+# per-install secret, so content cannot fake its own end and escape the
+# data block; the code is stable per body, so prompt caches stay warm.
+# ---------------------------------------------------------------------------
+
+_OUTSIDE_OPEN_RE = re.compile(r"\[outside content[^\]]*\]", re.I)
+_OUTSIDE_CLOSE_RE = re.compile(r"\[end outside content[^\]]*\]", re.I)
+
+
+def outside_code(text: str, key: bytes) -> str:
+    """The 8-hex HMAC code a body carries under this install's key."""
+    return hmac.new(bytes(key), str(text).encode("utf-8"),
+                    hashlib.sha256).hexdigest()[:8]
+
+
+def mark_outside(text: str, key: bytes) -> str:
+    """Wrap untrusted text in spotlight markers. Fake markers inside
+    the body are stripped first — the only closing marker in the
+    output is the real one, carrying the body's code."""
+    body = _OUTSIDE_CLOSE_RE.sub(
+        "", _OUTSIDE_OPEN_RE.sub("", str(text)))
+    code = outside_code(body, key)
+    return (f"[outside content {code}]\n{body}\n"
+            f"[end outside content {code}]")
+
+
+def is_marked(text: str, key: bytes) -> bool:
+    """True when the text is a mark_outside() product whose closing
+    code honestly matches its body under this key."""
+    s = str(text).strip()
+    if not (s.startswith("[outside content ")
+            and "[end outside content " in s):
+        return False
+    try:
+        code = s.split("[outside content ", 1)[1].split("]", 1)[0]
+        body = s.split("]\n", 1)[1].rsplit("\n[end outside content ", 1)[0]
+    except IndexError:
+        return False
+    return hmac.compare_digest(code.strip(),
+                               outside_code(body, key))
