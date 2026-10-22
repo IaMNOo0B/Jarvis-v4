@@ -214,6 +214,25 @@ class Brain:
                  protocol: str = PROTOCOL):
         self.chain = chain
         self.views = tool_views(tool_schemas)
+        # Simultaneity's safety map: which tools may run side by
+        # side. A round of independent, non-destructive calls
+        # executes CONCURRENTLY (the owner's order: bahut saari
+        # cheezein ek saath); destructive — or merely UNKNOWN —
+        # tools always run one by one, in order.
+        self._destructive_tools = set()
+        self._known_tools = set()
+        for _schema in (tool_schemas or []):
+            if not isinstance(_schema, dict):
+                continue
+            _fn = _schema.get("function") \
+                if isinstance(_schema.get("function"), dict) \
+                else _schema
+            _name = _fn.get("name") or _schema.get("name") or ""
+            if not _name:
+                continue
+            self._known_tools.add(str(_name))
+            if _schema.get("destructive") or _fn.get("destructive"):
+                self._destructive_tools.add(str(_name))
         self.dispatch = dispatch
         self.journal = journal
         self.memory = memory
@@ -366,6 +385,13 @@ class Brain:
         return (f'<tool_output tool="{name}" origin="tool:{name}" '
                 f'trust="untrusted">\n{text}\n</tool_output>')
 
+    def _is_destructive(self, name: str) -> bool:
+        """Fail-safe: a tool the brain cannot vouch for (not in
+        its catalog, or marked destructive) never runs in
+        parallel."""
+        return name not in self._known_tools \
+            or name in self._destructive_tools
+
     def _execute(self, call: Dict[str, Any]) -> Any:
         name, args = call["name"], call["args"]
         self._log("tool.call", {"tool": name, "args": args})
@@ -473,6 +499,14 @@ class Brain:
             }
             messages.append(assistant_msg)
 
+            # Plan the round first (LoopGuard + budget are
+            # bookkeeping and stay strictly sequential), then
+            # EXECUTE: a round of independent, non-destructive
+            # calls runs CONCURRENTLY — many things at once —
+            # while any destructive or unknown tool keeps the
+            # whole round serial, in order.
+            planned = []
+            planned_execs = 0
             for i, call in enumerate(reply.tool_calls):
                 call_id = f"call_{rounds}_{i}"
                 key = (call["name"] + "|" + json.dumps(
@@ -487,27 +521,59 @@ class Brain:
                     self._log("brain.loopguard",
                               {"tool": call["name"], "args": call["args"],
                                "run": last_call_run})
-                    content = ("LoopGuard: this exact call was already "
-                               "made twice in a row and has been refused. "
-                               "Work with the results you already have, "
-                               "or take a different approach.")
-                    messages.append({"role": "tool", "tool_call_id": call_id,
-                                     "content": content})
+                    planned.append({
+                        "call_id": call_id, "call": call,
+                        "refusal": (
+                            "LoopGuard: this exact call was already "
+                            "made twice in a row and has been refused. "
+                            "Work with the results you already have, "
+                            "or take a different approach.")})
                     continue
-                if len(records) >= self.max_tool_calls:
-                    content = (f"Tool budget for this turn is exhausted "
-                               f"({self.max_tool_calls} calls). Answer "
-                               "with what you have.")
-                    messages.append({"role": "tool", "tool_call_id": call_id,
-                                     "content": content})
+                if len(records) + planned_execs >= self.max_tool_calls:
+                    planned.append({
+                        "call_id": call_id, "call": call,
+                        "refusal": (
+                            f"Tool budget for this turn is exhausted "
+                            f"({self.max_tool_calls} calls). Answer "
+                            "with what you have.")})
                     continue
+                planned.append({"call_id": call_id, "call": call,
+                                "refusal": None})
+                planned_execs += 1
 
-                result = self._execute(call)
+            to_run = [(idx, p) for idx, p in enumerate(planned)
+                      if p["refusal"] is None]
+            results = {}
+            parallel_ok = len(to_run) > 1 and not any(
+                self._is_destructive(p["call"]["name"])
+                for _, p in to_run)
+            if parallel_ok:
+                from concurrent.futures import ThreadPoolExecutor
+                with ThreadPoolExecutor(
+                        max_workers=min(4, len(to_run))) as pool:
+                    futures = {
+                        pool.submit(self._execute, p["call"]): idx
+                        for idx, p in to_run}
+                    for future, idx in futures.items():
+                        results[idx] = future.result()
+            else:
+                for idx, p in to_run:
+                    results[idx] = self._execute(p["call"])
+
+            for idx, p in enumerate(planned):
+                if p["refusal"] is not None:
+                    messages.append({"role": "tool",
+                                     "tool_call_id": p["call_id"],
+                                     "content": p["refusal"]})
+                    continue
+                result = results[idx]
+                call = p["call"]
                 err = _result_error(result)
                 records.append(ToolCallRecord(tool=call["name"],
                                               args=call["args"],
                                               ok=err is None, error=err))
-                messages.append({"role": "tool", "tool_call_id": call_id,
+                messages.append({"role": "tool",
+                                 "tool_call_id": p["call_id"],
                                  "content": self._frame_tool_result(
                                      call["name"], result)})
 

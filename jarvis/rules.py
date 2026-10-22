@@ -53,6 +53,11 @@ FALLBACK_RULES = """\
   logged, and never sent anywhere the owner did not name.
 - Keep replies tight: what was done, what was found, what is next —
   in that order, without ceremony.
+- Aazaad kaam EK SAATH chalao: jab kai tool calls ek doosre par
+  nirbhar na hon (teen apps kholna, do jagah search, file +
+  hisaab), unhe EK hi jawaab me saath bhejo — woh saath-saath
+  chalte hain, ek-ek ka intezaar nahi hota. Khatarnaak
+  (destructive) kaam hamesha ek-ek karke, kram se.
 - Faisle naapa-tula lo (RLCD): jab koi badi baat tay karo, to
   record_decision se apna confidence darj karo; kaam se pehle
   check_confidence dekho — act kahe to khud karo, verify kahe to
