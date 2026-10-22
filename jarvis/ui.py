@@ -1,13 +1,37 @@
-"""JARVIS app UI — the face from the owner's reference photo.
+"""JARVIS app UI — fresh build (2026-10-22).
 
-A local web app (stdlib http.server, bound to 127.0.0.1 only) over
-the SAME ChatApp core the CLI uses — no second brain, no drift: the
-chat he perfects here is the chat everywhere. The design follows his
-photo: dark grid, one glowing ring with JARVIS in the middle, a
-state word under the ring that tells the TRUTH about what the core
-is doing (Standby / Thinking / Researching / Creating / Working —
-polled from the app's activity, never rotated on a timer), minimal
-chrome. Voice arrives later by his order; this is chat-first.
+The old UI was deleted and made again on the owner's order: on
+his PC the browser tab died with ERR_CONNECTION_REFUSED and the
+real reason stayed hidden inside a console window he could not
+usefully read back. This build is shaped around ONE law:
+
+    THE PAGE ALWAYS OPENS.
+
+How that is enforced, in order:
+
+1. main()/start_ui() binds the HTTP server FIRST and serves the
+   page immediately. ChatApp construction moves to a background
+   thread (BootState). The page polls /api/boot:
+   starting -> a clear "start ho raha hai" face around the orb;
+   ready -> chat enables; error -> THE FULL ERROR TEXT IS SHOWN
+   INSIDE THE PAGE, readable and copyable. The same traceback is
+   still written to startup-error.txt (belt and braces).
+2. Ports fall back: the requested port, then +1 ... +9 — the
+   first that binds wins. The browser opens at the ACTUAL bound
+   URL, and only after a self health-check GET has succeeded.
+3. The supervisor contract is unchanged: `python -m jarvis.ui`
+   is the entry, the heartbeat file is refreshed every 10 s,
+   and the background services (scheduler / telegram /
+   auto-watch) start only after the app is ready, each guarded
+   as before — a side service can never veto the UI again.
+
+The face: the owner's golden particle-orb image
+(embedded in jarvis/core_image.py, served at /assets/jarvis-core.jpg)
+— large, central, ringed, gently glowing; the state word under
+it is the TRUTH polled from the app (never a rotating script);
+chat, confirmation cards, build cards, notifications, the
+Settings panel (keys / telegram / accounts), voice and PTT
+controls — the same ChatApp core behind it all, no second brain.
 
     python -m jarvis.ui [--data-dir DIR] [--port 8765] [--no-open]
 """
@@ -18,6 +42,8 @@ import argparse
 import json
 import sys
 import threading
+import traceback
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -25,6 +51,64 @@ from pathlib import Path
 from .chat import (DEFAULT_DATA_DIR, ChatApp, _due_reminder_notifications,
                    _mark_notifications_read, _maybe_auto_watch,
                    _read_notifications, _unread_count)
+from .config import Config
+
+ASSET_NAME = "jarvis-core.jpg"
+ASSET_PATH = "/assets/" + ASSET_NAME
+_ASSET_FILE = Path(__file__).resolve().parent / "assets" / ASSET_NAME
+_asset_cache: dict = {}
+
+
+def _asset_bytes():
+    """The orb image's bytes (decoded once, then cached). The
+    image ships embedded as base64 text (jarvis/core_image.py —
+    the repo's push route carries text only); a loose file at
+    jarvis/assets/jarvis-core.jpg, when present, wins. None when
+    neither exists — the route answers an honest 404 and the
+    page still opens; the face degrades, the app does not."""
+    if "bytes" not in _asset_cache:
+        data = None
+        try:
+            data = _ASSET_FILE.read_bytes()
+        except OSError:
+            try:
+                import base64
+
+                from .core_image import CORE_JPG_B64
+
+                data = base64.b64decode(CORE_JPG_B64)
+            except Exception:
+                data = None
+        _asset_cache["bytes"] = data
+    return _asset_cache["bytes"]
+
+
+class BootState:
+    """Where the app behind this server currently stands.
+
+    state: "starting" (ChatApp building in its thread), "ready"
+    (app set, chat live), or "error" (construction failed —
+    `error` carries the full traceback text for the page).
+    """
+
+    def __init__(self, data_dir):
+        self.data_dir = Path(data_dir)
+        self.state = "starting"
+        self.app = None
+        self.error = ""
+
+    def mark_ready(self, app) -> None:
+        self.app = app
+        self.state = "ready"
+
+    def mark_error(self, exc: BaseException) -> None:
+        self.error = "".join(traceback.format_exception(
+            type(exc), exc, exc.__traceback__))
+        self.state = "error"
+
+    def payload(self) -> dict:
+        return {"state": self.state, "error": self.error}
+
 
 PAGE = """<!DOCTYPE html>
 <html lang="en">
@@ -36,135 +120,131 @@ PAGE = """<!DOCTYPE html>
   * { margin:0; padding:0; box-sizing:border-box; }
   html, body { height:100%; }
   body {
-    background:#04070d;
+    background:#0a0603;
     background-image:
-      radial-gradient(ellipse 90% 60% at 50% 38%, rgba(24,80,140,.28), transparent 60%),
-      linear-gradient(rgba(90,160,230,.055) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(90,160,230,.055) 1px, transparent 1px);
-    background-size:100% 100%, 44px 44px, 44px 44px;
-    color:#cfe7ff; font-family:"Segoe UI", system-ui, sans-serif;
+      radial-gradient(ellipse 90% 60% at 50% 36%, rgba(190,120,20,.20), transparent 62%),
+      radial-gradient(ellipse 60% 40% at 50% 110%, rgba(120,60,10,.12), transparent 70%);
+    color:#f3e7d3; font-family:"Segoe UI", system-ui, sans-serif;
     display:flex; flex-direction:column; align-items:center;
     height:100vh; overflow:hidden;
   }
   .stage { flex:0 0 auto; display:flex; flex-direction:column;
-           align-items:center; padding-top:4.5vh; }
-  .ring-wrap { position:relative; width:212px; height:212px; }
-  .ring-glow { position:absolute; inset:-34px; border-radius:50%;
-    background:radial-gradient(circle, rgba(56,170,255,.30) 0%, rgba(56,170,255,.06) 55%, transparent 70%);
-    animation:breathe 4.5s ease-in-out infinite; }
-  @keyframes breathe { 0%,100% { opacity:.75; transform:scale(1);} 50% { opacity:1; transform:scale(1.05);} }
-  svg.ring { position:absolute; inset:0; transform:rotate(-90deg); }
-  .ring-track { fill:none; stroke:rgba(110,190,255,.16); stroke-width:2; }
-  .ring-arc { fill:none; stroke:#57c4ff; stroke-width:2.5; stroke-linecap:round;
-    stroke-dasharray:120 560; animation:spin 7s linear infinite;
-    filter:drop-shadow(0 0 6px rgba(87,196,255,.9)); }
-  @keyframes spin { to { transform:rotate(360deg); } }
-  body.busy .ring-arc { animation-duration:1.4s; }
-  body.busy .ring-glow { animation-duration:1.2s; }
-  .ring-core { position:absolute; inset:26px; border-radius:50%;
-    border:1px solid rgba(120,200,255,.35);
-    background:radial-gradient(circle at 50% 42%, rgba(20,50,90,.55), rgba(3,8,16,.9) 75%);
-    box-shadow:0 0 34px rgba(56,170,255,.35) inset, 0 0 22px rgba(56,170,255,.25);
-    display:flex; align-items:center; justify-content:center; }
-  .ring-core span { font-size:25px; letter-spacing:7px; font-weight:300;
-    color:#eaf6ff; text-indent:7px; text-shadow:0 0 14px rgba(120,210,255,.8); }
-  .ticks { position:absolute; inset:6px; border-radius:50%;
-    border:1px dashed rgba(120,200,255,.14); animation:spin 60s linear infinite reverse; }
-  #state { margin-top:18px; font-size:12.5px; letter-spacing:4.5px;
-    text-transform:uppercase; color:#8fd2ff; min-height:16px;
-    text-shadow:0 0 10px rgba(87,196,255,.55); }
+           align-items:center; padding-top:3.6vh; }
+  /* The face: the owner's golden particle orb, ringed and
+     glowing. The motion is pure CSS mood — slow breathing at
+     rest, quicker and brighter while JARVIS works or speaks.
+     It never pretends to be a state; the WORD below it is the
+     state, and that word is polled truth. */
+  .orb-wrap { position:relative; width:228px; height:228px; }
+  .orb-glow { position:absolute; inset:-52px; border-radius:50%;
+    background:radial-gradient(circle, rgba(255,176,32,.34) 0%, rgba(255,140,20,.10) 55%, transparent 72%);
+    animation:breathe 4.6s ease-in-out infinite; }
+  @keyframes breathe { 0%,100% { opacity:.72; transform:scale(1);} 50% { opacity:1; transform:scale(1.055);} }
+  .orb-ring { position:absolute; inset:-11px; border-radius:50%;
+    border:2px solid rgba(245,185,66,.55);
+    box-shadow:0 0 26px rgba(255,170,40,.35), 0 0 9px rgba(255,190,60,.5) inset;
+    animation:ringpulse 4.6s ease-in-out infinite; }
+  @keyframes ringpulse { 0%,100% { opacity:.75; } 50% { opacity:1; } }
+  #orb { position:absolute; inset:0; width:100%; height:100%;
+    border-radius:50%; object-fit:cover; display:block;
+    box-shadow:0 0 44px rgba(255,160,30,.30); }
+  body.busy .orb-glow { animation-duration:1.3s; }
+  body.busy .orb-ring { animation-duration:1.3s; }
+  body.speaking .orb-glow { animation-duration:.8s;
+    background:radial-gradient(circle, rgba(255,196,64,.5) 0%, rgba(255,150,30,.16) 55%, transparent 72%); }
+  body.speaking .orb-ring { border-color:rgba(255,214,110,.95); }
+  body.listening .orb-ring { border-color:rgba(255,226,160,.8); }
+  #state { margin-top:20px; font-size:13px; letter-spacing:4.5px;
+    text-transform:uppercase; color:#ffd479; min-height:17px;
+    text-shadow:0 0 12px rgba(255,180,60,.55); }
   #provider { margin-top:5px; font-size:11px; letter-spacing:1.6px;
-    color:rgba(160,200,240,.45); min-height:14px; }
+    color:rgba(230,200,150,.5); min-height:14px; }
+  #bootBox { margin-top:8px; font-size:13px; letter-spacing:1.2px;
+    color:#ffdf9e; }
+  #bootError { display:none; width:min(760px, 94vw); margin-top:10px;
+    background:rgba(60,14,8,.85); border:1px solid rgba(255,120,80,.55);
+    border-radius:10px; padding:12px 14px; }
+  #bootError .etitle { color:#ffb59e; font-size:13.5px; margin-bottom:8px; }
+  #bootError pre { white-space:pre-wrap; word-wrap:break-word;
+    font-size:12px; line-height:1.45; color:#ffe3d3;
+    max-height:30vh; overflow-y:auto; user-select:text; }
+  #bootError .enote { color:rgba(255,210,180,.65); font-size:12px;
+    margin-top:8px; }
   .chat { flex:1 1 auto; width:min(760px, 94vw); display:flex;
-    flex-direction:column; min-height:0; margin-top:2.2vh; }
+    flex-direction:column; min-height:0; margin-top:2vh; }
   #log { flex:1 1 auto; overflow-y:auto; padding:6px 4px 12px;
     display:flex; flex-direction:column; gap:10px; scrollbar-width:thin; }
   .msg { max-width:82%; padding:10px 14px; border-radius:12px;
     font-size:14.5px; line-height:1.5; white-space:pre-wrap;
     word-wrap:break-word; }
-  .msg.user { align-self:flex-end; color:#e8f4ff;
-    background:linear-gradient(160deg, rgba(30,90,160,.5), rgba(16,50,95,.5));
-    border:1px solid rgba(110,190,255,.35); border-bottom-right-radius:3px; }
-  .msg.jarvis { align-self:flex-start; color:#d7ecff;
-    background:rgba(10,22,42,.62); border:1px solid rgba(110,190,255,.16);
+  .msg.user { align-self:flex-end; color:#fff4e0;
+    background:linear-gradient(160deg, rgba(146,90,16,.55), rgba(92,54,8,.55));
+    border:1px solid rgba(245,185,66,.4); border-bottom-right-radius:3px; }
+  .msg.jarvis { align-self:flex-start; color:#f6ead2;
+    background:rgba(26,18,8,.66); border:1px solid rgba(245,185,66,.18);
     border-bottom-left-radius:3px; }
   .bar { flex:0 0 auto; display:flex; gap:10px; padding:12px 2px 18px; }
-  #text { flex:1; background:rgba(8,18,36,.75); color:#eaf6ff;
-    border:1px solid rgba(110,190,255,.3); border-radius:10px;
+  #text { flex:1; background:rgba(24,16,6,.78); color:#fff6e6;
+    border:1px solid rgba(245,185,66,.32); border-radius:10px;
     padding:12px 14px; font-size:15px; outline:none; }
-  #text:focus { border-color:rgba(120,205,255,.75);
-    box-shadow:0 0 14px rgba(56,170,255,.25); }
-  #send { background:rgba(16,60,110,.6); color:#bfe4ff;
-    border:1px solid rgba(110,190,255,.4); border-radius:10px;
+  #text:focus { border-color:rgba(255,205,95,.8);
+    box-shadow:0 0 14px rgba(255,170,40,.25); }
+  #text:disabled { opacity:.55; }
+  #send { background:rgba(120,70,10,.6); color:#ffe1a1;
+    border:1px solid rgba(245,185,66,.45); border-radius:10px;
     padding:0 22px; font-size:13px; letter-spacing:3px; cursor:pointer; }
-  #send:hover { background:rgba(30,100,175,.65); color:#fff; }
+  #send:hover { background:rgba(165,98,16,.7); color:#fff; }
+  #send:disabled { opacity:.5; cursor:default; }
   .icons { flex:0 0 auto; display:flex; gap:26px; padding-bottom:14px;
-    color:rgba(150,200,245,.4); font-size:13px; letter-spacing:2px; }
+    color:rgba(235,205,155,.45); font-size:13px; letter-spacing:2px; }
   #bell { cursor:pointer; }
   #bell.hot { color:#ffd479; text-shadow:0 0 12px rgba(255,200,90,.8); }
   #npanel { display:none; width:min(760px, 94vw); max-height:30vh;
     overflow-y:auto; margin-bottom:8px; padding:10px 14px;
-    background:rgba(10,22,42,.85); border:1px solid rgba(255,205,110,.35);
+    background:rgba(26,18,8,.88); border:1px solid rgba(255,205,110,.35);
     border-radius:10px; font-size:13.5px; }
-  #npanel .nitem { padding:7px 2px; border-bottom:1px solid rgba(120,200,255,.1); }
+  #npanel .nitem { padding:7px 2px; border-bottom:1px solid rgba(245,185,66,.12); }
   #npanel .nitem:last-child { border-bottom:none; }
   #npanel .ntitle { color:#ffe1a1; }
-  #npanel .nempty { color:rgba(180,210,245,.55); }
+  #npanel .nempty { color:rgba(230,205,165,.55); }
   #spanel { display:none; width:min(760px, 94vw); max-height:44vh;
     overflow:auto; margin:0 auto 8px; padding:10px 14px;
-    background:rgba(10,22,38,.92); border:1px solid rgba(120,200,255,.25);
-    border-radius:10px; font-size:13px; color:#cfe8ff; }
+    background:rgba(22,14,5,.94); border:1px solid rgba(245,185,66,.28);
+    border-radius:10px; font-size:13px; color:#f3e7d3; }
   #spanel .stitle { color:#ffe1a1; margin-bottom:6px; }
   #spanel .srow { display:flex; gap:6px; flex-wrap:wrap; margin:5px 0; }
-  #spanel input { flex:1 1 130px; background:rgba(20,40,66,.9);
-    border:1px solid rgba(120,200,255,.3); border-radius:6px;
-    color:#eaf6ff; padding:6px 8px; font-size:13px; }
-  #spanel button { background:rgba(40,110,180,.85); color:#fff;
+  #spanel input, #spanel select { flex:1 1 130px; background:rgba(40,26,8,.9);
+    border:1px solid rgba(245,185,66,.3); border-radius:6px;
+    color:#fff6e6; padding:6px 8px; font-size:13px; }
+  #spanel button { background:rgba(165,98,16,.9); color:#fff;
     border:none; border-radius:6px; padding:6px 14px; cursor:pointer; }
-  #spanel .pname { min-width:110px; color:#9fd8ff; align-self:center; }
-  #spanel .pstat { color:rgba(180,210,245,.6); align-self:center; }
+  #spanel .pname { min-width:110px; color:#ffd479; align-self:center; }
+  #spanel .pstat { color:rgba(230,205,165,.65); align-self:center; }
   #smsg { color:#ffd479; margin-top:6px; min-height:16px; }
-  /* Living HUD — a particle field + waveform ring around the
-     core, driven by JARVIS's REAL states (see the engine in
-     the script): speaking pulses, listening draws inward,
-     working swirls amber, standby merely drifts. */
-  #orbFx { position:absolute; inset:-96px; width:calc(100% + 192px);
-    height:calc(100% + 192px); pointer-events:none; z-index:1; }
-  .ring-wrap svg.ring, .ring-wrap .ticks { z-index:2; }
-  .ring-core { z-index:3; }
-  #hudTool { margin-top:4px; font-size:11px; letter-spacing:2.5px;
-    color:#ffd479; min-height:14px; text-transform:uppercase;
-    text-shadow:0 0 8px rgba(255,200,90,.5); }
-  body.speaking .ring-core { border-color:rgba(170,228,255,.85);
-    box-shadow:0 0 54px rgba(56,170,255,.6) inset, 0 0 46px rgba(56,170,255,.5); }
-  body.speaking .ring-arc { animation-duration:.9s; stroke:#aee6ff; }
-  body.listening .ring-core { border-color:rgba(140,255,190,.6);
-    box-shadow:0 0 34px rgba(90,255,170,.3) inset, 0 0 26px rgba(90,255,170,.25); }
-  body.listening .ring-arc { stroke:#8dffbe; }
 </style>
 </head>
 <body>
   <div class="stage">
-    <div class="ring-wrap">
-      <div class="ring-glow"></div>
-      <canvas id="orbFx" width="600" height="600"></canvas>
-      <div class="ticks"></div>
-      <svg class="ring" viewBox="0 0 200 200">
-        <circle class="ring-track" cx="100" cy="100" r="96"></circle>
-        <circle class="ring-arc" cx="100" cy="100" r="96"></circle>
-      </svg>
-      <div class="ring-core"><span>JARVIS</span></div>
+    <div class="orb-wrap">
+      <div class="orb-glow"></div>
+      <div class="orb-ring"></div>
+      <img id="orb" src="/assets/jarvis-core.jpg" alt="JARVIS">
     </div>
-    <div id="state">Standby</div>
+    <div id="state">Start ho raha hai…</div>
     <div id="provider"></div>
-    <div id="hudTool"></div>
+    <div id="bootBox">JARVIS start ho raha hai — chat ek pal me khul jayegi…</div>
+    <div id="bootError">
+      <div class="etitle">JARVIS start nahi ho paya — wajah ye rahi:</div>
+      <pre id="bootErrorText"></pre>
+      <div class="enote">Is text ko copy karke bhej dijiye, fix ho jayega. Yahi wajah startup-error.txt me bhi save hai.</div>
+    </div>
   </div>
   <div class="chat">
     <div id="cards"></div>
     <div id="log"></div>
     <div class="bar">
-      <input id="text" placeholder="Type here, sir…" autocomplete="off">
-      <button id="send">SEND</button>
+      <input id="text" placeholder="JARVIS start ho raha hai…" autocomplete="off" disabled>
+      <button id="send" disabled>SEND</button>
     </div>
   </div>
   <div id="npanel"></div>
@@ -211,146 +291,59 @@ PAGE = """<!DOCTYPE html>
 <script>
   const log = document.getElementById('log');
   const input = document.getElementById('text');
+  const sendBtn = document.getElementById('send');
   const stateEl = document.getElementById('state');
   const providerEl = document.getElementById('provider');
+  const bootBox = document.getElementById('bootBox');
+  const bootError = document.getElementById('bootError');
+  const bootErrorText = document.getElementById('bootErrorText');
+  const bell = document.getElementById('bell');
+  const ncount = document.getElementById('ncount');
+  const npanel = document.getElementById('npanel');
+  const cardsEl = document.getElementById('cards');
+  const voiceBtn = document.getElementById('voiceBtn');
+  const muteBtn = document.getElementById('muteBtn');
+  const cutBtn = document.getElementById('cutBtn');
+  const pttBtn = document.getElementById('pttBtn');
+  const spanel = document.getElementById('spanel');
+  const smsg = document.getElementById('smsg');
   // The state word is the TRUTH, polled from the app while a turn
   // runs — never a rotating script (owner's order, 2026-10-21).
-  const stateLabels = { standby: 'Standby', thinking: 'Thinking…',
-    researching: 'Researching…', creating: 'Creating…',
-    working: 'Working…', listening: 'Listening…',
-    speaking: 'Speaking…', sending: 'Sending…',
-    writing: 'Writing…' };
+  const stateLabels = { standby: 'Standby', starting: 'Start ho raha hai…',
+    thinking: 'Thinking…', researching: 'Researching…',
+    creating: 'Creating…', working: 'Working…',
+    listening: 'Listening…', speaking: 'Speaking…',
+    sending: 'Sending…', writing: 'Writing…' };
   let timer = null;
+  let bootReady = false;
+  let pttOn = false;
+  let pttHeld = false;
+  let pttBooted = false;
+  let voiceActive = false;
   function showState(s) {
     stateEl.textContent = stateLabels[s] || 'Standby';
-    document.body.classList.toggle('busy', !!s && s !== 'standby');
+    document.body.classList.toggle('busy', !!s && s !== 'standby' && s !== 'starting');
+    document.body.classList.toggle('speaking', s === 'speaking');
+    document.body.classList.toggle('listening', s === 'listening');
   }
   async function pollState() {
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
       showState(s.activity);
-      setFx(s);
     } catch (e) { /* decoration only */ }
   }
-
-  // ---- Living HUD engine -------------------------------------
-  // Motion follows JARVIS's REAL state, never a script (the
-  // owner's truth law): speaking pulses with a voice-like
-  // envelope, listening draws the field inward, working
-  // swirls it amber, standby lets it drift and rest.
-  const fx = { mode: 'idle', amp: 0.12, level: null };
-  const hudToolEl = document.getElementById('hudTool');
-  function setFx(s) {
-    const v = (s && s.voice) || {};
-    const a = (s && s.activity) || 'standby';
-    let mode = 'idle';
-    if (v.speaking || a === 'speaking') mode = 'speaking';
-    else if (a === 'listening' || v.awake) mode = 'listening';
-    else if (a && a !== 'standby') mode = 'busy';
-    fx.mode = mode;
-    fx.level = (typeof v.level === 'number') ? v.level : null;
-    document.body.classList.toggle('speaking', mode === 'speaking');
-    document.body.classList.toggle('listening', mode === 'listening');
-    if (hudToolEl) {
-      const tool = (mode === 'busy' || mode === 'speaking')
-        ? (s && s.tool) : '';
-      hudToolEl.textContent = tool
-        ? ('⚙ ' + String(tool).replace(/_/g, ' ')) : '';
-    }
-  }
+  // The state WORD follows reality at all times — boot and voice
+  // included. It used to refresh only during typed turns, so it
+  // sat on "Standby" while JARVIS spoke.
   async function pollFx() {
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
-      // The state WORD follows reality at all times — voice
-      // included. It used to refresh only during typed
-      // turns, so it sat on "Standby" while JARVIS spoke.
       showState(s.activity);
-      setFx(s);
     } catch (e) { /* decoration only */ }
   }
   setInterval(pollFx, 700);
-  (function orbEngine() {
-    const cv = document.getElementById('orbFx');
-    if (!cv || !cv.getContext) return;
-    const ctx = cv.getContext('2d');
-    const W = cv.width, H = cv.height, CX = W / 2, CY = H / 2;
-    const ps = [];
-    for (let i = 0; i < 110; i++) {
-      ps.push({ a: Math.random() * Math.PI * 2,
-                r: 122 + Math.random() * 150,
-                sp: (Math.random() * 0.5 + 0.12)
-                    * (Math.random() < 0.5 ? -1 : 1),
-                sz: Math.random() * 1.9 + 0.6,
-                tw: Math.random() * Math.PI * 2 });
-    }
-    let t = 0;
-    function frame() {
-      requestAnimationFrame(frame);
-      if (document.hidden) return;
-      t += 0.016;
-      // A measured voice level (the app reports the real
-      // PCM level of what JARVIS says/hears) drives the
-      // dance when present; the envelope is only a resting
-      // fallback for when no level is being measured.
-      let target = fx.mode === 'speaking' ? 1
-        : fx.mode === 'listening' ? 0.45
-        : fx.mode === 'busy' ? 0.6 : 0.14;
-      const surge = fx.mode === 'speaking'
-        ? (0.55 + 0.45 * Math.sin(t * 7.3)
-             * Math.sin(t * 3.1 + 1.7)
-           + 0.25 * Math.sin(t * 13.7)) : 1;
-      target *= Math.max(0.25, surge);
-      if (fx.level !== null
-          && (fx.mode === 'speaking' || fx.mode === 'listening'))
-        target = Math.min(1, 0.12 + fx.level * 1.7);
-      fx.amp += (target - fx.amp) * 0.08;
-      const amp = fx.amp;
-      ctx.clearRect(0, 0, W, H);
-      // Waveform ring: 56 bars breathing with the envelope.
-      const bars = 56, baseR = 118;
-      ctx.lineWidth = 2;
-      for (let i = 0; i < bars; i++) {
-        const ang = (i / bars) * Math.PI * 2;
-        const w = 0.5 + 0.5 * Math.sin(
-          i * 1.93 + t * (fx.mode === 'speaking' ? 9 : 2.2));
-        const len = 3 + amp * 30 * w;
-        const r1 = baseR + amp * 7 * Math.sin(ang * 3 + t * 2);
-        ctx.strokeStyle = fx.mode === 'listening'
-          ? 'rgba(140,255,190,' + (0.22 + amp * 0.5) + ')'
-          : 'rgba(96,196,255,' + (0.2 + amp * 0.55) + ')';
-        ctx.beginPath();
-        ctx.moveTo(CX + Math.cos(ang) * r1,
-                   CY + Math.sin(ang) * r1);
-        ctx.lineTo(CX + Math.cos(ang) * (r1 + len),
-                   CY + Math.sin(ang) * (r1 + len));
-        ctx.stroke();
-      }
-      // The particle field around the core.
-      const swirl = fx.mode === 'busy' ? 2.6
-        : fx.mode === 'speaking' ? 1.6 : 1;
-      for (const p of ps) {
-        p.a += 0.0016 * p.sp * swirl
-             * (fx.mode === 'listening' ? 1.4 : 1);
-        let rr = p.r + Math.sin(t * 0.9 + p.tw) * 7
-          + (fx.mode === 'listening'
-             ? -18 * (0.5 + 0.5 * Math.sin(t * 0.7 + p.tw))
-             : amp * 16 * Math.sin(p.a * 3 + t * 2.4));
-        const x = CX + Math.cos(p.a) * rr;
-        const y = CY + Math.sin(p.a) * rr * 0.98;
-        const tw = 0.35 + 0.65
-          * (0.5 + 0.5 * Math.sin(t * 2 + p.tw));
-        ctx.fillStyle = (fx.mode === 'busy' && p.sz > 2)
-          ? 'rgba(255,212,121,' + (0.75 * tw) + ')'
-          : 'rgba(140,215,255,' + (0.8 * tw) + ')';
-        ctx.beginPath();
-        ctx.arc(x, y, p.sz * (1 + amp * 0.6), 0, Math.PI * 2);
-        ctx.fill();
-      }
-    }
-    requestAnimationFrame(frame);
-  })();
 
   function addMsg(text, who) {
     const div = document.createElement('div');
@@ -371,14 +364,10 @@ PAGE = """<!DOCTYPE html>
       pollState();
     }
   }
-  const bell = document.getElementById('bell');
-  const ncount = document.getElementById('ncount');
-  const npanel = document.getElementById('npanel');
   function setBadge(n) {
     ncount.textContent = n;
     bell.classList.toggle('hot', n > 0);
   }
-  const cardsEl = document.getElementById('cards');
   async function decideCard(id, approve) {
     try {
       const r = await fetch('/api/confirm', {method:'POST',
@@ -421,7 +410,7 @@ PAGE = """<!DOCTYPE html>
   function renderBuilds(builds) {
     (builds || []).filter(b => b.status === 'awaiting_proceed').forEach(b => {
       const d = document.createElement('div');
-      d.style.cssText = 'border:1px solid #7ad9ff;border-radius:10px;padding:10px 12px;margin:8px;background:rgba(122,217,255,.08)';
+      d.style.cssText = 'border:1px solid #ffd479;border-radius:10px;padding:10px 12px;margin:8px;background:rgba(255,212,121,.06)';
       const t = document.createElement('div');
       t.textContent = '🔨 Build plan taiyaar: ' + b.goal + ' — plan dekh kar aage badhun? (chat me /buildplan ' + b.id + ')';
       const yes = document.createElement('button');
@@ -436,6 +425,7 @@ PAGE = """<!DOCTYPE html>
     });
   }
   async function refreshState() {
+    if (!bootReady) return;
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
@@ -455,6 +445,7 @@ PAGE = """<!DOCTYPE html>
                                   : '⌨ PTT · OFF';
     } catch (e) { /* state line is decoration; never break chat */ }
   }
+  setInterval(refreshState, 20000);
   bell.addEventListener('click', async () => {
     if (npanel.style.display === 'block') { npanel.style.display = 'none'; return; }
     try {
@@ -471,9 +462,6 @@ PAGE = """<!DOCTYPE html>
       setBadge(0);
     } catch (e) { /* panel is decoration; never break chat */ }
   });
-  const voiceBtn = document.getElementById('voiceBtn');
-  const muteBtn = document.getElementById('muteBtn');
-  const cutBtn = document.getElementById('cutBtn');
   async function voiceAction(action) {
     try {
       const r = await fetch('/api/voice', { method: 'POST',
@@ -485,11 +473,6 @@ PAGE = """<!DOCTYPE html>
     } catch (e) { /* voice controls are additive; never break chat */ }
   }
   voiceBtn.addEventListener('click', () => voiceAction('toggle'));
-  const pttBtn = document.getElementById('pttBtn');
-  let pttOn = false;
-  let pttHeld = false;
-  let pttBooted = false;
-  let voiceActive = false;
   async function pttHold(held) {
     try {
       await fetch('/api/ptt', { method: 'POST',
@@ -526,8 +509,6 @@ PAGE = """<!DOCTYPE html>
     if (pttBooted) { pttBooted = false; voiceAction('stop'); }
     else { pttHold(false); }
   });
-  const spanel = document.getElementById('spanel');
-  const smsg = document.getElementById('smsg');
   async function loadKeys() {
     try {
       const r = await fetch('/api/keys');
@@ -670,8 +651,8 @@ PAGE = """<!DOCTYPE html>
       cap: parseInt(document.getElementById('accCap').value || '0', 10) }));
   muteBtn.addEventListener('click', () => voiceAction('mute'));
   cutBtn.addEventListener('click', () => voiceAction('interrupt'));
-  setInterval(refreshState, 20000);
   async function send() {
+    if (!bootReady) return;
     const text = input.value.trim();
     if (!text) return;
     input.value = '';
@@ -691,10 +672,39 @@ PAGE = """<!DOCTYPE html>
     refreshState();
     input.focus();
   }
-  document.getElementById('send').addEventListener('click', send);
+  sendBtn.addEventListener('click', send);
   input.addEventListener('keydown', e => { if (e.key === 'Enter') send(); });
-  refreshState();
-  input.focus();
+  // ---- Boot gate ----------------------------------------------
+  // The page opens BEFORE the app exists (the server binds
+  // first, ChatApp builds behind it). Poll /api/boot: while
+  // starting, chat stays disabled with a clear note; on ready,
+  // everything enables; on error, the full reason is shown
+  // right here in the page — never a dead tab again.
+  async function pollBoot() {
+    try {
+      const r = await fetch('/api/boot');
+      const b = await r.json();
+      if (b.state === 'ready') {
+        bootReady = true;
+        bootBox.style.display = 'none';
+        input.disabled = false;
+        sendBtn.disabled = false;
+        input.placeholder = 'Type here, sir…';
+        refreshState();
+        input.focus();
+        return;
+      }
+      if (b.state === 'error') {
+        bootBox.style.display = 'none';
+        bootError.style.display = 'block';
+        bootErrorText.textContent = b.error || 'unknown error';
+        stateEl.textContent = 'Start fail ho gaya';
+        return;
+      }
+    } catch (e) { /* the server hiccuped; keep polling */ }
+    setTimeout(pollBoot, 600);
+  }
+  pollBoot();
 </script>
 </body>
 </html>
@@ -714,10 +724,56 @@ def ui_bind_host(app: ChatApp) -> str:
         return "127.0.0.1"
 
 
-def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
-    """An HTTP server bound to one ChatApp. Turns are serialized —
-    the core is single-conversation by design."""
+def _bind_host_for_data_dir(data_dir) -> str:
+    """The bind host BEFORE any ChatApp exists — the server must
+    bind before the app is built, so the same config ui.bind_host
+    is read straight from the data dir's config store. Any
+    failure means the safe default: loopback."""
+    try:
+        host = str(Config(data_dir).get("ui", "bind_host",
+                                        "127.0.0.1")).strip()
+        return host or "127.0.0.1"
+    except Exception:
+        return "127.0.0.1"
+
+
+def _boot_state_payload(boot: BootState) -> dict:
+    """/api/state while the app is not (yet) there: the same
+    shape the page and the buddy overlay poll, with honest
+    starting values — the overlay must keep working (and keep
+    telling the truth) even while JARVIS is still booting."""
+    unread = 0
+    try:
+        unread = _unread_count(boot.data_dir)
+    except Exception:
+        pass
+    return {"provider": "", "tools": 0, "learned": 0,
+            "activity": "starting" if boot.state == "starting"
+                        else "standby",
+            "tool": "", "voice": {"active": False},
+            "ptt": False, "confirmations": [], "builds": [],
+            "incognito": False, "notifications": unread,
+            "boot": boot.state}
+
+
+def build_server(app: ChatApp = None, host: str = "127.0.0.1",
+                 port: int = 8765, boot: BootState = None):
+    """An HTTP server over the boot state. Called with a ready
+    ChatApp (the classic shape) it wraps it in a ready BootState;
+    called with boot= it serves the page from the first second
+    and the app whenever the boot thread lands it. Turns are
+    serialized — the core is single-conversation by design."""
+    if boot is None:
+        if app is None:
+            raise ValueError("build_server needs an app or a boot")
+        boot = BootState(app.data_dir)
+        boot.mark_ready(app)
     lock = threading.Lock()
+
+    def _not_ready(handler):
+        handler._json(503, {"ok": False,
+                            "error": "JARVIS abhi start ho raha "
+                                     "hai, sir — ek pal rukiye."})
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):  # keep the console clean
@@ -731,33 +787,42 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.end_headers()
             self.wfile.write(body)
 
+        def _read_payload(self):
+            size = int(self.headers.get("Content-Length", 0))
+            return json.loads(self.rfile.read(size).decode("utf-8"))
+
         def do_GET(self):
-            if self.path == "/api/keys":
-                with lock:
-                    settings = app.provider_settings()
-                self._json(200, settings)
+            if self.path == ASSET_PATH:
+                data = _asset_bytes()
+                if data is None:
+                    self._json(404, {"error": "asset missing"})
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
                 return
-            if self.path == "/api/telegram":
-                with lock:
-                    status = app.telegram_status()
-                self._json(200, status)
-                return
-            if self.path == "/api/accounts":
-                with lock:
-                    rows = app.accounts_overview()
-                self._json(200, {"accounts": rows})
+            if self.path == "/api/boot":
+                self._json(200, boot.payload())
                 return
             if self.path == "/api/notifications":
+                data_dir = boot.app.data_dir if boot.app is not None \
+                    else boot.data_dir
                 try:
-                    _due_reminder_notifications(app.data_dir)
+                    _due_reminder_notifications(data_dir)
                 except Exception:
                     pass
-                items = _read_notifications(app.data_dir)[-20:]
+                items = _read_notifications(data_dir)[-20:]
                 self._json(200, {
                     "items": list(reversed(items)),
-                    "unread": _unread_count(app.data_dir)})
+                    "unread": _unread_count(data_dir)})
                 return
             if self.path == "/api/state":
+                app = boot.app
+                if app is None:
+                    self._json(200, _boot_state_payload(boot))
+                    return
                 learned = 0
                 store = getattr(app.memory, "_learned", None)
                 if store is not None:
@@ -788,7 +853,33 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                                  "builds": app.list_builds(),
                                  "incognito": bool(app.incognito),
                                  "notifications":
-                                     _unread_count(app.data_dir)})
+                                     _unread_count(app.data_dir),
+                                 "boot": boot.state})
+                return
+            app = boot.app
+            if self.path == "/api/keys":
+                if app is None:
+                    _not_ready(self)
+                    return
+                with lock:
+                    settings = app.provider_settings()
+                self._json(200, settings)
+                return
+            if self.path == "/api/telegram":
+                if app is None:
+                    _not_ready(self)
+                    return
+                with lock:
+                    status = app.telegram_status()
+                self._json(200, status)
+                return
+            if self.path == "/api/accounts":
+                if app is None:
+                    _not_ready(self)
+                    return
+                with lock:
+                    rows = app.accounts_overview()
+                self._json(200, {"accounts": rows})
                 return
             body = PAGE.encode()
             self.send_response(200)
@@ -798,11 +889,24 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.wfile.write(body)
 
         def do_POST(self):
+            app = boot.app
+            if self.path == "/api/notifications/read":
+                data_dir = app.data_dir if app is not None \
+                    else boot.data_dir
+                _mark_notifications_read(data_dir)
+                self._json(200, {"ok": True})
+                return
+            if app is None:
+                if self.path == "/api/chat":
+                    self._json(503, {
+                        "error": "JARVIS abhi start ho raha hai, "
+                                 "sir — ek pal rukiye."})
+                else:
+                    _not_ready(self)
+                return
             if self.path == "/api/builds/proceed":
                 try:
-                    size = int(self.headers.get("Content-Length", 0))
-                    payload = json.loads(
-                        self.rfile.read(size).decode("utf-8"))
+                    payload = self._read_payload()
                 except Exception:
                     self._json(400, {"ok": False,
                                      "error": "bad request"})
@@ -817,9 +921,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 return
             if self.path == "/api/confirm":
                 try:
-                    size = int(self.headers.get("Content-Length", 0))
-                    payload = json.loads(
-                        self.rfile.read(size).decode("utf-8"))
+                    payload = self._read_payload()
                 except Exception:
                     self._json(400, {"ok": False,
                                      "error": "bad request"})
@@ -832,9 +934,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 return
             if self.path == "/api/ptt":
                 try:
-                    size = int(self.headers.get("Content-Length", 0))
-                    payload = json.loads(
-                        self.rfile.read(size).decode("utf-8"))
+                    payload = self._read_payload()
                 except Exception:
                     self._json(400, {"ok": False,
                                      "error": "bad request"})
@@ -850,9 +950,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 return
             if self.path == "/api/accounts":
                 try:
-                    size = int(self.headers.get("Content-Length", 0))
-                    payload = json.loads(
-                        self.rfile.read(size).decode("utf-8"))
+                    payload = self._read_payload()
                 except Exception:
                     self._json(400, {"ok": False,
                                      "error": "bad request"})
@@ -880,9 +978,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 return
             if self.path == "/api/telegram":
                 try:
-                    size = int(self.headers.get("Content-Length", 0))
-                    payload = json.loads(
-                        self.rfile.read(size).decode("utf-8"))
+                    payload = self._read_payload()
                 except Exception:
                     self._json(400, {"ok": False,
                                      "error": "bad request"})
@@ -904,9 +1000,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 return
             if self.path == "/api/keys":
                 try:
-                    size = int(self.headers.get("Content-Length", 0))
-                    payload = json.loads(
-                        self.rfile.read(size).decode("utf-8"))
+                    payload = self._read_payload()
                 except Exception:
                     self._json(400, {"ok": False,
                                      "error": "bad request"})
@@ -919,16 +1013,10 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                         model=str(payload.get("model", "")))
                 self._json(200 if out.get("ok") else 400, out)
                 return
-            if self.path == "/api/notifications/read":
-                _mark_notifications_read(app.data_dir)
-                self._json(200, {"ok": True})
-                return
             if self.path == "/api/voice":
                 try:
-                    size = int(self.headers.get("Content-Length", 0))
-                    action = str(json.loads(
-                        self.rfile.read(size).decode("utf-8")
-                    ).get("action", "toggle")).lower()
+                    action = str(self._read_payload().get(
+                        "action", "toggle")).lower()
                 except Exception:
                     # Malformed JSON is a 400 — it must never
                     # TOGGLE the owner's voice (the old fallback
@@ -958,9 +1046,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                 self._json(404, {"error": "not found"})
                 return
             try:
-                size = int(self.headers.get("Content-Length", 0))
-                payload = json.loads(
-                    self.rfile.read(size).decode("utf-8"))
+                payload = self._read_payload()
                 text = str(payload["text"]).strip()
             except Exception:
                 self._json(400, {"error": "bad request — JSON with a "
@@ -1050,6 +1136,108 @@ def _start_background_services(app) -> None:
                   "itself is running.")
 
 
+def _boot_app(data_dir, boot: BootState, start_services: bool) -> None:
+    """The boot thread: build the ChatApp behind the already-live
+    server. A crash here is NOT a dead UI — it lands in the boot
+    state (the page shows the full text) and in startup-error.txt,
+    and the process keeps serving so the owner can read both."""
+    try:
+        app = ChatApp(data_dir)
+    except Exception as exc:
+        boot.mark_error(exc)
+        _write_startup_error(data_dir, exc)
+        return
+    boot.mark_ready(app)
+    if start_services:
+        _start_background_services(app)
+
+
+class UIHandle:
+    """A running UI: the server, its boot state, the bound URL."""
+
+    def __init__(self, server, boot: BootState, host: str):
+        self.server = server
+        self.boot = boot
+        self.host = host
+        self.port = server.server_address[1]
+        self.url = f"http://{host}:{self.port}/"
+
+    def serve_forever(self) -> None:
+        self.server.serve_forever()
+
+    def shutdown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _health_check(url: str, attempts: int = 25) -> bool:
+    """GET the boot endpoint until the server answers — the
+    browser is opened only once this succeeds, at the URL that
+    actually bound. Loopback only: no proxy may intercept it."""
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}))
+    import time as _time
+    for _ in range(attempts):
+        try:
+            with opener.open(url + "api/boot", timeout=1) as resp:
+                if resp.status == 200:
+                    return True
+        except Exception:
+            _time.sleep(0.1)
+    return False
+
+
+def start_ui(data_dir, port: int = 8765, open_browser: bool = True,
+             start_services: bool = True) -> UIHandle:
+    """Bind FIRST, boot behind it. Ports fall back +1 ... +9 from
+    the requested one (port 0 binds one ephemeral port, for
+    tests). Raises the last OSError when no port binds at all —
+    the one failure no page can paper over, so main() records it
+    in startup-error.txt and returns 1."""
+    data_dir = Path(data_dir)
+    host = _bind_host_for_data_dir(data_dir)
+    boot = BootState(data_dir)
+    server = None
+    last_exc = None
+    candidates = [port] if port == 0 else \
+        list(range(port, port + 10))
+    for candidate in candidates:
+        try:
+            server = build_server(boot=boot, host=host,
+                                  port=candidate)
+            break
+        except OSError as exc:
+            last_exc = exc
+    if server is None:
+        raise last_exc if last_exc is not None else OSError(
+            "no port could be bound")
+    handle = UIHandle(server, boot, host)
+
+    def _heartbeat():
+        # The supervisor (jarvis/supervisor.py) watches this file:
+        # a live process with a stale heartbeat is a HUNG app. It
+        # beats from the moment the server exists — a slow app
+        # boot is not a hang.
+        from .supervisor import write_heartbeat
+        import time as _time
+        while True:
+            write_heartbeat(data_dir)
+            _time.sleep(10)
+
+    threading.Thread(target=_heartbeat, daemon=True,
+                     name="jarvis-heartbeat").start()
+    threading.Thread(target=_boot_app,
+                     args=(data_dir, boot, start_services),
+                     daemon=True, name="jarvis-boot").start()
+    if open_browser:
+        if _health_check(handle.url):
+            webbrowser.open(handle.url)
+        else:
+            print("JARVIS: the page did not answer its health "
+                  f"check — open {handle.url} yourself, sir.")
+    return handle
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="jarvis.ui", description="JARVIS v4 app UI (local web).")
@@ -1061,40 +1249,19 @@ def main(argv=None) -> int:
 
     data_dir = Path(args.data_dir)
     try:
-        app = ChatApp(data_dir)
+        handle = start_ui(data_dir, port=args.port,
+                          open_browser=not args.no_open)
     except Exception as exc:
         _write_startup_error(data_dir, exc)
         return 1
-
-    def _heartbeat():
-        # The supervisor (jarvis/supervisor.py) watches this file:
-        # a live process with a stale heartbeat is a HUNG app.
-        from .supervisor import write_heartbeat
-        import time as _time
-        while True:
-            write_heartbeat(app.data_dir)
-            _time.sleep(10)
-
-    threading.Thread(target=_heartbeat, daemon=True,
-                     name="jarvis-heartbeat").start()
-    host = ui_bind_host(app)
-    try:
-        server = build_server(app, host=host, port=args.port)
-    except Exception as exc:
-        _write_startup_error(data_dir, exc)
-        return 1
-    url = f"http://{host}:{args.port}/"
-    print(f"JARVIS UI — {url}")
-    if host != "127.0.0.1":
+    print(f"JARVIS UI — {handle.url}")
+    if handle.host != "127.0.0.1":
         print("Note: UI is reachable beyond this PC (config "
               "ui.bind_host). On a private tailnet that is the "
               "point; on an open network, set it back to "
               "127.0.0.1.")
-    if not args.no_open:
-        webbrowser.open(url)
-    _start_background_services(app)
     try:
-        server.serve_forever()
+        handle.serve_forever()
     except KeyboardInterrupt:
         pass
     return 0

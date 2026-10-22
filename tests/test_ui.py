@@ -1,6 +1,7 @@
-"""The app UI: same ChatApp core behind a local web page shaped
-like the owner's reference photo (ring, states, chat). Hermetic:
-an ephemeral port and the counting stub chain."""
+"""The app UI (fresh build, 2026-10-22): the golden-orb page
+over the SAME ChatApp core. Hermetic: an ephemeral port and the
+counting stub chain. The boot-first startup flow itself is
+covered by test_ui_startup.py."""
 import json
 import threading
 import urllib.request
@@ -47,12 +48,33 @@ def _post(url, payload):
         return resp.status, json.loads(resp.read().decode())
 
 
-def test_page_is_the_ring_design(ui):
+def test_page_is_the_orb_design(ui):
     status, body = _get(ui + "/")
     assert status == 200
-    assert "JARVIS" in body and "ring-core" in body
-    assert "Researching" in body       # the state words he asked for
-    assert "/api/chat" in body
+    assert "JARVIS" in body
+    assert "/assets/jarvis-core.jpg" in body   # the owner's orb
+    assert "orb-ring" in body
+    assert "/api/chat" in body and "/api/boot" in body
+    assert "Start ho raha hai" in body         # the boot face
+    # The old HUD-canvas design is gone, by the owner's order.
+    assert "orbFx" not in body and "ring-core" not in body
+
+
+def test_orb_asset_is_served_as_jpeg(ui):
+    with urllib.request.urlopen(ui + "/assets/jarvis-core.jpg",
+                                timeout=5) as resp:
+        assert resp.status == 200
+        assert resp.headers.get_content_type() == "image/jpeg"
+        data = resp.read()
+    assert data[:3] == b"\xff\xd8\xff"         # real JPEG bytes
+    assert len(data) > 10_000
+
+
+def test_boot_endpoint_reports_ready_for_a_built_app(ui):
+    status, body = _get(ui + "/api/boot")
+    boot = json.loads(body)
+    assert status == 200
+    assert boot["state"] == "ready" and boot["error"] == ""
 
 
 def test_chat_round_trip_through_http(ui):
@@ -73,6 +95,7 @@ def test_state_endpoint(ui):
     state = json.loads(body)
     assert status == 200
     assert state["tools"] >= 15        # the whole toolbox is wired in
+    assert state["boot"] == "ready"
 
 
 def test_bad_post_is_an_honest_400(ui):
