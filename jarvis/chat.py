@@ -547,6 +547,43 @@ def _app_root(parts) -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def _packs_annex(parts, text, paths=(), domains=None):
+    """(annex, packs) — the rules-pack annex for one brain turn.
+
+    The router picks the packs (two-key rule: with `domains`
+    given, a coding/build domain must be among them; without,
+    the caller already knows its input is work, so work=True),
+    the loader joins the surviving cards under the annex cap,
+    and a selected card that cannot load is journaled as
+    refused — a refusal is never silent. ("", []) when no pack
+    applies. Never raises: a broken pack layer must not break
+    the turn it was meant to help."""
+    try:
+        from .router import route_rule_packs
+        from .rules import load_rule_packs, pack_card_problem
+        if domains is None:
+            packs = route_rule_packs(text, paths=paths, work=True)
+        else:
+            packs = route_rule_packs(text, domains=domains,
+                                     paths=paths)
+        if not packs:
+            return "", []
+        root = _app_root(parts)
+        annex = load_rule_packs(root, packs)
+        for pack in packs:
+            problem = pack_card_problem(root, pack)
+            if problem:
+                try:
+                    parts.journal.append(
+                        "rules.pack_refused",
+                        {"pack": pack, "reason": problem})
+                except Exception:
+                    pass
+        return annex, packs
+    except Exception:
+        return "", []
+
+
 AUTOMATION_MANIFEST = {
     "name": "core.automations",
     "version": "1.0.0",
@@ -712,7 +749,8 @@ def _forge_ops(holder, data_dir):
                 "module and proving it works>\", \"source\": "
                 "\"<where the pattern came from>\"}. Files "
                 "only under jarvis/, tests/ or knowledge/. "
-                "Keep it small and self-contained.")).reply
+                "Keep it small and self-contained."),
+                rules_annex=_packs_annex(parts, brief)[0]).reply
             plan = _json_from_reply(reply)
             if not isinstance(plan, dict) \
                     or not isinstance(plan.get("files"), dict):
@@ -941,6 +979,7 @@ def _critic_once(parts, task_text, subtask, content, summary,
     the first critic would wave through; it shares no
     context with the first — separate Brain, separate call."""
     brain = _team_brain(parts, with_tools=False)
+    annex, _pk = _packs_annex(parts, task_text)
     if skeptic:
         head = ("You are the SECOND reviewer (skeptic) — you "
                 "did NOT write this code and you have NOT "
@@ -958,7 +997,7 @@ def _critic_once(parts, task_text, subtask, content, summary,
         f"Worker ki summary: {summary}\nFiles:\n{content}\n"
         "Reply with ONLY JSON: {\"ok\": true} or "
         "{\"ok\": false, \"issues\": \"kya kharab hai, saaf "
-        "shabdon me\"}")).reply
+        "shabdon me\"}"), rules_annex=annex).reply
     verdict = _json_from_reply(reply)
     if not isinstance(verdict, dict) or "ok" not in verdict:
         return {"ok": False,
@@ -1020,7 +1059,8 @@ def _team_ops(holder, data_dir):
                 "subtask. Reply with ONLY JSON: {\"subtasks\": "
                 "[{\"title\": \"...\", \"files\": [\"name.py\"], "
                 "\"brief\": \"what to build\"}]}\nTask: "
-                + task_text)).reply
+                + task_text),
+                rules_annex=_packs_annex(parts, task_text)[0]).reply
             return _json_from_reply(reply)
 
         def worker(task_text, subtask, workspace, issues):
@@ -1698,7 +1738,9 @@ def _delegated_summary(parts, task_text: str) -> str:
         "watching live): " + task_text +
         "\nWhen finished, end with a concise summary of what "
         "was done and the outcome.")
-    result = brain.respond([], prompt)
+    result = brain.respond(
+        [], prompt,
+        rules_annex=_packs_annex(parts, task_text)[0])
     return str(result.reply)[:900]
 
 
@@ -1725,7 +1767,9 @@ def _delegated_run(parts, task_text: str):
         "watching live): " + task_text +
         "\nWhen finished, end with a concise summary of what "
         "was done and the outcome.")
-    result = brain.respond([], prompt)
+    result = brain.respond(
+        [], prompt,
+        rules_annex=_packs_annex(parts, task_text)[0])
     return str(result.reply)[:900], str(
         getattr(result, "stopped_reason", "completed"))
 
@@ -1754,7 +1798,9 @@ def _local_summary(parts, task_text: str) -> str:
               "only; work autonomously with your tools): "
               + task_text
               + "\nWhen finished, end with a concise summary.")
-    result = brain.respond([], prompt)
+    result = brain.respond(
+        [], prompt,
+        rules_annex=_packs_annex(parts, task_text)[0])
     return str(result.reply)[:900]
 
 
@@ -2145,12 +2191,13 @@ def _plan_for_build(parts, goal: str, workspace: str):
         "safalta KAISE saabit hogi aur DONE ka matlab KYA "
         "hai, pehle se tay karo.")
     problems = ["plan JSON hi nahi mila"]
+    annex, _pk = _packs_annex(parts, goal)
     for _attempt in range(2):
         try:
             brain = Brain(parts.chain, [], parts.dispatch,
                           parts.journal, parts.memory,
                           audit=False)
-            out = brain.respond([], prompt)
+            out = brain.respond([], prompt, rules_annex=annex)
             parsed = _json_from_reply(str(out.reply))
         except Exception:
             parsed = None
@@ -2208,7 +2255,10 @@ def _build_check(parts, goal: str, item: dict, context: str,
     try:
         brain = Brain(parts.chain, [], parts.dispatch,
                       parts.journal, parts.memory, audit=False)
-        out = brain.respond([], prompt)
+        out = brain.respond(
+            [], prompt,
+            rules_annex=_packs_annex(
+                parts, f"{goal} {item.get('detail', '')}")[0])
         parsed = _json_from_reply(str(out.reply))
         if isinstance(parsed, dict) and "ok" in parsed:
             return {"ok": bool(parsed["ok"]),
@@ -2247,7 +2297,12 @@ def _build_rubric_eval(parts, plan: dict, evidence: str):
     try:
         brain = Brain(parts.chain, [], parts.dispatch,
                       parts.journal, parts.memory, audit=False)
-        out = brain.respond([], prompt)
+        plan_paths = [c.get("path") for c in plan.get("changes") or []
+                      if isinstance(c, dict) and c.get("path")]
+        out = brain.respond(
+            [], prompt,
+            rules_annex=_packs_annex(parts, str(plan.get("goal", "")),
+                                     paths=plan_paths)[0])
         parsed = _json_from_reply(str(out.reply))
     except Exception:
         parsed = None
@@ -4962,6 +5017,9 @@ class ChatApp:
         self.incognito = False
         self._incognito_history: list = []
         self.last_provider = "none"
+        # Rule packs chosen on the most recent brain turn
+        # (display state for /rules; the journal is the record).
+        self._last_rule_packs: list = []
 
     # -- tool execution (the same gate-mediated path the brain uses) --
 
@@ -5401,6 +5459,57 @@ class ChatApp:
             return f"'{name}' naam ki routine nahi mili, sir."
         return self._schedule_listing("routines.json", "routine")
 
+    def _pack_index_lines(self):
+        """The /rules pack index: every installed card with its
+        size (or the missing-card note), from the app root's
+        rules-packs/ — display only, nothing here reaches a
+        prompt."""
+        from .rules import (list_rule_packs, load_rule_pack,
+                            pack_card_problem)
+        root = _app_root(self.parts)
+        lines = []
+        for name in list_rule_packs(root):
+            card = load_rule_pack(root, name)
+            if card:
+                lines.append(f"• {name} — card {len(card)} chars")
+            else:
+                problem = pack_card_problem(root, name)
+                note = (f"card refused ({problem})"
+                        if problem in ("banned", "over-cap")
+                        else "card missing")
+                lines.append(f"• {name} — {note} — "
+                             "full text only")
+        return lines
+
+    def _full_pack_text(self, name: str):
+        """The FULL verbatim ECC text of one pack (an owner
+        reading surface — never sent to a prompt), or None when
+        the name is not a known pack. The name is validated
+        against the on-disk pack dirs before any path is built
+        from it."""
+        from .rules import rules_pack_path
+        root = _app_root(self.parts)
+        folder = root / "knowledge" / "ecc" / "rules"
+        try:
+            known = sorted(p.name for p in folder.iterdir()
+                           if p.is_dir() and p.name != "common")
+        except Exception:
+            known = []
+        if name not in known:
+            return None
+        try:
+            rules_pack_path(root, name)   # simple-name check
+        except ValueError:
+            return None
+        chunks = []
+        for md in sorted((folder / name).glob("*.md")):
+            try:
+                chunks.append(f"===== {name}/{md.name} =====\n"
+                              + md.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+        return "\n\n".join(chunks) if chunks else None
+
     def handle_command(self, command: str) -> str:
         """Slash commands. `/memory <text>` stores a fact (the app's
         own memory surface); `/memory` lists current facts."""
@@ -5591,10 +5700,46 @@ class ChatApp:
         if text.startswith("/buildplan "):
             return self.build_plan_text(
                 text[len("/buildplan "):].strip())
+        if text == "/rules packs":
+            lines = ["Language packs (distilled cards, "
+                     "rules-packs/ me), sir:"]
+            lines.extend(self._pack_index_lines())
+            lines.append("Pura ECC text: knowledge/ecc/rules/"
+                         "<pack>/ — /rules pack <name> se khulta "
+                         "hai; card: /rules card <name>.")
+            return "\n".join(lines)
+        if text.startswith("/rules pack "):
+            name = text[len("/rules pack "):].strip()
+            full = self._full_pack_text(name)
+            if full is None:
+                return (f"Pack '{name}' mila nahi, sir — "
+                        "/rules packs se list dekhiye.")
+            return (f"Pack '{name}' ka pura ECC text, sir "
+                    "(ye sirf padhne ke liye hai — prompt me "
+                    "sirf distilled card jata hai):\n\n" + full)
+        if text.startswith("/rules card "):
+            from .rules import load_rule_pack
+            name = text[len("/rules card "):].strip()
+            card = load_rule_pack(_app_root(self.parts), name)
+            if not card:
+                return (f"Card '{name}' mila nahi, sir — "
+                        "/rules packs se list dekhiye.")
+            return card
         if text == "/rules":
-            return ("Ye rahe mere saare rules, sir — ek hi file "
-                    f"se ({self.rules_source}):\n\n"
-                    + self.rules_text)
+            lines = ["Ye rahe mere saare rules, sir — ek hi file "
+                     f"se ({self.rules_source}):\n\n"
+                     + self.rules_text,
+                     "\n— Language packs (router coding turn par "
+                     "khud lagata hai):"]
+            lines.extend(self._pack_index_lines())
+            last = getattr(self, "_last_rule_packs", None) or []
+            lines.append("Aakhri brain turn par lage pack: "
+                         + (", ".join(last) if last
+                            else "koi nahi"))
+            lines.append("Pura ECC text: /rules pack <name> · "
+                         "Sirf card: /rules card <name> · "
+                         "Index: /rules packs")
+            return "\n".join(lines)
         if text == "/calibration":
             return self.calibrator.report()
         if text == "/instincts":
@@ -6221,21 +6366,38 @@ class ChatApp:
             brain_text = text if not auto_hint else (
                 text + "\n[Automation note: " + auto_hint + "]")
             from .prompt import PromptBudgetError
+            # Rules packs (ECC install): packs are chosen from
+            # the owner's ORIGINAL text — never from
+            # brain_text, so an automation note cannot trigger
+            # a pack — and the annex rides this turn only.
+            from .router import routed_domains
+            annex, packs = _packs_annex(
+                self.parts, text, domains=routed_domains(text))
+            if packs:
+                try:
+                    self.journal.append("rules.pack_selected", {
+                        "packs": packs, "chars": len(annex)})
+                except Exception:
+                    pass
+                self._last_rule_packs = packs
             result = None
             try:
                 result = self._brain_for(text).respond(
                     self._brain_history(), brain_text,
-                    correction=bool(correction))
+                    correction=bool(correction),
+                    rules_annex=annex)
             except PromptBudgetError:
                 # ONE retry with an empty history — the
                 # minimal build. A bloated history must not
                 # silence the turn (audit 2026-10-22: the
                 # error propagated, /api/chat 500'd, and the
-                # owner heard nothing at all).
+                # owner heard nothing at all). The retry is
+                # the minimal build: no annex either.
                 try:
                     result = self._brain_for(text).respond(
                         [], brain_text,
-                        correction=bool(correction))
+                        correction=bool(correction),
+                        rules_annex="")
                 except PromptBudgetError:
                     result = None
             if result is None:

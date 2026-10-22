@@ -1,0 +1,16 @@
+## PACK: VUE (ECC se distilled)
+- <script setup lang="ts"> + Composition API hi;
+  Options API naye code me NAHI. Ek file ek
+  component; order: script, template, style.
+- ref primary state; reactive/store destructure
+  NAHI — storeToRefs lo.
+- computed pure (no side effects). watch lazy
+  hai — getter pass karo. Cleanup onUnmounted me.
+- v-for par stable :key hamesha; v-if + v-for ek
+  element par KABHI nahi.
+- v-html user content par = XSS: DOMPurify pehle.
+  :href scheme validate karo. VITE_* env client
+  ko dikhta hai — secret NAHI.
+- Tests: Vitest + @vue/test-utils. Check:
+  vue-tsc + lint.
+Pura text: knowledge_search "ecc rules vue".

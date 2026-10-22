@@ -1,0 +1,15 @@
+## PACK: KOTLIN (ECC se distilled)
+- val pehle, var sirf jab mutation zaroori.
+  data class value types ke liye; immutable
+  collections public API me.
+- !! KABHI nahi: ?. ?: requireNotNull. Sealed
+  types state ke liye, exhaustive when, else NAHI.
+- Errors: Result / sealed type; exceptions
+  control flow ke liye NAHI. CancellationException
+  hamesha rethrow karo.
+- Coroutines structured: viewModelScope /
+  coroutineScope; Flow streams ke liye.
+- Secrets code me NAHI: BuildConfig/local
+  properties; tokens secure storage me.
+- Check: ./gradlew test; ktlint/Detekt; Turbine.
+Pura text: knowledge_search "ecc rules kotlin".

@@ -18,8 +18,9 @@ is the file's own text, not a second hidden rulebook.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Tuple
+from typing import List, Sequence, Tuple
 
 _VOICE_MARK = "AWAAZ"
 
@@ -86,6 +87,14 @@ FALLBACK_RULES = """\
   se confidence darj karo, check_confidence dekho — act = khud
   karo, verify = pehle tool se jaancho, ask = malik se poochho.
   Nateeje par resolve_decision band karo; score khud lagta hai.
+- Coding: tests first (RED-GREEN-refactor); review
+  your own diff — CRITICAL blocks 'done'.
+- Functions <50 lines, files cohesive; new objects
+  over mutation; errors handled, never swallowed.
+- Validate boundary inputs; parameterized queries
+  only; rotate leaked secrets.
+- Commits conventional (feat:/fix:/test:); push
+  only on the owner's signal.
 
 ## AWAAZ (sirf voice ke liye)
 - Bol kar jawab do — chhota, saaf, insaan ki tarah. Likhi hui
@@ -144,3 +153,136 @@ def voice_rules(text: str) -> str:
     for header, body in _sections(text):
         parts.append(f"{header}: {body.strip()}")
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Language rule packs (ECC rules install, 2026-10-22)
+#
+# `rules-packs/<pack>.txt` at the repo root holds one distilled
+# card per language/framework, distilled from the ECC rules
+# corpus (full texts stay in knowledge/ecc/rules/, reachable via
+# knowledge_search). The router picks at most a couple of packs
+# for a coding turn; the cards ride in the prompt's DYNAMIC tail
+# as a bounded annex — they are never part of the core protocol,
+# never reach the voice session, and never outrank the owner's
+# own rules above. This loader is pure file reading: no model,
+# no network, and a bad card is REFUSED (empty result), never
+# silently truncated into compliance.
+# ---------------------------------------------------------------------------
+
+PACKS_DIR = "rules-packs"
+MAX_PACK_CHARS = 700
+MAX_ANNEX_CHARS = 1600
+
+ANNEX_HEADING = "## LANGUAGE PACKS (is kaam ke liye chune hue)"
+
+_PACK_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+
+# Material that must never ride into a prompt as a "rule":
+# Claude-Code machinery paths/markers, and owner-conflicting
+# instructions (permission bypass phrasing, coverage-as-a-gate).
+# A card containing any of these is refused whole.
+_BANNED_PACK_SUBSTRINGS = (
+    "~/.claude",
+    "auto-accept",
+    "dangerously-skip-permissions",
+    "allowlist",
+)
+_BANNED_PACK_RES = (
+    # Claude Code's settings file — but a .NET card may
+    # legitimately name appsettings.json, so the plain word
+    # "settings.json" is banned only when it is not that file.
+    re.compile(r"(?<!app)settings\.json", re.IGNORECASE),
+    re.compile(r"\becc:", re.IGNORECASE),
+    re.compile(r"always\s+allow", re.IGNORECASE),
+    re.compile(r"skip\s+permissions?", re.IGNORECASE),
+    re.compile(r"coverage\s*(>=|≥|at\s+least|minimum|must|required)",
+               re.IGNORECASE),
+    re.compile(r"(>=|≥)\s*80\s*%"),
+    re.compile(r"80\s*%\s*(coverage\s*)?(gate|required|minimum|must)",
+               re.IGNORECASE),
+    re.compile(r"coverage\s+gate", re.IGNORECASE),
+)
+
+
+def _pack_banned(text: str) -> bool:
+    low = text.lower()
+    if any(marker in low for marker in _BANNED_PACK_SUBSTRINGS):
+        return True
+    return any(rx.search(text) for rx in _BANNED_PACK_RES)
+
+
+def rules_pack_path(root, pack: str) -> Path:
+    """Resolve one pack name inside rules-packs/. Raises
+    ValueError for anything that is not a simple pack name —
+    an unchecked name is never interpolated into a path."""
+    if not _PACK_NAME_RE.match(str(pack or "")):
+        raise ValueError(f"not a simple pack name: {pack!r}")
+    return Path(root) / PACKS_DIR / f"{pack}.txt"
+
+
+def list_rule_packs(root) -> List[str]:
+    """Sorted pack names whose .txt card exists on disk."""
+    folder = Path(root) / PACKS_DIR
+    try:
+        names = [p.stem for p in folder.glob("*.txt")
+                 if _PACK_NAME_RE.match(p.stem)]
+    except Exception:
+        return []
+    return sorted(names)
+
+
+def pack_card_problem(root, pack: str) -> str:
+    """Why a card cannot load: "" when it loads fine, else
+    "bad-name" / "missing" / "over-cap" / "banned". Pure check —
+    the chat layer uses this to journal a refused card; the
+    loader functions themselves stay silent file reading."""
+    try:
+        path = rules_pack_path(root, pack)
+    except ValueError:
+        return "bad-name"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception:
+        return "missing"
+    body = text.strip()
+    if not body:
+        return "missing"
+    if len(body) > MAX_PACK_CHARS:
+        return "over-cap"
+    if _pack_banned(body):
+        return "banned"
+    return ""
+
+
+def load_rule_pack(root, pack: str) -> str:
+    """One card's text, stripped; "" when the name is not a
+    simple pack name, the card is missing, over the 700-char
+    cap, or contains banned material. Never raises."""
+    if pack_card_problem(root, pack):
+        return ""
+    try:
+        return rules_pack_path(root, pack).read_text(
+            encoding="utf-8").strip()
+    except Exception:
+        return ""
+
+
+def load_rule_packs(root, packs: Sequence[str]) -> str:
+    """The annex for a turn: the selected cards, deduped in
+    priority order, joined under the annex heading. Whole
+    cards drop from the end until the joined annex fits
+    MAX_ANNEX_CHARS — a card is never truncated. "" when no
+    selected card loads."""
+    seen: List[str] = []
+    for pack in packs or ():
+        if pack not in seen:
+            seen.append(pack)
+    cards = [card for card in
+             (load_rule_pack(root, pack) for pack in seen) if card]
+    while cards:
+        annex = ANNEX_HEADING + "\n\n" + "\n\n".join(cards)
+        if len(annex) <= MAX_ANNEX_CHARS:
+            return annex
+        cards.pop()
+    return ""

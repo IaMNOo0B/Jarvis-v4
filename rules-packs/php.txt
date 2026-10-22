@@ -1,0 +1,15 @@
+## PACK: PHP (ECC se distilled)
+- PSR-12 + declare(strict_types=1); scalar hints,
+  return types, typed properties.
+- Controllers patle: transport sirf. Business
+  rules testable services me; framework globals
+  par dependency NAHI — constructor injection.
+- Arrays ki jagah DTOs/value objects (money,
+  ids, ranges).
+- SQL sirf prepared statements (PDO/Eloquent);
+  mass-assignment whitelist. Output escape
+  default; raw HTML exception, wajah ke saath.
+- Secrets env/secret manager se. password_hash;
+  session id login par regenerate; CSRF rakho.
+- Check: Pint/PHP-CS-Fixer; PHPStan; PHPUnit.
+Pura text: knowledge_search "ecc rules php".

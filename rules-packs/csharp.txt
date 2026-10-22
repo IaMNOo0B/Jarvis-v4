@@ -1,0 +1,15 @@
+## PACK: CSHARP (ECC se distilled)
+- Nullable reference types on. record / record
+  struct immutable models ke liye; dynamic NAHI.
+- Async/await hi — .Result/.Wait() blocking NAHI.
+  CancellationToken async APIs me pass karo.
+- Immutability: init setters, with expressions;
+  input models in-place mutate NAHI.
+- DI interfaces par; lifetimes: singleton
+  stateless, scoped request, transient halke.
+- Secrets code/config me NAHI: env, user secrets,
+  secret manager. SQL parameterized.
+- API errors me safe message hi; stack trace
+  client ko kabhi NAHI.
+- Check: dotnet format; dotnet test.
+Pura text: knowledge_search "ecc rules csharp".

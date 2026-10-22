@@ -15,6 +15,7 @@ still governs every call.
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Optional, Sequence
 
 ALWAYS_SKILLS = frozenset({
@@ -124,3 +125,176 @@ def routed_domains(text: str) -> List[str]:
     """Which domains the router heard (for the journal) —
     the same ranked top-3 route_schemas picks."""
     return _top_domains(text)
+
+
+# ---------------------------------------------------------------------------
+# Rule-pack routing (ECC rules install, 2026-10-22)
+#
+# Separate from tool-schema routing above: this picks which
+# distilled language cards (rules-packs/*.txt) ride in the
+# prompt's dynamic tail for a coding turn. TWO keys must turn —
+# (1) work: a coding/build domain was routed, or the caller
+# already knows its input is a coding task (work=True); and
+# (2) a language signal: the text names the language/framework,
+# or known file paths match the pack's extensions. A language
+# mentioned in passing ("Java is a place") loads nothing.
+# ---------------------------------------------------------------------------
+
+CODING_DOMAINS = frozenset({
+    "core.code", "core.builds", "core.team", "core.forge",
+})
+
+# Specific stems: distinctive enough to name the pack on their
+# own. Matched on word boundaries, so "java" never fires inside
+# "javascript" and "rails" never inside "guardrails".
+PACK_STEMS: Dict[str, Sequence[str]] = {
+    "python": ("python", "pytest", "pip", "fastapi", "flask",
+               "django"),
+    "typescript": ("typescript", "javascript", "node.js", "nodejs",
+                   "node", "npm", "deno", "bun"),
+    "react": ("react", "next.js", "nextjs", "jsx", "tsx"),
+    "react-native": ("react native", "react-native", "expo"),
+    "vue": ("vue", "pinia"),
+    "nuxt": ("nuxt", "nitro"),
+    "angular": ("angular", "rxjs", "ngrx"),
+    "web": ("html", "css", "website design", "landing page",
+            "ui design"),
+    "golang": ("golang", "go mod", "go test"),
+    "java": ("java", "spring", "maven", "gradle"),
+    "kotlin": ("kotlin", "android", "compose"),
+    "rust": ("rust", "cargo"),
+    "cpp": ("c++", "cpp", "cmake"),
+    "csharp": ("c#", "csharp", ".net", "dotnet"),
+    "fsharp": ("f#", "fsharp"),
+    "swift": ("swift", "swiftui", "ios"),
+    "dart": ("dart", "flutter"),
+    "php": ("php", "laravel", "wordpress"),
+    "ruby": ("ruby", "rails"),
+    "perl": ("perl",),
+    "arkts": ("arkts", "harmonyos", "arkui"),
+}
+
+# Generic stems: real signals, but too weak to outrank a
+# specific match for another pack — consulted only when no
+# specific stem fired ("ek component banao" -> react).
+GENERIC_PACK_STEMS: Dict[str, Sequence[str]] = {
+    "react": ("component",),
+    "react-native": ("mobile app",),
+}
+
+# A framework card rarely travels alone: its base language
+# card follows it (budget permitting — the annex loader drops
+# whole cards from the end when the cap bites).
+PACK_CHAINS: Dict[str, Sequence[str]] = {
+    "react": ("typescript",),
+    "react-native": ("typescript",),
+    "nuxt": ("vue", "typescript"),
+    "angular": ("typescript",),
+}
+
+EXTENSION_PACKS: Dict[str, str] = {
+    ".py": "python",
+    ".ts": "typescript", ".js": "typescript",
+    ".tsx": "react", ".jsx": "react",
+    ".vue": "vue",
+    ".go": "golang",
+    ".rs": "rust",
+    ".java": "java",
+    ".kt": "kotlin", ".kts": "kotlin",
+    ".rb": "ruby",
+    ".php": "php",
+    ".pl": "perl", ".pm": "perl",
+    ".swift": "swift",
+    ".dart": "dart",
+    ".cs": "csharp",
+    ".fs": "fsharp", ".fsx": "fsharp",
+    ".cpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+    ".hpp": "cpp", ".h": "cpp",
+    ".ets": "arkts",
+    ".html": "web", ".css": "web",
+    ".csproj": "csharp", ".fsproj": "fsharp",
+}
+
+# Whole-file signals — basenames (or glob prefixes) that name a
+# pack even without a language extension.
+FILENAME_PACKS: Dict[str, str] = {
+    "pom.xml": "java",
+    "go.mod": "golang",
+    "cargo.toml": "rust",
+    "gemfile": "ruby",
+    "composer.json": "php",
+    "pubspec.yaml": "dart",
+    "cmakelists.txt": "cpp",
+    "cpanfile": "perl",
+    "package.swift": "swift",
+    "angular.json": "angular",
+}
+
+
+def _stem_re(stem: str) -> "re.Pattern[str]":
+    return re.compile(r"(?<![a-z0-9])" + re.escape(stem)
+                      + r"(?![a-z0-9])")
+
+
+def _stem_hits(text: str,
+               table: Dict[str, Sequence[str]]) -> List[str]:
+    """Packs named by a stem table, best first: earliest match
+    position in the text, table order breaking ties."""
+    low = " " + str(text or "").lower() + " "
+    hits: List = []
+    for order, (pack, stems) in enumerate(table.items()):
+        positions = [m.start() for stem in stems
+                     for m in _stem_re(stem).finditer(low)]
+        if positions:
+            hits.append((min(positions), order, pack))
+    hits.sort()
+    return [pack for _, _, pack in hits]
+
+
+def _path_pack(path: str) -> Optional[str]:
+    name = str(path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if not name:
+        return None
+    if name.startswith("nuxt.config."):
+        return "nuxt"
+    if name in FILENAME_PACKS:
+        return FILENAME_PACKS[name]
+    dot = name.rfind(".")
+    if dot > 0:
+        return EXTENSION_PACKS.get(name[dot:])
+    return None
+
+
+def _expand_chains(packs: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    for pack in packs:
+        if pack not in out:
+            out.append(pack)
+        for chained in PACK_CHAINS.get(pack, ()):
+            if chained not in out:
+                out.append(chained)
+    return out
+
+
+def route_rule_packs(text: str,
+                     domains: Sequence[str] = (),
+                     paths: Sequence[str] = (),
+                     work: bool = False) -> List[str]:
+    """Priority-ordered pack names for this work input.
+
+    [] unless `work` is true or a coding/build domain is
+    present — the two-key rule. Explicit text signals outrank
+    path/extension signals, which outrank generic stems.
+    Chains follow their framework pack; duplicates appear
+    once. The annex loader enforces the size cap."""
+    if not work and not (set(domains or ()) & CODING_DOMAINS):
+        return []
+    chosen = _stem_hits(text, PACK_STEMS)
+    if not chosen:
+        for path in paths or ():
+            pack = _path_pack(path)
+            if pack and pack not in chosen:
+                chosen.append(pack)
+    if not chosen:
+        chosen = _stem_hits(text, GENERIC_PACK_STEMS)
+    return _expand_chains(chosen)

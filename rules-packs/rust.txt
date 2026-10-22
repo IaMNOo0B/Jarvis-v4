@@ -1,0 +1,17 @@
+## PACK: RUST (ECC se distilled)
+- Ownership pehle: borrow karo, clone sirf jab
+  sach-much zaroori. Unwrap production me NAHI —
+  ? + proper error types (lib me thiserror,
+  app me anyhow).
+- Clippy warnings = errors: cargo clippy --
+  -D warnings. cargo fmt.
+- Unsafe sirf chhote block me, SAFETY comment ke
+  saath, safe abstraction peeche.
+- Traits chhote; newtype se invalid state
+  unrepresentable banao.
+- Concurrency: Mutex/RwLock ya channels; data
+  race design se roko.
+- Secrets env se; input boundary par validate.
+- Tests: unit + integration (tests/); proptest
+  invariants par; cargo audit.
+Pura text: knowledge_search "ecc rules rust".

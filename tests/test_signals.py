@@ -16,7 +16,8 @@ class _Brain:
         self._reply = reply
         self._stopped = stopped
 
-    def respond(self, history, text, correction=False):
+    def respond(self, history, text, correction=False,
+                rules_annex=""):
         return SimpleNamespace(reply=self._reply,
                                stopped_reason=self._stopped,
                                tool_calls_made=[])

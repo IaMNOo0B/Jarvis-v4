@@ -1,0 +1,15 @@
+## PACK: GOLANG (ECC se distilled)
+- Errors wrap karo: fmt.Errorf("context: %w", err).
+  Sentinel errors errors.New se; check errors.Is
+  / errors.As se. Panic sirf unrecoverable par.
+- Har error handle karo — blank identifier se
+  discard NAHI. User ko safe message.
+- Interface consumer side define karo; chhoti
+  interfaces, composition. Receiver style ek
+  package me consistent rakho.
+- Goroutine leak rokna tumhari zimmedari:
+  context.Context har blocking call tak; defer
+  se resources hamesha band karo.
+- SQL hamesha parameterized; secrets env se.
+- Check: gofmt, go vet, go test -race ./...
+Pura text: knowledge_search "ecc rules golang".

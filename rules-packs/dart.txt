@@ -1,0 +1,15 @@
+## PACK: DART (ECC se distilled)
+- dart format hamesha (80 col). final/const pehle.
+- ! se bacho: ?. ?? ya pattern matching. Sealed
+  classes + exhaustive switch.
+- Errors: specific 'on' clauses; bare catch NAHI;
+  Error subtypes catch mat karo.
+- Futures: await karo ya unawaited() mark karo.
+  await ke baad context.mounted check (Flutter).
+- Layers: domain pure Dart — Flutter import NAHI;
+  repository interfaces; presentation use cases
+  ko call kare.
+- Secrets source me NAHI: --dart-define config,
+  tokens flutter_secure_storage me. HTTPS only.
+- Check: dart analyze; flutter test.
+Pura text: knowledge_search "ecc rules dart".

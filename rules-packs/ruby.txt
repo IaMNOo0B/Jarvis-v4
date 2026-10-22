@@ -1,0 +1,17 @@
+## PACK: RUBY (ECC se distilled)
+- Rails way pehle: conventions, binstubs
+  (bin/rails); frozen_string_literal project
+  convention par.
+- Controllers transport sirf. Domain models /
+  concerns / service objects me —
+  complexity par, ceremony ke liye NAHI.
+- Strong parameters mass assignment se pehle.
+  SQL parameterized; request values SQL string
+  me interpolate KABHI nahi.
+- Secrets Rails credentials/env se; plaintext
+  commit KABHI nahi. html_safe/raw sensitive —
+  default escape.
+- Rescue specific exceptions; broad rescue
+  re-raise ke saath hi.
+- Check: rubocop; brakeman; bin/rails test.
+Pura text: knowledge_search "ecc rules ruby".

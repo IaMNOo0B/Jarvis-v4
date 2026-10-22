@@ -1,0 +1,14 @@
+## PACK: TYPESCRIPT (ECC se distilled)
+- Zod schemas se runtime validation; types zod se
+  infer karo, haath se duplicate nahi.
+- any NAHI — unknown + type guards. Public API par
+  explicit types, private par inference chalega.
+- Immutability: spread se update, mutation nahi;
+  readonly / as const jahan sahi hai.
+- Errors typed classes me throw; catch me swallow
+  NAHI. async me try-catch hamesha.
+- Secrets code me kabhi nahi; env se, fail-fast.
+- Check: npx tsc --noEmit; eslint + prettier.
+- Tests: Vitest/Jest — behaviour, implementation
+  details nahi.
+Pura text: knowledge_search "ecc rules typescript".

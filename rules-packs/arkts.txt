@@ -1,0 +1,17 @@
+## PACK: ARKTS (ECC se distilled)
+- ArkTS strict TS subset hai — galti compile
+  error: any/unknown NAHI, explicit types.
+- NAHI chalta: structural typing, mapped/
+  conditional types, obj["field"], delete,
+  as const, typeof annotations.
+- Arrow functions hi; nested NAHI. Class fields
+  class body me, constructor me NAHI.
+- State sirf V2: @ComponentV2, @Local, @Param,
+  @Event, @Provider/@Consumer, @Computed.
+  V1 (@State/@Prop/@Link) NAHI.
+- Routing: Navigation + NavPathStack hi;
+  @ohos.router NAHI.
+- Permissions module.json5 me + runtime
+  request; denial par fallback. Secrets
+  Keystore me.
+Pura text: knowledge_search "ecc rules arkts".

@@ -1,0 +1,16 @@
+## PACK: WEB (ECC se distilled)
+- Design template-jaisa NAHI: pehle specific
+  direction chuno. Card-grid + gradient hero =
+  reject. Har surface par kam se kam 4: hierarchy,
+  rhythm, depth, typography, hover/focus states.
+- Semantic HTML pehle (header/main/footer);
+  div-stack sirf majboori me.
+- Tokens CSS custom properties me rakho.
+- Animation sirf compositor properties:
+  transform, opacity, clip-path. Images
+  width/height + lazy.
+- CWV salah: LCP <2.5s, INP <200ms, CLS <0.1.
+- Security: CSP nonce-based; unsanitized HTML
+  inject NAHI; HSTS/nosniff/DENY.
+- Tests: Playwright; a11y check.
+Pura text: knowledge_search "ecc rules web".

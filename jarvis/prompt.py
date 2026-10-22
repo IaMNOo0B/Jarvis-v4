@@ -218,13 +218,21 @@ def render_system(views: Sequence[ToolView],
                   desc_cap: Optional[int] = None,
                   memory_lines: Sequence[str] = (),
                   persona: str = PERSONA,
-                  protocol: str = PROTOCOL) -> str:
-    """The full system message: stable prefix, boundary, dynamic tail."""
+                  protocol: str = PROTOCOL,
+                  rules_annex: str = "") -> str:
+    """The full system message: stable prefix, boundary, dynamic tail.
+
+    The rules annex (distilled language-pack cards for a coding
+    turn) rides at the very end of the dynamic tail, after the
+    memory excerpts — per-turn data exactly like memory, so the
+    stable prefix stays byte-identical with or without it."""
     prefix = render_stable_prefix(views, desc_cap, persona, protocol)
     dynamic = ""
     if memory_lines:
         body = "\n".join(f"- {line}" for line in memory_lines)
         dynamic = f"\n\nMEMORY (from earlier sessions):\n{body}"
+    if rules_annex:
+        dynamic += "\n\n" + rules_annex
     return prefix + "\n" + BOUNDARY + dynamic
 
 
@@ -301,6 +309,7 @@ class AssembledPrompt:
     ladder_actions: List[str] = field(default_factory=list)
     dropped: int = 0                  # history messages compacted away
     summary: Optional[str] = None     # the summary text, when produced
+    rules_annex_included: bool = False  # a pack annex survived the ladder
 
 
 class PromptBuilder:
@@ -326,9 +335,11 @@ class PromptBuilder:
 
     def _attempt(self, history: List[Dict[str, Any]], user_text: str,
                  memory_lines: Sequence[str], desc_cap: Optional[int],
-                 compact: bool = False, names_only: bool = False):
+                 compact: bool = False, names_only: bool = False,
+                 rules_annex: str = ""):
         system = render_system(self.views, desc_cap, memory_lines,
-                               self.persona, self.protocol)
+                               self.persona, self.protocol,
+                               rules_annex=rules_annex)
         messages = [{"role": "system", "content": system}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_text})
@@ -342,23 +353,29 @@ class PromptBuilder:
     # -- the ladder ------------------------------------------------------
 
     def build(self, history: Sequence[Dict[str, Any]], user_text: str,
-              memory_lines: Sequence[str] = ()) -> AssembledPrompt:
+              memory_lines: Sequence[str] = (),
+              rules_annex: str = "") -> AssembledPrompt:
         hist = [dict(m) for m in (history or [])]
         actions: List[str] = []
         dropped_msgs: List[Dict[str, Any]] = []
+        annex = rules_annex or ""
 
         messages, tools, est = self._attempt(hist, user_text,
-                                             memory_lines, None)
+                                             memory_lines, None,
+                                             rules_annex=annex)
         if est <= self.soft_cap:
-            return AssembledPrompt(messages, tools, est, actions)
+            return AssembledPrompt(messages, tools, est, actions,
+                                   rules_annex_included=bool(annex))
 
         # (a) shrink tool descriptions — descriptions only, never tools.
         if self.views:
             messages, tools, est = self._attempt(hist, user_text,
-                                                 memory_lines, TOOL_DESC_CAP)
+                                                 memory_lines, TOOL_DESC_CAP,
+                                                 rules_annex=annex)
             actions.append(f"tool descriptions capped at {TOOL_DESC_CAP} chars")
             if est <= self.soft_cap:
-                return AssembledPrompt(messages, tools, est, actions)
+                return AssembledPrompt(messages, tools, est, actions,
+                                       rules_annex_included=bool(annex))
 
         # (a2) the schema diet — argument schemas in compact form
         # (names + types + required; trimmings dropped). Cheaper
@@ -366,10 +383,24 @@ class PromptBuilder:
         if self.views and est > self.soft_cap:
             messages, tools, est = self._attempt(
                 hist, user_text, memory_lines, TOOL_DESC_CAP,
-                compact=True)
+                compact=True, rules_annex=annex)
             actions.append("tool schemas compacted (names + types)")
             if est <= self.soft_cap:
-                return AssembledPrompt(messages, tools, est, actions)
+                return AssembledPrompt(messages, tools, est, actions,
+                                       rules_annex_included=bool(annex))
+
+        # (a3) drop the rules annex whole. The annex is advisory
+        # and re-derivable next turn; conversation history is
+        # not — so the annex goes BEFORE any history trimming.
+        if annex and est > self.soft_cap:
+            annex = ""
+            actions.append("dropped rules annex (budget)")
+            messages, tools, est = self._attempt(
+                hist, user_text, memory_lines, TOOL_DESC_CAP,
+                compact=True, rules_annex=annex)
+            if est <= self.soft_cap:
+                return AssembledPrompt(messages, tools, est, actions,
+                                       dropped=len(dropped_msgs))
 
         # (b) trim the history middle, halving what is droppable.
         while est > self.soft_cap and self._droppable(hist) > 0:
@@ -380,10 +411,11 @@ class PromptBuilder:
             actions.append(f"trimmed {n_drop} history message(s) from the middle")
             messages, tools, est = self._attempt(
                 hist, user_text, memory_lines, TOOL_DESC_CAP,
-                compact=True)
+                compact=True, rules_annex=annex)
             if est <= self.soft_cap:
                 return AssembledPrompt(messages, tools, est, actions,
-                                       dropped=len(dropped_msgs))
+                                       dropped=len(dropped_msgs),
+                                       rules_annex_included=bool(annex))
 
         # (c) summarize: still over the soft cap with only head+tail
         # left — fold everything except the head and the freshest two
@@ -403,7 +435,7 @@ class PromptBuilder:
                            "message(s) into one summary")
             messages, tools, est = self._attempt(
                 hist, user_text, memory_lines, TOOL_DESC_CAP,
-                compact=True)
+                compact=True, rules_annex=annex)
         else:
             dropped_count = len(dropped_msgs)
 
@@ -426,13 +458,13 @@ class PromptBuilder:
                                "bodies (last resort)")
                 messages, tools, est = self._attempt(
                     trimmed, user_text, memory_lines,
-                    TOOL_DESC_CAP, compact=True)
+                    TOOL_DESC_CAP, compact=True, rules_annex=annex)
             if est > self.hard_budget and memory_lines:
                 actions.append("dropped memory excerpts "
                                "(last resort)")
                 messages, tools, est = self._attempt(
                     trimmed, user_text, (), TOOL_DESC_CAP,
-                    compact=True)
+                    compact=True, rules_annex=annex)
 
         # (e) the names-only floor — the state this pipeline
         # provably ran in before schemas were wired: every tool
@@ -445,7 +477,7 @@ class PromptBuilder:
                            "(final floor before refusing)")
             messages, tools, est = self._attempt(
                 trimmed, user_text, (), TOOL_DESC_CAP,
-                names_only=True)
+                names_only=True, rules_annex=annex)
 
         # (f) fold the head too: everything except the freshest
         # two messages goes into the summary. The head was kept
@@ -460,18 +492,22 @@ class PromptBuilder:
                            "into the summary (final floor)")
             messages, tools, est = self._attempt(
                 hist_f, user_text, (), TOOL_DESC_CAP,
-                names_only=True)
+                names_only=True, rules_annex=annex)
 
         return self._finish(messages, tools, est, actions,
-                            dropped_count, summary)
+                            dropped_count, summary,
+                            rules_annex_included=bool(annex))
 
-    def _finish(self, messages, tools, est, actions, dropped, summary):
+    def _finish(self, messages, tools, est, actions, dropped, summary,
+                rules_annex_included: bool = False):
         if est > self.hard_budget:
             raise PromptBudgetError(
                 f"prompt needs ~{est} tokens even after compaction "
                 f"(hard budget {self.hard_budget}); refusing to send an "
                 "over-budget prompt")
-        return AssembledPrompt(messages, tools, est, actions, dropped, summary)
+        return AssembledPrompt(messages, tools, est, actions, dropped,
+                               summary,
+                               rules_annex_included=rules_annex_included)
 
 
 __all__ = [

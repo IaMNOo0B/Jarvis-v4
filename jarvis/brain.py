@@ -484,7 +484,8 @@ class Brain:
     # -- main entry ------------------------------------------------------------
 
     def respond(self, history: Sequence[Dict[str, Any]], user_text: str,
-                *, correction: bool = False) -> BrainResult:
+                *, correction: bool = False,
+                rules_annex: str = "") -> BrainResult:
         hist = [dict(m) for m in (history or [])]
         is_correction = bool(correction)
         # History-flag form: the current turn rides at the end of
@@ -498,7 +499,8 @@ class Brain:
             self._capture_golden_pair(hist, user_text)
 
         assembled = self._builder.build(hist, user_text,
-                                        self._memory_lines(user_text))
+                                        self._memory_lines(user_text),
+                                        rules_annex=rules_annex)
         if assembled.ladder_actions:
             self._log("brain.compaction",
                       {"actions": assembled.ladder_actions,
@@ -508,7 +510,9 @@ class Brain:
                 self._remember(assembled.summary)
         self._log("brain.turn", {"user": str(user_text)[:200],
                                  "estimate": assembled.estimate,
-                                 "correction": is_correction})
+                                 "correction": is_correction,
+                                 "rules_annex_included":
+                                     assembled.rules_annex_included})
 
         messages = list(assembled.messages)
         tools = assembled.tools

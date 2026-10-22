@@ -1,0 +1,15 @@
+## PACK: ANGULAR (ECC se distilled)
+- Pehle version check (ng version). Kaam ke
+  baad ng build.
+- Standalone components + OnPush default. DI ke
+  liye inject() — constructor injection NAHI.
+- Signals: derived state computed se; effect()
+  sirf side effects ke liye.
+- Services saara data own karte hain; component
+  me HttpClient NAHI. Cleanup takeUntilDestroyed.
+- Templates: @for me track hamesha; logic
+  template me NAHI — methods/pipes me.
+- bypassSecurityTrust* user input par NAHI.
+  Restricted routes par guard (canMatch pehle).
+- Tests: TestBed + HttpTestingController.
+Pura text: knowledge_search "ecc rules angular".

@@ -1,0 +1,15 @@
+## PACK: REACT-NATIVE (ECC se distilled)
+- Screens patle: hooks + presentational
+  components; bhari logic hooks me.
+- StyleSheet.create module scope par; render me
+  inline style objects NAHI. Tokens ek theme me.
+- Lists: FlatList/FlashList + stable keyExtractor;
+  ScrollView me badi list map NAHI.
+- Bundle public hai — secrets KABHI nahi. Tokens
+  expo-secure-store me, AsyncStorage me NAHI.
+- Deep-link params + API responses Zod se
+  boundary par validate karo.
+- Interactive elements: accessibilityRole +
+  label; touch target kam se kam 44pt.
+- Check: tsc --noEmit; expo lint; Jest tests.
+Pura text: knowledge_search "ecc rules react-native".

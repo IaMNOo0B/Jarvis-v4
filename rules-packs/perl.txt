@@ -1,0 +1,16 @@
+## PACK: PERL (ECC se distilled)
+- Modern Perl: use v5.36 (strict, warnings,
+  signatures). @_ manual unpack NAHI.
+- Moo with is => 'ro' + Types::Standard; blessed
+  hashrefs seedhe KABHI nahi.
+- Web par taint mode (-T). %ENV saaf
+  kiye bina external command NAHI.
+- Three-arg open hamesha (autodie ke saath);
+  system() list-form hi — backticks variable
+  interpolation ke saath KABHI nahi.
+- SQL: DBI placeholders sirf. Untaint whitelist
+  regex se — /(.*)/ kabhi nahi. Path traversal
+  realpath check se roko.
+- Export @EXPORT_OK hi. cpanfile + carton.
+- Check: perltidy; perlcritic; prove -l t/.
+Pura text: knowledge_search "ecc rules perl".

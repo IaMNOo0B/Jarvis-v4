@@ -1,0 +1,16 @@
+## PACK: NUXT (ECC se distilled)
+- Pehle nuxt.config.ts dekho: srcDir/aliases
+  project ke hisaab se hote hain.
+- Data: first paint par useFetch/useAsyncData;
+  $fetch sirf client interactions ke liye.
+- Shared state useState('key') se; module scope
+  par ref export KABHI nahi — SSR requests ke
+  beech leak.
+- runtimeConfig.public client ko dikhta hai —
+  secrets sirf root keys me; app.config.ts me
+  secret KABHI nahi.
+- Server routes: readValidatedBody /
+  getValidatedQuery se validate; raw body par
+  bharosa NAHI. Server $fetch me user URL = SSRF.
+- Tests: @nuxt/test-utils. Check: nuxi build.
+Pura text: knowledge_search "ecc rules nuxt".

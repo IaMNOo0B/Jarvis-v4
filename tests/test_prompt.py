@@ -110,3 +110,76 @@ def test_summarize_dropped_is_deterministic():
             {"role": "assistant", "content": "ye jawab tha"}]
     assert summarize_dropped(msgs) == summarize_dropped(msgs)
     assert "2 earlier message(s)" in summarize_dropped(msgs)
+
+
+# ---------------------------------------------------------------------------
+# Rules annex (ECC rules install): pack cards ride the DYNAMIC
+# tail only; the ladder drops the annex whole (step a3) before
+# it ever touches history.
+# ---------------------------------------------------------------------------
+
+def _python_annex():
+    from pathlib import Path as _Path
+
+    import jarvis.rules as _rules
+    root = _Path(__file__).resolve().parent.parent
+    return _rules.load_rule_packs(root, ["python"])
+
+
+def test_rules_annex_below_dynamic_boundary():
+    annex = _python_annex()
+    assert "PEP 8" in annex
+    plain = render_system(_tools(), memory_lines=["fact one"])
+    with_annex = render_system(_tools(), memory_lines=["fact one"],
+                               rules_annex=annex)
+    p1, t1 = split_stable(plain)
+    p2, t2 = split_stable(with_annex)
+    assert p1 == p2                    # prefix byte-identical
+    assert "PEP 8" not in t1
+    assert "PEP 8" in t2               # card below the boundary
+    # The annex rides AFTER the memory excerpts.
+    assert t2.index("fact one") < t2.index("PEP 8")
+
+
+def test_rules_annex_absent_by_default():
+    system = render_system(_tools())
+    assert "PACK:" not in system
+    out = PromptBuilder(_tools()).build([], "hi")
+    assert out.rules_annex_included is False
+    assert "PACK:" not in out.messages[0]["content"]
+
+
+def test_ladder_drops_annex_before_history():
+    views = _tools()
+    history = []
+    for i in range(6):
+        role = "user" if i % 2 == 0 else "assistant"
+        history.append({"role": role,
+                        "content": f"baat {i} " + "lafz " * 40})
+    probe = PromptBuilder(views, soft_cap=10 ** 9,
+                          hard_budget=10 ** 9)
+    base = probe.build(history, "aakhri sawal")
+    # A soft cap the plain build fits but the annexed build
+    # does not: the annex alone must absorb the difference.
+    b = PromptBuilder(views, soft_cap=base.estimate + 5,
+                      hard_budget=4000)
+    out = b.build(history, "aakhri sawal",
+                  rules_annex=_python_annex())
+    assert any("dropped rules annex" in a
+               for a in out.ladder_actions)
+    assert out.rules_annex_included is False
+    assert "PACK:" not in out.messages[0]["content"]
+    # History was never trimmed — head and tail survive whole.
+    assert not any("trimmed" in a for a in out.ladder_actions)
+    contents = [str(m.get("content", "")) for m in out.messages]
+    assert any("baat 0" in c for c in contents)
+    assert any("baat 5" in c for c in contents)
+
+
+def test_annex_survives_when_budget_allows():
+    b = PromptBuilder(_tools())
+    out = b.build([], "python script likho",
+                  rules_annex=_python_annex())
+    assert out.rules_annex_included is True
+    assert not any("annex" in a for a in out.ladder_actions)
+    assert "PEP 8" in out.messages[0]["content"]

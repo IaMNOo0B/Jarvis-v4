@@ -1,0 +1,16 @@
+## PACK: CPP (ECC se distilled)
+- Modern C++ (17/20): RAII har jagah — raw new/
+  delete NAHI. unique_ptr default; shared_ptr
+  sirf sach-much shared par.
+- Rule of Zero pehle; destructor/copy/move me
+  se ek custom chahiye to paanchon (Rule of 5).
+- Buffer safety: std::string/array/vector;
+  strcpy, sprintf, malloc KABHI nahi. Bounds
+  par .at() use karo.
+- Errors: exceptions exceptional par; optional
+  missing value, expected expected failure par.
+- Har variable initialize; overflow/dangling
+  UB hai — sanitizers CI me.
+- Check: clang-format; clang-tidy + cppcheck;
+  cmake + ctest (ASan/UBSan).
+Pura text: knowledge_search "ecc rules cpp".

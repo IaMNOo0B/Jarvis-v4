@@ -1,0 +1,16 @@
+## PACK: FSHARP (ECC se distilled)
+- Immutability default; mutable sirf measure ki
+  hui wajah par. Records with expression se.
+- Modeling: discriminated unions states ke liye,
+  single-case unions wrappers ke liye; classes
+  sirf interop par.
+- Option null ki jagah; Result expected failures
+  ke liye (railway pipeline). Exceptions control
+  flow ke liye NAHI.
+- Pipe |> pipelines; if/else ki jagah pattern
+  matching.
+- Boundary par validated types (single-case
+  DU) — invalid input domain me ghuse hi na.
+- Secrets code/config me NAHI. SQL parameterized.
+- Check: dotnet test; fantomas chalao.
+Pura text: knowledge_search "ecc rules fsharp".

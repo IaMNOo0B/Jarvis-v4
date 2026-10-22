@@ -1,0 +1,16 @@
+## PACK: REACT (ECC se distilled)
+- Function components hi; naye code me class NAHI.
+  Props param me destructure; .tsx JSX, .ts logic.
+- Hooks sirf top level, unconditional. Derived
+  state render me compute karo — useEffect uske
+  liye NAHI. Har subscription ka cleanup.
+- Memo/useCallback sirf jahan identity matter
+  kare.
+- Server Component default (Next.js); "use client"
+  sirf state/effects/browser par.
+- dangerouslySetInnerHTML = review rukawat: pehle
+  DOMPurify sanitize ya text render. List keys
+  stable, index NAHI.
+- Tests: Testing Library, role/label,
+  userEvent. Check: build + lint.
+Pura text: knowledge_search "ecc rules react".

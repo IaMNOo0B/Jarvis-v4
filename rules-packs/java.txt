@@ -1,0 +1,16 @@
+## PACK: JAVA (ECC se distilled)
+- Java 21: records immutable data ke liye; sealed
+  classes closed hierarchies, pattern
+  matching switch exhaustive.
+- Optional sirf return types me, params/fields
+  me NAHI. Boundary par requireNonNull.
+- Exceptions specific; generic catch NAHI,
+  swallow NAHI. Resources
+  try-with-resources se hi.
+- Immutability pehle: final fields, defensive
+  copies, unmodifiable collections return karo.
+- Concurrency: ExecutorService / virtual threads;
+  shared state synchronize ya hata do.
+- SQL parameterized; secrets env se. Check:
+  ./mvnw verify ya ./gradlew check.
+Pura text: knowledge_search "ecc rules java".

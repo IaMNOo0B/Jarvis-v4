@@ -1,0 +1,14 @@
+## PACK: PYTHON (ECC se distilled)
+- Style: PEP 8, 4-space indent, public functions par type
+  annotations; black + ruff + mypy saaf; imports stdlib,
+  third-party, local kram me.
+- Shape: data ke liye dataclasses, resources ke liye
+  context managers, silent fallback ki jagah explicit
+  exceptions.
+- Tests: pytest, AAA shape, edge cases parametrize,
+  fixtures conftest me; coverage target 80% (pack
+  standard — salah hai, gate nahi).
+- Security: bandit saaf; input par eval/exec kabhi nahi;
+  secrets env/keyring se, code me kabhi nahi; SQL hamesha
+  parameterized.
+Pura text: knowledge_search "ecc rules python".

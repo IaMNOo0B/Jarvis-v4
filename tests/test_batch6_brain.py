@@ -161,7 +161,8 @@ def test_turn_survives_prompt_budget_error(tmp_path):
     calls = {"n": 0}
 
     class RaisingBrain:
-        def respond(self, history, text, correction=False):
+        def respond(self, history, text, correction=False,
+                    rules_annex=""):
             calls["n"] += 1
             if history:
                 raise PromptBudgetError("too big")

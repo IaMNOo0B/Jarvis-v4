@@ -1,0 +1,16 @@
+## PACK: SWIFT (ECC se distilled)
+- let pehle; struct value semantics default —
+  class sirf jab identity/reference sach-much
+  zaroori ho.
+- Swift 6 strict concurrency: Sendable boundaries
+  par; shared mutable state actors me, haath ke
+  locks NAHI. Structured concurrency pehle.
+- Typed throws + pattern matching; force unwrap /
+  force try production me NAHI.
+- Protocol-oriented: chhote protocols; DI
+  protocol injection se.
+- Secrets Keychain me — UserDefaults me KABHI
+  nahi, source me nahi. ATS band NAHI.
+- Check: swift build; SwiftLint/SwiftFormat;
+  tests Swift Testing (@Test, #expect).
+Pura text: knowledge_search "ecc rules swift".
