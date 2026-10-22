@@ -473,6 +473,129 @@ def _app_root(parts) -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+AUTOMATION_MANIFEST = {
+    "name": "core.automations",
+    "version": "1.0.0",
+    "tools": [
+        {"name": "create_automation",
+         "op": "create_automation",
+         "permission": "tasks.delegate",
+         "schema": {"type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "title": {"type": "string"},
+                        "steps": {"type": "array"},
+                        "params": {"type": "array"}},
+                    "required": ["name", "steps"],
+                    "additionalProperties": False}},
+        {"name": "list_automations",
+         "op": "list_automations",
+         "permission": "tasks.delegate",
+         "schema": {"type": "object", "properties": {},
+                    "additionalProperties": False}},
+        {"name": "run_automation",
+         "op": "run_automation",
+         "permission": "tasks.delegate",
+         "schema": {"type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1},
+                        "params": {"type": "object"},
+                        "start_step": {"type": "integer",
+                                       "minimum": 0}},
+                    "required": ["name"],
+                    "additionalProperties": False}},
+        {"name": "delete_automation",
+         "op": "delete_automation",
+         "permission": "tasks.delegate",
+         "destructive": True,
+         "schema": {"type": "object",
+                    "properties": {
+                        "name": {"type": "string", "minLength": 1}},
+                    "required": ["name"],
+                    "additionalProperties": False}},
+    ],
+}
+
+_META_TOOLS = ("create_automation", "run_automation",
+               "delete_automation")
+
+
+def _automation_ops(holder, data_dir):
+    """Saved routes for repeated work (jarvis/automations.py):
+    the brain composes a route once — steps of real tools,
+    {{params}} for the parts that change — and later runs it
+    on command. Steps dispatch normally, so a destructive
+    step files its confirmation card and the route pauses
+    there instead of sneaking past the gate."""
+
+    def _book():
+        from .automations import AutomationBook
+        return AutomationBook(data_dir)
+
+    def create_automation(name: str, title: str = "",
+                          steps=None, params=None):
+        parts = holder.get("parts")
+        if parts is None:
+            return {"ok": False,
+                    "error": "automations abhi taiyaar nahi, sir"}
+        from .automations import validate_steps
+        known = {t["name"] for t in
+                 parts.registry.advertised_tools(parts.allowances)}
+        known -= set(_META_TOOLS)
+        err = validate_steps(steps, known)
+        if err:
+            return {"ok": False, "error": err}
+        row, err = _book().create(name, title or name,
+                                  steps, params or [])
+        if err:
+            return {"ok": False, "error": err}
+        return {"ok": True, "automation": row["name"],
+                "title": row["title"], "steps": len(steps),
+                "params": row["params"],
+                "message": f"Route ban gaya, sir — agli baar "
+                           f"run_automation(name={row['name']!r}) "
+                           "se ye kaam seedha chalega."}
+
+    def list_automations():
+        return {"ok": True, "automations": _book().list()}
+
+    def run_automation(name: str, params=None, start_step: int = 0):
+        parts = holder.get("parts")
+        if parts is None:
+            return {"ok": False,
+                    "error": "automations abhi taiyaar nahi, sir"}
+        book = _book()
+        auto = book.get(name)
+        if auto is None:
+            return {"ok": False,
+                    "error": f"{name!r} naam ka automation nahi "
+                             "mila — list_automations me dekho, "
+                             "sir"}
+        for step in auto.get("steps") or []:
+            if step.get("tool") in _META_TOOLS:
+                return {"ok": False,
+                        "error": "is route me automation wala "
+                                 "tool hai — route ke andar route "
+                                 "nahi chalega, sir"}
+        from .automations import run_steps
+        report = run_steps(parts.dispatch, auto, params or {},
+                           start_step or 0)
+        book.note_run(auto["name"], str(report.get("status", "")))
+        return report
+
+    def delete_automation(name: str):
+        if _book().remove(name):
+            return {"ok": True, "deleted": name}
+        return {"ok": False,
+                "error": f"{name!r} naam ka automation nahi "
+                         "mila, sir"}
+
+    return {"create_automation": create_automation,
+            "list_automations": list_automations,
+            "run_automation": run_automation,
+            "delete_automation": delete_automation}
+
+
 def _forge_ops(holder, data_dir):
     """build_feature (jarvis/forge.py): hukum par JARVIS khud
     naya feature banata hai — pehle research (saboot ke saath),
@@ -2745,6 +2868,10 @@ TOOL_STATES = {
     "delegate_task": "creating",
     "delegate_tasks": "creating",
     "run_mission": "creating",
+    "create_automation": "creating",
+    "list_automations": "working",
+    "run_automation": "working",
+    "delete_automation": "working",
     "pc_info": "working",
     "process_list": "working",
     "window_list": "working",
@@ -3465,6 +3592,15 @@ def build_app(data_dir, *, chain=None, modules=None,
                            {"error": f"{type(exc).__name__}: {exc}"})
     if hasattr(registry, "register") and hasattr(registry, "approve"):
         try:
+            registry.register(AUTOMATION_MANIFEST,
+                              ops=_automation_ops(parts_holder,
+                                                  data_dir))
+            registry.approve(AUTOMATION_MANIFEST["name"])
+        except Exception as exc:  # a sibling got there first, etc.
+            journal.append("chat.automation_skill_skipped",
+                           {"error": f"{type(exc).__name__}: {exc}"})
+    if hasattr(registry, "register") and hasattr(registry, "approve"):
+        try:
             registry.register(MAIL_MANIFEST,
                               ops=_mail_ops(secrets, data_dir))
             registry.approve(MAIL_MANIFEST["name"])
@@ -4161,6 +4297,22 @@ class ChatApp:
             return self.confirm_card(
                 parts_cmd[1].strip() if len(parts_cmd) > 1 else "",
                 approve=False)
+        if text == "/automations":
+            from .automations import AutomationBook
+            rows = AutomationBook(self.data_dir).list()
+            if not rows:
+                return ("Koi automation nahi bana abhi, sir — "
+                        "jo kaam baar-baar hota hai, mujhe use "
+                        "route bana kar rakhne ko kahiye.")
+            lines = ["Saved automations, sir:"]
+            for r in rows:
+                lines.append(
+                    f"🤖 {r['name']} — {r['title']} "
+                    f"({r['steps']} kadam"
+                    + (f", params: {', '.join(r['params'])}"
+                       if r["params"] else "")
+                    + f", {r['runs']} baar chala)")
+            return "\n".join(lines)
         if text == "/cards":
             pending = self.pending_confirmations()
             if not pending:

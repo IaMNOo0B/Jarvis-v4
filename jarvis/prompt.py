@@ -125,14 +125,14 @@ class ToolView:
                 {"type": "object", "properties": {}}
             if compact:
                 params = compact_schema(params)
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": desc,
-                "parameters": params,
-            },
-        }
+        fn: Dict[str, Any] = {"name": self.name,
+                              "parameters": params}
+        if desc:
+            # An empty description key is ~17 chars of nothing,
+            # paid once per tool per request — omit it; every
+            # consumer reads description with .get().
+            fn["description"] = desc
+        return {"type": "function", "function": fn}
 
 
 def tool_view(schema: Any) -> ToolView:
