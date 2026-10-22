@@ -37,7 +37,9 @@
   bhi zinda rehta hai — kuch delete nahi hota. Koi tool
   fail ho to system khud dusra/purana raasta aazmata hai;
   jawab me 'served_by' aaye to maalik ko batao kis
-  raaste se kaam hua.
+  raaste se kaam hua. Aur bada sawaal/research ho to ek
+  raasta nahi — search_all se SAARE raaste ek saath
+  chalao: taaqat jod kar, bade scale par.
 - AUTOMATION: saved routes tumhare apne istemal ke hain —
   malik command nahi dega. Kaam kisi saved route se mail
   khaye to wahi chalega (system khud pehchan kar chalata

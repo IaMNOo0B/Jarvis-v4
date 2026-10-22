@@ -1492,8 +1492,16 @@ RESEARCH_MANIFEST = {
                                   "depth": {"type": "integer",
                                             "minimum": 1, "maximum": 2}},
                    "required": ["topic"],
-                   "additionalProperties": False},
-    }],
+                   "additionalProperties": False}},
+        {"name": "search_all",
+         "op": "search_all",
+         "permission": "net.outbound",
+         "schema": {"type": "object",
+                    "properties": {"query": {"type": "string",
+                                             "minLength": 1}},
+                    "required": ["query"],
+                    "additionalProperties": False}},
+    ],
 }
 
 
@@ -2022,13 +2030,18 @@ def _research_op(learned: LearnedStore):
         if int(depth) >= 2:
             angles += [f"{topic} tutorial step by step",
                        f"{topic} common mistakes"]
+        # Upgraded engine (the original was serial): every
+        # angle searches AT ONCE and every page is read AT
+        # ONCE — same tool, same contract, combined power.
+        from .fanout import run_parallel
+        angle_jobs = {f"angle{i}": (lambda q=q:
+                                    bs.op_web_search(q, limit=5))
+                      for i, q in enumerate(angles)}
+        oks, fails = run_parallel(angle_jobs, timeout=45)
         seen, sources = set(), []
-        search_errors = []
-        for query in angles:
-            found = bs.op_web_search(query, limit=5)
-            if "error" in found:
-                search_errors.append(found["error"])
-            for hit in found.get("results", []):
+        search_errors = [fails[k] for k in sorted(fails)]
+        for i in range(len(angles)):
+            for hit in oks.get(f"angle{i}", {}).get("results", []):
                 if hit["url"] not in seen:
                     seen.add(hit["url"])
                     sources.append(hit)
@@ -2037,11 +2050,15 @@ def _research_op(learned: LearnedStore):
                              f"ho paya — {search_errors[0]}",
                     "sources_found": 0, "fetch_failed": 0}
         page_cap = 4 if int(depth) <= 1 else 8
-        read, failed = [], 0
-        for src in sources[:page_cap]:
-            page = bs.op_web_fetch(src["url"], max_chars=6000)
-            if "error" in page:
-                failed += 1
+        chosen = sources[:page_cap]
+        fetch_jobs = {src["url"]: (lambda u=src["url"]:
+                                   bs.op_web_fetch(u, max_chars=6000))
+                      for src in chosen}
+        pages, fetch_fails = run_parallel(fetch_jobs, timeout=45)
+        read, failed = [], len(fetch_fails)
+        for src in chosen:
+            page = pages.get(src["url"])
+            if not page:
                 continue
             read.append({"title": src["title"], "url": src["url"],
                          "text": page["text"]})
@@ -2070,6 +2087,71 @@ def _research_op(learned: LearnedStore):
                              for it in read]}
 
     return deep_research
+
+
+def _search_all_op():
+    """The fan-out tool: EVERY search route fires at once —
+    web search, GitHub, Wikipedia, and the real browser's own
+    view — and the findings merge into one digest. A route
+    that fails is named in routes_failed and never sinks the
+    others (ye nahi to woh — at full scale, all at once)."""
+    def search_all(query: str):
+        from . import builtin_skills as bs
+        from .fanout import merge_hits, run_parallel
+        q = str(query).strip()
+
+        def github():
+            data = bs.op_github_search(q, limit=5)
+            if data.get("error"):
+                return data
+            return {"results": [{
+                "title": r.get("name", ""), "url": r.get("url", ""),
+                "snippet": ((r.get("description") or "")
+                            + (f" (stars: {r['stars']})"
+                               if r.get("stars") else ""))}
+                for r in data.get("repos", [])]}
+
+        def wiki():
+            data = bs.op_wikipedia(q)
+            if data.get("error") or data.get("ok") is False:
+                return {"error": data.get(
+                    "error", "wikipedia par kuch nahi mila")}
+            return {"results": [{
+                "title": data.get("title", ""), "url": data.get("url", ""),
+                "snippet": (data.get("extract") or "")[:300]}]}
+
+        def browser():
+            page = bs.op_search_browser(q)
+            if page.get("error"):
+                return page
+            return {"excerpt": str(page.get("text")
+                                   or page.get("content")
+                                   or "")[:1500]}
+
+        oks, failures = run_parallel({
+            "web_search": lambda: bs.op_web_search(q, limit=6),
+            "github": github,
+            "wikipedia": wiki,
+            "real_browser": browser,
+        }, timeout=30)
+        route_hits = [(name, oks[name].get("results", []))
+                      for name in ("web_search", "github", "wikipedia")
+                      if name in oks]
+        out = {"ok": False, "query": q,
+               "routes_used": sorted(oks),
+               "routes_failed": [{"route": n, "error": e}
+                                 for n, e in sorted(failures.items())],
+               "results": merge_hits(route_hits, cap=12)}
+        if "real_browser" in oks and oks["real_browser"].get("excerpt"):
+            out["browser_view"] = oks["real_browser"]["excerpt"]
+        out["ok"] = bool(out["results"] or out.get("browser_view"))
+        if not out["ok"]:
+            out["error"] = ("search_all: saare raaste fail — "
+                            + "; ".join(f"{n}: {e}" for n, e in
+                                        sorted(failures.items())))[:300]
+        return out
+
+    return search_all
 
 
 NOTIFY_MANIFEST = {
@@ -2921,6 +3003,7 @@ TOOL_STATES = {
     "web_scrape": "researching", "search_browser": "researching",
     "web_fetch_tor": "researching", "learn_url": "researching",
     "deep_research": "researching", "knowledge_search": "researching",
+    "search_all": "researching",
     "watch_for_upgrades": "researching", "upgrade_report": "researching",
     "create_project": "creating", "run_code": "creating",
     "write_file": "creating", "learn_text": "creating",
@@ -3502,7 +3585,9 @@ def build_app(data_dir, *, chain=None, modules=None,
         try:
             registry.register(RESEARCH_MANIFEST,
                               ops={"deep_research":
-                                   _research_op(learned)})
+                                   _research_op(learned),
+                                   "search_all":
+                                   _search_all_op()})
             registry.approve(RESEARCH_MANIFEST["name"])
         except Exception as exc:  # a sibling got there first, etc.
             journal.append("chat.research_skill_skipped",
