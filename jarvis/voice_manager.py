@@ -118,8 +118,10 @@ class VoiceManager(VoiceEvents):
         for t in self._threads:
             t.start()
         self.session.start()
-        self._set_activity("listening" if self.gate.awake
-                           else "standby")
+        # Voice on = JARVIS is listening (for the wake word if
+        # not awake, for speech if awake). Standby comes from
+        # the Activity idle rule or from stop(), never early.
+        self._set_activity("listening")
         return True, "Voice is on, sir."
 
     def stop(self):
@@ -293,16 +295,20 @@ class VoiceManager(VoiceEvents):
         self._turn_played = 0
         latency = self.io.output_latency if self.io else 0.20
         self._tail_until = self._clock() + latency + TAIL_MARGIN_S
-        self._set_activity(
-            "listening" if (self.gate and self.gate.awake)
-            else "standby")
+        # A spoken turn ends into listening, awake or not —
+        # the mic is still JARVIS's ear. The word decays to
+        # standby only through the Activity idle rule.
+        self._set_activity("listening")
 
     def _watch_loop(self):
         while self.active:
             time.sleep(2.0)
-            if self.gate is not None and self.gate.check_sleep() \
-                    and not self.speaking:
-                self._set_activity("standby")
+            if self.gate is not None:
+                # The gate's own sleep bookkeeping; the state
+                # WORD is the Activity idle rule's business
+                # now (standby after 120s of silence), so the
+                # watch loop no longer forces it early.
+                self.gate.check_sleep()
 
     def _set_activity(self, state: str):
         if self.activity is not None:

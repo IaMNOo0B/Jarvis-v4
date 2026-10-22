@@ -699,6 +699,9 @@ class StubProvider:
                 break
         text = ("I am running on the offline stub provider — no AI brain "
                 "is reachable right now, so I cannot truly answer. "
+                "Dimag wapas laane ke liye: Settings (⚙) me apni "
+                "Gemini key daalo, ya Ollama start karo, phir "
+                "dobara bolo. "
                 f"(You said: {last_user[:120]})")
         return ProviderReply(text=text, tool_calls=[], model=self.model,
                              usage={}, provider=self.name)

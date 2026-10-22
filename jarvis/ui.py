@@ -169,7 +169,7 @@ PAGE = """<!DOCTYPE html>
   </div>
   <div id="npanel"></div>
   <div id="spanel">
-    <div class="stitle">⚙ API KEYS — ek key set karo, JARVIS restart ke baad woh brain kaam karega. Key kabhi screen par wapas nahi dikhti.</div>
+    <div class="stitle">⚙ API KEYS — ek key set karo, naya brain usi waqt chalu ho jayega (restart nahi chahiye). Key kabhi screen par wapas nahi dikhti.</div>
     <div id="presetRows"></div>
     <div class="stitle" style="margin-top:10px">Naya provider (OpenAI-compatible):</div>
     <div class="srow">
@@ -261,7 +261,12 @@ PAGE = """<!DOCTYPE html>
   async function pollFx() {
     try {
       const r = await fetch('/api/state');
-      setFx(await r.json());
+      const s = await r.json();
+      // The state WORD follows reality at all times — voice
+      // included. It used to refresh only during typed
+      // turns, so it sat on "Standby" while JARVIS spoke.
+      showState(s.activity);
+      setFx(s);
     } catch (e) { /* decoration only */ }
   }
   setInterval(pollFx, 700);
@@ -943,14 +948,18 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                     else:
                         reply = app.turn(text)
                 finally:
-                    # With voice on, the resting word is the voice's
-                    # own truth (listening/speaking), not standby.
+                    # The resting word after a turn is Listening
+                    # — JARVIS is waiting for the owner's next
+                    # input. Standby arrives only through the
+                    # Activity idle rule (120s of silence), per
+                    # the owner's order; it is never snapped on
+                    # at the end of a reply.
                     v = app.voice_status()
                     if v.get("active"):
                         app.activity.set("speaking" if v.get(
                             "speaking") else "listening")
                     else:
-                        app.activity.set("standby")
+                        app.activity.set("listening")
             self._json(200, {"reply": reply,
                              "provider": app.last_provider})
 

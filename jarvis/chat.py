@@ -48,6 +48,7 @@ import argparse
 import importlib
 import json
 import os
+import shutil
 import re
 import sys
 import threading
@@ -66,7 +67,52 @@ from .idempotency import business_key as _idem_business_key
 from .journal import Journal
 from .memory import Memory
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+def _dir_has_content(path: Path) -> bool:
+    try:
+        return path.is_dir() and any(path.iterdir())
+    except OSError:
+        return False
+
+
+def _stable_data_dir() -> Path:
+    """The per-user home for JARVIS's data — deliberately NOT
+    inside the app folder. The owner installs every new build
+    into a FRESH folder, and on his PC the keys live in a
+    local file inside the data dir (no keyring backend), so
+    an app-folder data dir meant every download arrived
+    amnesiac: no keys, no memory, brain on the stub. Data
+    that lives with the USER survives every reinstall."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(
+            Path.home() / "AppData" / "Local")
+        return Path(base) / "JarvisV4"
+    return Path.home() / ".jarvis-v4"
+
+
+def _resolve_data_dir(legacy: Path, stable: Path) -> Path:
+    """Where the app's data lives. A stable dir that already
+    holds data wins. Otherwise a legacy app-folder data dir
+    with content is COPIED over once (the owner's keys,
+    memory, automations and builds all move house), and the
+    stable dir is used from then on. A failed copy falls
+    back to the legacy dir — data where it is beats no
+    data at all."""
+    if _dir_has_content(stable):
+        return stable
+    if _dir_has_content(legacy):
+        try:
+            shutil.copytree(legacy, stable, dirs_exist_ok=True)
+            return stable
+        except Exception:
+            return legacy
+    return stable
+
+
+DEFAULT_DATA_DIR = _resolve_data_dir(
+    Path(__file__).resolve().parent.parent / "data",
+    Path(os.environ["JARVIS_DATA_DIR"])
+    if os.environ.get("JARVIS_DATA_DIR")
+    else _stable_data_dir())
 
 # See module docstring.
 DEFAULT_ALLOWANCES = frozenset({
@@ -2798,9 +2844,11 @@ def set_provider(secrets, data_dir, name: str, key: str,
     - a NEW name + base URL + model -> a custom provider: the key
       goes to the secret store under its own name, and the
       provider joins config["providers"], which build_chain
-      already reads. Either way the reply never contains the key,
-      and the chain picks the provider up on the next start (the
-      chain is built at startup — the same rule /key follows)."""
+      already reads. Either way the reply never contains the
+      key. ChatApp rebuilds the chain live after a successful
+      set (see _rebuild_chain), so the provider serves the
+      next turn — the restart wording below is only the
+      fallback for when a live rebuild could not run."""
     name = str(name or "").strip().lower()
     key = str(key or "").strip()
     if not name or not key:
@@ -3405,15 +3453,39 @@ class Activity:
     States: standby (waiting), thinking (brain generating), researching
     (a knowledge/net tool is executing), creating (a making tool is
     executing), working (any other tool). Listening/Speaking do not
-    exist until the voice feature does — no fake states, ever."""
+    exist until the voice feature does — no fake states, ever.
 
-    def __init__(self):
-        self.state = "standby"
+    The owner's idle rule (2026-10-22): Standby is EARNED by
+    silence — the word falls to standby only after IDLE_AFTER_S
+    seconds with no fresh activity. Mid-conversation pauses
+    keep the last true state (Listening after a reply, most
+    often); an explicit set("standby") — voice off, a real
+    stop — still lands immediately."""
+
+    IDLE_AFTER_S = 120.0
+
+    def __init__(self, clock=None):
+        self._clock = clock or time.monotonic
+        self._state = "standby"
+        self._at = 0.0
         self.tool = None
 
+    @property
+    def state(self):
+        if self._state != "standby" and \
+                self._clock() - self._at > self.IDLE_AFTER_S:
+            return "standby"
+        return self._state
+
+    @state.setter
+    def state(self, value):
+        self._state = value
+        self._at = self._clock()
+
     def set(self, state, tool=None):
-        self.state = state
+        self._state = state
         self.tool = tool
+        self._at = self._clock()
 
 
 TOOL_STATES = {
@@ -4221,11 +4293,17 @@ def build_app(data_dir, *, chain=None, modules=None,
         except Exception:
             goodput = GoodputLedger()
 
+    _app_built = chain is None
     if chain is None:
         chain = _build_chain(_resolve_module(modules, "providers"),
                              config, _ChainSecrets(secrets), goodput)
 
     chain = _BrainChainAdapter(chain)
+    if _app_built:
+        # Only an app-built chain may be rebuilt live when a
+        # key is filed (ChatApp._rebuild_chain) — an injected
+        # chain belongs to its injector (tests, the harness).
+        chain._app_built = True
 
     skills_mod = _resolve_module(modules, "skills")
     refused_exc = getattr(skills_mod, "DispatchRefused", ())
@@ -4674,10 +4752,45 @@ class ChatApp:
     def provider_settings(self) -> dict:
         return provider_settings(self.secrets, self.data_dir)
 
+    def _rebuild_chain(self) -> bool:
+        """Rebuild the brain chain from the CURRENT secrets and
+        config, live — a key filed a second ago serves the very
+        next turn, no restart. (The owner filed a key, kept
+        talking, and met the stub: the chain used to be built
+        once at startup and keys joined only on the next
+        launch.) Only the app-built chain is rebuilt; an
+        injected chain (tests, the eval harness) is left
+        exactly as it was."""
+        if not getattr(self.chain, "_app_built", False):
+            return False
+        try:
+            from . import providers as providers_mod
+            built = _build_chain(providers_mod, self.config,
+                                 _ChainSecrets(self.secrets),
+                                 self.parts.goodput)
+            new_chain = _BrainChainAdapter(built)
+            new_chain._app_built = True
+        except Exception:
+            return False
+        self.chain = new_chain
+        self.parts.chain = new_chain
+        if getattr(self, "brain", None) is not None:
+            self.brain.chain = new_chain
+        try:
+            self.journal.append("settings.chain_rebuilt", {})
+        except Exception:
+            pass
+        return True
+
     def set_provider(self, name: str, key: str, base_url: str = "",
                      model: str = "") -> dict:
         out = set_provider(self.secrets, self.data_dir, name, key,
                            base_url=base_url, model=model)
+        if out.get("ok") and self._rebuild_chain():
+            out = dict(out)
+            out["note"] = ("key set ho gayi, sir — naya brain "
+                           "abhi se chalu hai, restart nahi "
+                           "chahiye")
         try:
             self.journal.append(
                 "settings.provider_set",
@@ -5102,8 +5215,9 @@ class ChatApp:
                 saved = keys_mod.add_key(self.secrets, raw, provider)
             except keys_mod.KeysError as exc:
                 return f"That key was not stored, sir: {exc}"
-            return (f"Key stored for {saved}, sir. Restart JARVIS and "
-                    "it joins the brain chain.")
+            self._rebuild_chain()
+            return (f"Key stored for {saved}, sir — naya brain "
+                    "abhi se chalu hai, restart nahi chahiye.")
         if text == "/voice" or text.startswith("/voice "):
             arg = text[len("/voice"):].strip().lower()
             if arg in ("off", "stop"):
