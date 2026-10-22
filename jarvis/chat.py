@@ -1533,6 +1533,33 @@ def _task_log(data_dir, row: dict) -> None:
         pass
 
 
+_EFFORT_ACTION_WORDS = ("kar", "bana", "likh", "khoj", "search",
+                        "check", "bhej", "khol", "band", "run",
+                        "chalao", "download", "create", "make",
+                        "find", "set")
+_EFFORT_STEP_MARKERS = (" phir ", "uske baad", "aur phir",
+                        "pehle ", "step", "ek ek karke", "sab ")
+
+
+def _effort_for(text: str):
+    """How much computation does this turn deserve?
+    (level, max_rounds, max_tool_calls) — deterministic and
+    small on purpose: a greeting must not burn a mission's
+    budget, and a multi-step job must not starve at the
+    default. This is the brain sizing its own effort before
+    it spends — the owner's 'kitne calculations, khud tay
+    karo' order, mechanized."""
+    t = " " + str(text or "").lower() + " "
+    actions = sum(1 for w in _EFFORT_ACTION_WORDS
+                  if f" {w}" in t or f"{w} " in t)
+    steps = sum(1 for m in _EFFORT_STEP_MARKERS if m in t)
+    if len(t) > 300 or steps >= 2 or actions >= 4:
+        return "heavy", 5, 20
+    if len(t) < 70 and actions <= 1 and steps == 0:
+        return "light", 2, 8
+    return "normal", 3, 12
+
+
 def _delegated_summary(parts, task_text: str) -> str:
     """Run one autonomous work order on a fresh Brain over the
     shared chain/dispatch/journal/memory and return its summary.
@@ -2980,7 +3007,8 @@ def _run_guarded(ledger, session_id, name, args, execute, journal):
 
 def make_dispatch(gate, registry, journal, allowances,
                   pass_decision=False, refused_exc=(), ledger=None,
-                  session_id="", approval_sink=None):
+                  session_id="", approval_sink=None,
+                  calibrator=None):
     """The gate-mediated dispatch every tool call flows through.
 
     Journals tool.call (with the gate verdict) and tool.result — the
@@ -3065,8 +3093,48 @@ def make_dispatch(gate, registry, journal, allowances,
         journal.append("tool.result", entry)
         return result
 
+    def _learn_outcome(name, result):
+        """The self-calibration feed (the owner's order: the
+        brain decides from probabilities it computed from its
+        own life). Every real execution outcome — success or
+        failure — is recorded in the Calibrator under the
+        tool's domain and resolved on the spot from what
+        ACTUALLY happened. Over time each domain's calibrated
+        reliability is JARVIS's own lived record, and the
+        act/verify/ask policy reads it before autonomous
+        runs. Gate decisions are not execution outcomes and
+        are never learned from; learning can never break a
+        dispatch."""
+        if calibrator is None or not isinstance(result, dict):
+            return
+        if result.get("gate_denied") or result.get("needs_approval"):
+            return
+        try:
+            tool = registry._tools.get(name) \
+                if hasattr(registry, "_tools") else None
+            domain = getattr(tool, "skill", "") or f"tool.{name}"
+            if domain == "core.calibration":
+                return
+            row = calibrator.record(domain, f"{name} chalega",
+                                    0.7)
+            # Success means what the rest of the system means
+            # by it — many ops return a bare payload with no
+            # "ok" key at all (time_now gives {iso, unix});
+            # _result_ok is that shared definition.
+            calibrator.resolve(row["id"], _result_ok(result))
+        except Exception:
+            pass
+
     def dispatch(name, args=None, origin="owner",
                  approved_decision=None, _depth=0):
+        result = _dispatch_routed(name, args, origin,
+                                  approved_decision, _depth)
+        if _depth == 0:
+            _learn_outcome(name, result)
+        return result
+
+    def _dispatch_routed(name, args=None, origin="owner",
+                         approved_decision=None, _depth=0):
         """One call, with the owner's route doctrine on top:
         the latest route runs first; on an honest failure the
         preserved older/alternate route is TRIED — never
@@ -3087,8 +3155,8 @@ def make_dispatch(gate, registry, journal, allowances,
         if not fallback:
             return result
         try:
-            alt = dispatch(fallback, args, origin=origin,
-                           _depth=_depth + 1)
+            alt = _dispatch_routed(fallback, args, origin=origin,
+                                   _depth=_depth + 1)
         except Exception:
             return result
         if isinstance(alt, dict) and _result_ok(alt):
@@ -3357,6 +3425,7 @@ TOOL_STATES = {
     "build_task": "creating",
     "watch_for_upgrades": "researching", "upgrade_report": "researching",
     "create_project": "creating", "run_code": "creating",
+    "run_shell": "creating",
     "write_file": "creating", "learn_text": "creating",
     "propose_skill": "creating",
     "email_send": "sending", "email_draft": "writing",
@@ -4172,7 +4241,8 @@ def build_app(data_dir, *, chain=None, modules=None,
                       pass_decision=pass_decision,
                       refused_exc=refused_exc, ledger=ledger,
                       session_id=session_id,
-                      approval_sink=_card_book.add),
+                      approval_sink=_card_book.add,
+                      calibrator=calibrator),
         activity)
     tool_schemas = registry.advertised_tools(allowances)
     # The ONE rules file (the owner's standing order): the brain's
@@ -5184,6 +5254,27 @@ class ChatApp:
             row, trigger = hits[0]
             if len(hits) == 1 and not creating \
                     and not (row.get("params") or []):
+                # The calibration gate on autonomous runs:
+                # when this domain's lived reliability is low,
+                # JARVIS does not silently self-run — it asks.
+                # (Missions carry the same gate in their judge
+                # loop; this is the automations' share.)
+                pol = self.calibrator.policy(
+                    "core.automations", 0.7)
+                self.journal.append("autonomy.gate", {
+                    "where": "automation", "name": row["name"],
+                    "action": pol["action"],
+                    "calibrated": pol["calibrated"]})
+                if pol["action"] == "ask":
+                    return (None,
+                            f"[Automation note: '{row['name']}' "
+                            "naam ka saved route mila tha, "
+                            "lekin automations ki calibrated "
+                            f"reliability kam hai "
+                            f"({pol['calibrated']:.2f}) — khud "
+                            "nahi chalaya. Owner ko ye batao "
+                            "aur poochho route chalayen ya "
+                            "kaam haath se karein.]")
                 report = run_steps(self.parts.dispatch, row, {})
                 book.note_run(row["name"],
                               str(report.get("status", "")))
@@ -5311,6 +5402,21 @@ class ChatApp:
         # every turn — the view is the clone's, the chain is
         # always the app's current one.
         clone.chain = self.brain.chain
+        # Effort budget — the brain decides how much
+        # computation this turn deserves (the owner's order:
+        # kitne calculations, khud tay karo). A short question
+        # gets a light brain; a multi-step job gets room to
+        # work. The choice is journaled, never silent.
+        level, rounds, calls = _effort_for(text)
+        clone.max_rounds = rounds
+        clone.max_tool_calls = calls
+        if level != "normal":
+            try:
+                self.journal.append("brain.effort", {
+                    "level": level, "rounds": rounds,
+                    "max_tool_calls": calls})
+            except Exception:
+                pass
         return clone
 
     def turn(self, user_text: str) -> str:

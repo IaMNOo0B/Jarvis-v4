@@ -630,6 +630,7 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                                  "confirmations":
                                      app.pending_confirmations(),
                                  "builds": app.list_builds(),
+                                 "incognito": bool(app.incognito),
                                  "notifications":
                                      _unread_count(app.data_dir)})
                 return

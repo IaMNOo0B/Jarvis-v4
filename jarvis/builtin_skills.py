@@ -674,6 +674,52 @@ def op_run_code(code: str, timeout: int = 30, cwd: str = ""):
             "stderr": proc.stderr[-3000:], "cwd": str(workdir)}
 
 
+def op_run_shell(command: str, timeout: int = 30, cwd: str = ""):
+    """Run ONE shell command in the terminal — the coding
+    agent's hands (Antigravity parity: editor + terminal +
+    browser). Windows runs PowerShell, everywhere else sh.
+    Same rails as run_code: scrubbed environment, hard
+    timeout, honest exit code and output tails. The gate
+    (code.run) decides who may call this; the knowledge
+    pack (knowledge/linux-terminal.md) teaches JARVIS how
+    to drive a shell well."""
+    cmd = str(command or "").strip()
+    if not cmd:
+        return {"error": "run_shell: khali command"}
+    if str(cwd).strip():
+        workdir = Path(str(cwd)).expanduser()
+    else:
+        workdir = Path(tempfile.mkdtemp(prefix="jarvis-shell-"))
+    try:
+        workdir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return {"error": f"run_shell failed: "
+                         f"{type(exc).__name__}: {exc}"}
+    if os.name == "nt":
+        argv = ["powershell", "-NoProfile", "-NonInteractive",
+                "-Command", cmd]
+    else:
+        argv = ["/bin/sh", "-c", cmd]
+    limit = max(1, min(int(timeout), 120))
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True,
+            timeout=limit, env=_scrubbed_env(),
+            cwd=str(workdir))
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "cwd": str(workdir),
+                "error": f"run_shell timed out after {limit}s "
+                         "— command rok di gayi"}
+    except OSError as exc:
+        return {"error": f"run_shell failed: "
+                         f"{type(exc).__name__}: {exc}"}
+    return {"ok": proc.returncode == 0,
+            "exit_code": proc.returncode,
+            "stdout": proc.stdout[-6000:],
+            "stderr": proc.stderr[-3000:],
+            "cwd": str(workdir)}
+
+
 def op_create_project(path: str, files: list):
     """Create a project folder from [{path, content}, ...] — the
     'build it' half of the code skill. Paths may not escape the
@@ -1113,6 +1159,21 @@ CODE_MANIFEST = {
                        "additionalProperties": False},
         },
         {
+            "name": "run_shell",
+            "op": "run_shell",
+            "permission": "code.run",
+            "schema": {"type": "object",
+                       "properties": {
+                           "command": {"type": "string",
+                                       "minLength": 1},
+                           "timeout": {"type": "integer",
+                                       "minimum": 1,
+                                       "maximum": 120},
+                           "cwd": {"type": "string"}},
+                       "required": ["command"],
+                       "additionalProperties": False},
+        },
+        {
             "name": "create_project",
             "op": "create_project",
             "permission": "files.write",
@@ -1313,6 +1374,7 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
                            "write_file": op_write_file})
     registry.register(CODE_MANIFEST,
                       ops={"run_code": op_run_code,
+                           "run_shell": op_run_shell,
                            "create_project": op_create_project})
     registry.register(BROWSER_MANIFEST,
                       ops={"browser_launch": op_browser_launch,
