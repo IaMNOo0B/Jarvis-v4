@@ -485,7 +485,8 @@ AUTOMATION_MANIFEST = {
                         "name": {"type": "string", "minLength": 1},
                         "title": {"type": "string"},
                         "steps": {"type": "array"},
-                        "params": {"type": "array"}},
+                        "params": {"type": "array"},
+                        "triggers": {"type": "array"}},
                     "required": ["name", "steps"],
                     "additionalProperties": False}},
         {"name": "list_automations",
@@ -533,7 +534,7 @@ def _automation_ops(holder, data_dir):
         return AutomationBook(data_dir)
 
     def create_automation(name: str, title: str = "",
-                          steps=None, params=None):
+                          steps=None, params=None, triggers=None):
         parts = holder.get("parts")
         if parts is None:
             return {"ok": False,
@@ -546,15 +547,16 @@ def _automation_ops(holder, data_dir):
         if err:
             return {"ok": False, "error": err}
         row, err = _book().create(name, title or name,
-                                  steps, params or [])
+                                  steps, params or [],
+                                  triggers=triggers)
         if err:
             return {"ok": False, "error": err}
         return {"ok": True, "automation": row["name"],
                 "title": row["title"], "steps": len(steps),
                 "params": row["params"],
                 "message": f"Route ban gaya, sir — agli baar "
-                           f"run_automation(name={row['name']!r}) "
-                           "se ye kaam seedha chalega."}
+                           "ye kaam bolo ge to JARVIS khud "
+                           "pehchan kar chala dega."}
 
     def list_automations():
         return {"ok": True, "automations": _book().list()}
@@ -4576,6 +4578,129 @@ class ChatApp:
                 f"nahi paya, sir: "
                 f"{str(result.get('error', result))[:300]}")
 
+    # -- automations: JARVIS uses them itself -----------------
+
+    def _automation_pre_brain(self, text: str):
+        """Before the brain: does a saved route own this job?
+        The owner's standing order — no commands, JARVIS
+        recognizes and runs it itself. Exactly one match with
+        no params runs mechanically and its report IS the
+        reply; a card-pause also completes the turn (the card
+        is the owner's to approve); anything else becomes a
+        hint inside the brain's turn, and a failed mechanical
+        run falls through to the brain — mechanical route
+        first, thinking route as its fallback."""
+        try:
+            from .automations import (AutomationBook,
+                                      match_automations,
+                                      run_steps)
+            book = AutomationBook(self.data_dir)
+            rows = book.all()
+            if not rows:
+                return None, None
+            low = " " + str(text).lower() + " "
+            if any(w in low for w in (" mat ", "ruk jao",
+                                      "band kar do")):
+                return None, None
+            hits = match_automations(rows, text)
+            if not hits:
+                return None, None
+            creating = any(w in low for w in ("banao", "bana do",
+                                              "create", "save kar"))
+            row, trigger = hits[0]
+            if len(hits) == 1 and not creating \
+                    and not (row.get("params") or []):
+                report = run_steps(self.parts.dispatch, row, {})
+                book.note_run(row["name"],
+                              str(report.get("status", "")))
+                self.journal.append("automation.auto_run", {
+                    "name": row["name"], "trigger": trigger,
+                    "status": report.get("status")})
+                if report.get("status") == "done":
+                    return (f"🤖 Automation '{row['name']}' khud "
+                            f"chala diya, sir — "
+                            f"{len(report.get('completed') or [])}"
+                            " kadam poore hue.", None)
+                if report.get("status") == "waiting_approval":
+                    card = report.get("card") or {}
+                    return (f"🤖 Automation '{row['name']}' "
+                            f"chalaya, par kadam "
+                            f"{report.get('stopped_at_step')} par "
+                            f"confirmation card ban gaya hai "
+                            f"({card.get('summary', '')}). "
+                            "Manzoor kar dein to route wahi se "
+                            "aage badhega — /cards dekhein, sir.",
+                            None)
+                return None, (f"automation '{row['name']}' "
+                              "chalane ki koshish nakam rahi: "
+                              f"{report.get('error')} — ab tum "
+                              "khud auzaaron se ye kaam karo.")
+            hint_rows = hits[:2]
+            desc = "; ".join(
+                f"'{r['name']}' (params: "
+                f"{', '.join(r.get('params') or []) or 'koi nahi'})"
+                for r, _ in hint_rows)
+            return None, (f"in saved automations me se is kaam "
+                          f"ke liye bana hai: {desc} — "
+                          "run_automation se chalao, params is "
+                          "sandesh se bhar kar. Naya route tabhi "
+                          "banao jab koi mail na khaye.")
+        except Exception:
+            return None, None
+
+    def _automation_auto_create(self, text: str, result):
+        """After a brain turn: a job that took >= 3 successful
+        tool calls has shown its shape. The SECOND time the
+        same shape shows up, it has earned a route — save it
+        (owner's words lifted into {{params}}), and say so in
+        one line. One-off jobs never become routes."""
+        try:
+            records = [r for r in
+                       (getattr(result, "tool_calls_made", None)
+                        or [])
+                       if getattr(r, "ok", False)]
+            if len(records) < 3:
+                return None
+            banned = {"delegate_task", "delegate_tasks",
+                      "run_mission", "delegate_team",
+                      "build_feature"} | set(_META_TOOLS)
+            if any(r.tool in banned for r in records):
+                return None
+            from .automations import (AutomationBook,
+                                      parameterize_steps,
+                                      signature_of)
+            steps = [{"tool": r.tool, "args": dict(r.args or {})}
+                     for r in records]
+            steps, params = parameterize_steps(steps, text)
+            sig = signature_of(steps)
+            book = AutomationBook(self.data_dir)
+            for row in book.all():
+                if row.get("signature") == sig:
+                    return None      # the route already exists
+            if book.note_seen(sig) < 2:
+                return None          # pehli dafa — sirf gin lo
+            trigger = " ".join(str(text).lower().split())[:80]
+            if len(trigger) < 10:
+                return None
+            base = records[0].tool.split("_")[0]
+            name = f"auto-{base}-{sig[:4]}"
+            row, err = book.create(
+                name, f"Khud bana route: {trigger[:50]}",
+                steps, params, triggers=[trigger],
+                origin="auto")
+            if err:
+                return None
+            self.journal.append("automation.auto_created",
+                                {"name": row["name"],
+                                 "signature": sig})
+            return (f"🤖 Ye kaam doosri dafa hua, isliye iska "
+                    f"route bana kar rakh diya hai "
+                    f"('{row['name']}') — agli baar ye bolne par "
+                    "ye khud chal jayega. /automations me "
+                    "dikhega, sir.")
+        except Exception:
+            return None
+
     def _brain_for(self, text: str):
         """Route-then-specialize for the main turn: a cached
         sibling brain that sees only the domains this message
@@ -4640,18 +4765,31 @@ class ChatApp:
         stopped_reason = "completed"
         if correction is None:
             reply = self._fast_path(text, incognito=self.incognito)
+        auto_hint = None
+        auto_ran = False
+        if reply is None and correction is None \
+                and not self.incognito:
+            reply, auto_hint = self._automation_pre_brain(text)
+            auto_ran = reply is not None
         if reply is not None:
-            via = "fast_path"
-            self.last_provider = "fast-path"
+            via = "automation" if auto_ran else "fast_path"
+            self.last_provider = "automation" if auto_ran \
+                else "fast-path"
         else:
             rows_before = len(self.goodput.to_rows())
+            brain_text = text if not auto_hint else (
+                text + "\n[Automation note: " + auto_hint + "]")
             result = self._brain_for(text).respond(
-                self._brain_history(), text,
+                self._brain_history(), brain_text,
                 correction=bool(correction))
             reply = str(result.reply)
             stopped_reason = str(
                 getattr(result, "stopped_reason", "completed"))
             via = "brain"
+            if not self.incognito:
+                note = self._automation_auto_create(text, result)
+                if note:
+                    reply = reply + "\n\n" + note
             rows = self.goodput.to_rows()
             if len(rows) > rows_before:
                 self.last_provider = str(rows[-1]["provider"])

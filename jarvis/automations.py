@@ -65,6 +65,86 @@ def render(value: Any, params: Dict[str, Any]) -> Any:
     return value
 
 
+def derive_triggers(name: str, title: str) -> List[str]:
+    """Default trigger phrases for a route: its title said
+    plainly, and its name with spaces. Matching is phrase-
+    based — one stray word never fires a route."""
+    out = []
+    for phrase in (str(title or "").strip().lower(),
+                   str(name or "").replace("-", " ").strip()):
+        if phrase and phrase not in out:
+            out.append(phrase)
+    return out
+
+
+def match_automations(rows: List[Dict], text: str):
+    """[(row, trigger)] for every route whose trigger phrase
+    appears in the text — most specific (longest) first. A
+    trigger must be a real phrase (>= 8 chars or >= 2 words):
+    routes fire on intent, never on one stray word."""
+    low = " " + str(text or "").lower() + " "
+    hits = []
+    for row in rows or []:
+        triggers = row.get("triggers") or derive_triggers(
+            row.get("name", ""), row.get("title", ""))
+        for trig in triggers:
+            t = str(trig).strip().lower()
+            if not t:
+                continue
+            if len(t) < 8 and len(t.split()) < 2:
+                continue
+            if t in low:
+                hits.append((row, t))
+                break
+    hits.sort(key=lambda h: -len(h[1]))
+    return hits
+
+
+def signature_of(steps) -> str:
+    """A route's fingerprint: the tool sequence + static args
+    (placeholders normalized away). Two jobs with the same
+    signature are the same job."""
+    import hashlib
+    norm = []
+    for step in steps or []:
+        args = _PLACEHOLDER.sub("{{}}", json.dumps(
+            step.get("args", {}), ensure_ascii=False,
+            sort_keys=True, default=str))
+        norm.append((step.get("tool", ""), args))
+    return hashlib.sha256(
+        json.dumps(norm, ensure_ascii=False).encode(
+            "utf-8")).hexdigest()[:16]
+
+
+def parameterize_steps(steps, user_text: str):
+    """Lift the owner's own words out of a finished job's args
+    into {{params}}: any string value that appears verbatim
+    in what the owner said becomes a slot. Returns
+    (new_steps, param_names)."""
+    text = str(user_text or "")
+    params: List[str] = []
+    slots: Dict[str, str] = {}
+
+    def lift(value):
+        if isinstance(value, str):
+            if len(value) >= 4 and value in text:
+                if value not in slots:
+                    name = f"p{len(params) + 1}"
+                    slots[value] = name
+                    params.append(name)
+                return "{{" + slots[value] + "}}"
+            return value
+        if isinstance(value, dict):
+            return {k: lift(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [lift(v) for v in value]
+        return value
+
+    return ([{"tool": s.get("tool", ""),
+              "args": lift(s.get("args", {}))} for s in steps],
+            params)
+
+
 def validate_steps(steps, known_tools) -> Optional[str]:
     """Creation-time honesty: a route may only name tools that
     exist, and every placeholder it uses must be declared.
@@ -106,9 +186,41 @@ class AutomationBook:
         except Exception:
             pass
 
+    def all(self) -> List[Dict]:
+        return self._rows()
+
+    def seen_count(self, signature: str) -> int:
+        """How often a job-signature has been observed (the
+        repetition ledger behind auto-creation: a job earns
+        its route the SECOND time it shows up)."""
+        path = self.path.with_name("automations_seen.json")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return int((data or {}).get(signature, 0))
+        except Exception:
+            return 0
+
+    def note_seen(self, signature: str) -> int:
+        path = self.path.with_name("automations_seen.json")
+        with self._lock:
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                data = {}
+            data[signature] = int(data.get(signature, 0)) + 1
+            try:
+                path.write_text(json.dumps(data),
+                                encoding="utf-8")
+            except Exception:
+                pass
+            return data[signature]
+
     def create(self, name: str, title: str, steps: List[Dict],
-               params: List[str]) -> Tuple[Optional[Dict],
-                                           Optional[str]]:
+               params: List[str], triggers: List[str] = None,
+               origin: str = "manual") -> Tuple[Optional[Dict],
+                                                 Optional[str]]:
         slug = re.sub(r"[^a-z0-9_-]+", "-",
                       str(name or "").strip().lower()).strip("-")
         if not slug:
@@ -133,6 +245,10 @@ class AutomationBook:
                    "title": str(title or slug),
                    "steps": steps,
                    "params": list(params or []),
+                   "triggers": list(triggers) if triggers
+                   else derive_triggers(slug, title or slug),
+                   "origin": origin,
+                   "signature": signature_of(steps),
                    "created": time.time(), "runs": 0,
                    "last_status": ""}
             rows.append(row)
