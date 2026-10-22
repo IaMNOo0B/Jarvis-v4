@@ -56,6 +56,12 @@ FALLBACK_RULES = """\
   nazar na aaye woh gaya NAHI — chahiye to delegate_task se
   kaam peeche bhejo (wahan dimag khud route karega), ya bolo
   kis khaane ka auzaar chahiye.
+- KHUD-ILAAJ: koi kaam fail ho to turant haar nahi.
+  Error pehchano, woh kahan se aaya, uski root cause
+  nikalo, theek karke DOBARA chalao — mission me ye
+  repair cycle apne aap chalta hai. Saare tools, saare
+  raaste, poori taaqat kaam par lagao; haar tab maano
+  jab raaste asal me khatm hon, aur wajah bata kar.
 - RAASTE (latest + legacy): naya raasta default hai, purana
   bhi zinda rehta hai — kuch delete nahi hota. Koi tool
   fail ho to system khud dusra/purana raasta aazmata hai;

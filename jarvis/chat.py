@@ -1715,6 +1715,53 @@ def _mission_check(parts, goal: str, log) -> dict:
     return {"state": "continue", "confidence": 0.5, "note": ""}
 
 
+def _mission_repair(parts, goal: str, log, failure: str) -> dict:
+    """The mission's doctor — the self-healing law: when a
+    step fails, do not just retry blindly and do not give up.
+    A fresh no-tools Brain performs the root-cause analysis:
+    WHAT the error is, WHERE it comes from, WHY it really
+    happened — then prescribes retry (with a concrete
+    instruction for what to do differently), skip, or abort.
+    Any failure of the doctor itself defaults to one honest
+    retry, so a sick doctor never kills a mission either."""
+    from .brain import Brain
+    steps = "\n".join(f"{s['step']}. {s['summary']}"
+                      for s in log[-6:])
+    prompt = (
+        f"MISSION GOAL: {goal}\nAb tak ke kadam:\n{steps}\n"
+        f"NAKAMI: {failure}\n"
+        "Tum doctor ho, judge nahi. Is nakami ki teh tak jao: "
+        "error kya hai, woh kahan se aa raha hai (origin), aur "
+        "uski ASAL root cause kya hai. Phir ilaaj chuno: "
+        "retry (dobara koshish — instruction me saaf likho is "
+        "baar kya ALAG karna hai: dusra tool, dusra raasta, "
+        "theek args), skip (ye kadam chhod kar aage badhna "
+        "behtar hai), abort (raasta asal me band hai).\n"
+        'Reply ONLY with JSON: {"error": "...", "origin": '
+        '"...", "root_cause": "...", "strategy": '
+        '"retry|skip|abort", "instruction": "..."}')
+    try:
+        brain = Brain(parts.chain, [], parts.dispatch,
+                      parts.journal, parts.memory)
+        out = brain.respond([], prompt)
+        parsed = _json_from_reply(str(out.reply))
+        if isinstance(parsed, dict) and parsed.get("strategy") in (
+                "retry", "skip", "abort"):
+            return {"error": str(parsed.get("error", ""))[:200],
+                    "origin": str(parsed.get("origin", ""))[:200],
+                    "root_cause": str(
+                        parsed.get("root_cause", ""))[:240],
+                    "strategy": parsed["strategy"],
+                    "instruction": str(
+                        parsed.get("instruction", ""))[:240]}
+    except Exception:
+        pass
+    return {"error": failure[:200], "origin": "",
+            "root_cause": failure[:240], "strategy": "retry",
+            "instruction": "wahi kadam ek baar aur, dhyaan se — "
+                           "pichhli galti dohrana mat"}
+
+
 def _run_mission_app(parts, data_dir, mission_id: str,
                      goal: str, max_steps: int) -> None:
     """Autopilot, app-side: worker = the delegated brain,
@@ -1770,7 +1817,9 @@ def _run_mission_app(parts, data_dir, mission_id: str,
             lambda g, log: _mission_check(parts, g, log),
             max_steps=max_steps,
             should_stop=lambda: _is_stopped(data_dir),
-            on_step=on_step)
+            on_step=on_step,
+            repair_fn=lambda g, log, f: _mission_repair(
+                parts, g, log, f))
     except Exception as exc:
         outcome = {"goal": goal, "state": "stuck",
                    "note": f"mission crash: "
@@ -1796,10 +1845,16 @@ def _run_mission_app(parts, data_dir, mission_id: str,
                          "steps": outcome["steps"]})
     icons = {"done": "✅", "stuck": "⛔", "owner": "🙋",
              "budget": "⏳", "stopped": "⏸"}
+    repair_note = ""
+    if outcome.get("repairs"):
+        causes = "; ".join(
+            r["root_cause"] for r in outcome["repairs"][:3])
+        repair_note = (f"\nRepairs: {outcome['repairs_made']} "
+                       f"(root cause: {causes})")
     _notify(data_dir, f"Mission {outcome['state']}",
             f"{icons.get(outcome['state'], '•')} Goal: "
             f"{goal[:120]}\nKadam: {outcome['steps_taken']} — "
-            f"{outcome['note']}", kind="mission")
+            f"{outcome['note']}{repair_note}", kind="mission")
     try:
         parts.journal.append("mission.done",
                              {"id": mission_id,
