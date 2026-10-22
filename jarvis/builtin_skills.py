@@ -742,20 +742,106 @@ def op_browser_status():
 
 
 def op_open_app(name: str):
-    """Launch an application by name. Real on Windows; honest refusal
-    (as a result, not an exception) where no driver exists."""
-    if sys.platform == "win32":
+    """Launch an application by name — FOUR routes, tried in
+    order (the options rule: ye nahi to woh): os.startfile,
+    direct spawn, PowerShell Start-Process, and finally the
+    Start-menu AppsFolder lookup by display name. Real on
+    Windows; honest refusal where no driver exists."""
+    if sys.platform != "win32":
+        return {"error": f"driver not present on this OS "
+                         f"({sys.platform}): open_app can only "
+                         f"launch {name!r} on Windows"}
+    try:
+        os.startfile(name)  # noqa: S606 — owner's own machine
+        return {"launched": name, "route": "startfile"}
+    except (OSError, AttributeError):
+        pass
+    try:
+        subprocess.Popen([name])  # noqa: S603 — same reasoning
+        return {"launched": name, "route": "spawn"}
+    except OSError:
+        pass
+    from jarvis.pc import run_ps
+    out = run_ps(f"Start-Process '{str(name).replace(chr(39), chr(39) * 2)}'")
+    if not out.get("error"):
+        return {"launched": name, "route": "powershell"}
+    # Last route: the Start menu's own catalog (Get-StartApps).
+    lookup = run_ps(
+        "$a = Get-StartApps | Where-Object {$_.Name -like "
+        f"'*{str(name).replace(chr(39), chr(39) * 2)}*'}} | "
+        "Select-Object -First 1; if ($a) { $a.AppID }")
+    app_id = (lookup.get("stdout") or "").strip()
+    if app_id and not lookup.get("error"):
         try:
-            os.startfile(name)  # noqa: S606 — owner's own machine, his app
-            return {"launched": name}
-        except (OSError, AttributeError):
-            try:
-                subprocess.Popen([name])  # noqa: S603 — same reasoning
-                return {"launched": name}
-            except OSError as exc:
-                return {"error": f"open_app failed to launch {name!r}: {exc}"}
-    return {"error": f"driver not present on this OS ({sys.platform}): "
-                     f"open_app can only launch {name!r} on Windows"}
+            os.startfile(f"shell:AppsFolder\\{app_id}")
+            return {"launched": name, "route": "appsfolder",
+                    "app_id": app_id}
+        except OSError:
+            pass
+    return {"error": f"open_app failed to launch {name!r} — "
+                     "chaaron raaste band mile, sir"}
+
+
+# -- the PC domain library (jarvis/pc.py) -------------------------
+
+def op_pc_info():
+    from jarvis.pc import op_pc_info as _f
+    return _f()
+
+
+def op_process_list(name: str = ""):
+    from jarvis.pc import op_process_list as _f
+    return _f(name)
+
+
+def op_window_list():
+    from jarvis.pc import op_window_list as _f
+    return _f()
+
+
+def op_disk_usage():
+    from jarvis.pc import op_disk_usage as _f
+    return _f()
+
+
+def op_battery_status():
+    from jarvis.pc import op_battery_status as _f
+    return _f()
+
+
+def op_clipboard_read():
+    from jarvis.pc import op_clipboard_read as _f
+    return _f()
+
+
+def op_clipboard_write(text: str):
+    from jarvis.pc import op_clipboard_write as _f
+    return _f(text)
+
+
+def op_volume_get():
+    from jarvis.pc import op_volume_get as _f
+    return _f()
+
+
+def op_volume_set(level: int):
+    from jarvis.pc import op_volume_set as _f
+    return _f(level)
+
+
+def op_process_kill(target: str):
+    from jarvis.pc import op_process_kill as _f
+    return _f(target)
+
+
+def op_empty_recycle_bin():
+    from jarvis.pc import op_empty_recycle_bin as _f
+    return _f()
+
+
+def op_lock_pc():
+    from jarvis.pc import op_lock_pc as _f
+    return _f()
 
 
 # ---------------------------------------------------------------------
@@ -1108,19 +1194,49 @@ BROWSER_MANIFEST = {
     ],
 }
 
+def _pc_tool(name, properties=None, required=(), **flags):
+    tool = {"name": name, "op": name, "permission": "pc.control",
+            "schema": {"type": "object",
+                       "properties": properties or {},
+                       "required": list(required),
+                       "additionalProperties": False}}
+    tool.update(flags)
+    return tool
+
+
 PC_MANIFEST = {
     "name": "core.pc",
-    "version": "1.0.0",
-    "tools": [{
-        "name": "open_app",
-        "op": "open_app",
-        "permission": "pc.control",
-        "undoable": True,
-        "schema": {"type": "object",
-                   "properties": {"name": {"type": "string", "minLength": 1}},
-                   "required": ["name"],
-                   "additionalProperties": False},
-    }],
+    "version": "1.1.0",
+    "tools": [
+        {"name": "open_app",
+         "op": "open_app",
+         "permission": "pc.control",
+         "undoable": True,
+         "schema": {"type": "object",
+                    "properties": {"name": {"type": "string", "minLength": 1}},
+                    "required": ["name"],
+                    "additionalProperties": False}},
+        _pc_tool("pc_info"),
+        _pc_tool("process_list",
+                 {"name": {"type": "string"}}),
+        _pc_tool("window_list"),
+        _pc_tool("disk_usage"),
+        _pc_tool("battery_status"),
+        _pc_tool("clipboard_read"),
+        _pc_tool("clipboard_write",
+                 {"text": {"type": "string", "minLength": 1}},
+                 ("text",)),
+        _pc_tool("volume_get"),
+        _pc_tool("volume_set",
+                 {"level": {"type": "integer", "minimum": 0,
+                            "maximum": 100}},
+                 ("level",)),
+        _pc_tool("process_kill",
+                 {"target": {"type": "string", "minLength": 1}},
+                 ("target",), destructive=True),
+        _pc_tool("empty_recycle_bin", destructive=True),
+        _pc_tool("lock_pc"),
+    ],
 }
 
 ALL_MANIFESTS = (TIME_MANIFEST, MEMORY_MANIFEST, WEB_MANIFEST,
@@ -1175,7 +1291,20 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
                            "browser_snapshot": op_browser_snapshot,
                            "browser_screenshot": op_browser_screenshot,
                            "browser_click_ref": op_browser_click_ref})
-    registry.register(PC_MANIFEST, ops={"open_app": op_open_app})
+    registry.register(PC_MANIFEST, ops={
+        "open_app": op_open_app,
+        "pc_info": op_pc_info,
+        "process_list": op_process_list,
+        "window_list": op_window_list,
+        "disk_usage": op_disk_usage,
+        "battery_status": op_battery_status,
+        "clipboard_read": op_clipboard_read,
+        "clipboard_write": op_clipboard_write,
+        "volume_get": op_volume_get,
+        "volume_set": op_volume_set,
+        "process_kill": op_process_kill,
+        "empty_recycle_bin": op_empty_recycle_bin,
+        "lock_pc": op_lock_pc})
     for manifest in ALL_MANIFESTS:
         registry.approve(manifest["name"])
     return registry

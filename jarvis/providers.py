@@ -324,7 +324,12 @@ class _HTTPProvider:
     def _post_json(self, url: str, payload: Dict[str, Any],
                    headers: Optional[Dict[str, str]] = None
                    ) -> Dict[str, Any]:
-        body = json.dumps(payload).encode("utf-8")
+        # Compact separators + no ASCII escaping: the bytes on
+        # the wire are what the provider tokenizes, and the
+        # prompt estimator counts this exact form — the two
+        # must agree, and both should be lean.
+        body = json.dumps(payload, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
         hdrs = {"Content-Type": "application/json"}
         if headers:
             hdrs.update(headers)

@@ -141,6 +141,7 @@ PAGE = """<!DOCTYPE html>
     <div id="provider"></div>
   </div>
   <div class="chat">
+    <div id="cards"></div>
     <div id="log"></div>
     <div class="bar">
       <input id="text" placeholder="Type here, sir…" autocomplete="off">
@@ -235,12 +236,42 @@ PAGE = """<!DOCTYPE html>
     ncount.textContent = n;
     bell.classList.toggle('hot', n > 0);
   }
+  const cardsEl = document.getElementById('cards');
+  async function decideCard(id, approve) {
+    try {
+      const r = await fetch('/api/confirm', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({id, approve})});
+      const out = await r.json();
+      addMsg('jarvis', out.result || '(card tay ho gaya)');
+    } catch(e) { addMsg('jarvis', 'Card ka faisla nahi gaya: ' + e); }
+    refreshState();
+  }
+  function renderCards(cards) {
+    cardsEl.innerHTML = '';
+    (cards || []).forEach(c => {
+      const d = document.createElement('div');
+      d.style.cssText = 'border:1px solid #ffd479;border-radius:10px;padding:10px 12px;margin:8px;background:rgba(255,212,121,.08)';
+      const t = document.createElement('div');
+      t.textContent = '🪪 ' + c.summary + ' — ye kaam ulta mushkil hai. Chalun?';
+      const yes = document.createElement('button');
+      yes.textContent = '✓ HAAN, chalao';
+      yes.onclick = () => decideCard(c.id, true);
+      const no = document.createElement('button');
+      no.textContent = '✗ NAHI';
+      no.style.marginLeft = '8px';
+      no.onclick = () => decideCard(c.id, false);
+      d.appendChild(t); d.appendChild(yes); d.appendChild(no);
+      cardsEl.appendChild(d);
+    });
+  }
   async function refreshState() {
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
       providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned) : '';
       setBadge(s.notifications || 0);
+      renderCards(s.confirmations || []);
       const v = s.voice || {};
       voiceBtn.textContent = v.active
         ? ('♪ VOICE · ' + (v.connected ? 'ON' : '…')) : '♪ VOICE · OFF';
@@ -567,6 +598,8 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
                                  "tool": app.activity.tool,
                                  "voice": voice,
                                  "ptt": app.push_to_talk(),
+                                 "confirmations":
+                                     app.pending_confirmations(),
                                  "notifications":
                                      _unread_count(app.data_dir)})
                 return
@@ -578,6 +611,21 @@ def build_server(app: ChatApp, host: str = "127.0.0.1", port: int = 8765):
             self.wfile.write(body)
 
         def do_POST(self):
+            if self.path == "/api/confirm":
+                try:
+                    size = int(self.headers.get("Content-Length", 0))
+                    payload = json.loads(
+                        self.rfile.read(size).decode("utf-8"))
+                except Exception:
+                    self._json(400, {"ok": False,
+                                     "error": "bad request"})
+                    return
+                with lock:
+                    out = app.confirm_card(
+                        str(payload.get("id", "")),
+                        approve=bool(payload.get("approve")))
+                self._json(200, {"ok": True, "result": out})
+                return
             if self.path == "/api/ptt":
                 try:
                     size = int(self.headers.get("Content-Length", 0))

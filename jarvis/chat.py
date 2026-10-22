@@ -231,9 +231,20 @@ def _diagnose_op(data_dir: Path, secrets):
             findings.append(
                 "Koi badi kharabi nahi mili — sab systems apne record "
                 "ke hisaab se theek hain.")
+        from .failures import cluster_errors
+        clusters = cluster_errors(recent_errors)
+        for c in clusters:
+            if c["count"] >= 2:
+                findings.append(
+                    f"Ek hi wajah baar-baar aa rahi hai: "
+                    f"{c['kind']} — {c['error']} "
+                    f"({c['count']} baar). Pehle is jhund ko "
+                    "theek karna sabse zyada fayda dega.")
         return {"checks_failed": failed, "providers": providers,
                 "keys_filed": keys_filed,
-                "recent_errors": recent_errors, "findings": findings}
+                "recent_errors": recent_errors,
+                "failure_clusters": clusters,
+                "findings": findings}
 
     return diagnose
 
@@ -1378,10 +1389,19 @@ def _delegated_summary(parts, task_text: str) -> str:
     from .brain import Brain
     from .rules import chat_protocol
     schemas = parts.registry.advertised_tools(parts.allowances)
-    brain = Brain(parts.chain, schemas, parts.dispatch,
+    from .router import route_schemas
+    subset = route_schemas(task_text, schemas)
+    brain = Brain(parts.chain, subset or schemas, parts.dispatch,
                   parts.journal, parts.memory,
                   **({"protocol": chat_protocol(parts.rules_text)}
                      if getattr(parts, "rules_text", "") else {}))
+    if subset:
+        try:
+            parts.journal.append("brain.route", {
+                "shown": len(subset), "total": len(schemas),
+                "where": "delegated"})
+        except Exception:
+            pass
     prompt = (
         "Background task from the owner (work autonomously "
         "with your tools; do not ask questions — nobody is "
@@ -1576,11 +1596,19 @@ def _run_mission_app(parts, data_dir, mission_id: str,
 
     def step_fn(g, log, n):
         ctx = "; ".join(s["summary"] for s in log[-3:])
+        # Manus's todo recitation: the plan is re-read at the
+        # END of every step prompt, where the model's eyes
+        # finish — long missions drift without it.
+        todo = "\n".join(
+            [f"[x] kadam {s['step']}: {s['summary'][:80]}"
+             for s in log]
+            + [f"[ ] kadam {n}: (ye wala — abhi karna hai)"])
         work = (f"MISSION kadam {n}. GOAL: {g}"
                 + (f"\nAb tak: {ctx}" if ctx else "")
                 + "\nSirf AGla ek asal kadam lo aur use pura "
                   "karo. Ant me us kadam ka saar ek-do line me "
-                  "batao.")
+                  "batao."
+                + f"\n\nTODO:\n{todo}")
         return _delegated_summary(parts, work)
 
     def on_step(n, verdict, entry):
@@ -2395,7 +2423,7 @@ def _run_guarded(ledger, session_id, name, args, execute, journal):
 
 def make_dispatch(gate, registry, journal, allowances,
                   pass_decision=False, refused_exc=(), ledger=None,
-                  session_id=""):
+                  session_id="", approval_sink=None):
     """The gate-mediated dispatch every tool call flows through.
 
     Journals tool.call (with the gate verdict) and tool.result — the
@@ -2413,15 +2441,27 @@ def make_dispatch(gate, registry, journal, allowances,
         except Exception:
             guarded = set()
 
-    def dispatch(name, args=None, origin="owner"):
+    def dispatch(name, args=None, origin="owner",
+                 approved_decision=None):
         args = dict(args or {})
-        decision = gate.evaluate(name, args, origin, allowances)
+        if approved_decision is not None:
+            # The owner approved this exact call on a card: the
+            # fresh decision (with its one-time token) rides in;
+            # the registry verifies it before anything runs.
+            decision = approved_decision
+        else:
+            decision = gate.evaluate(name, args, origin,
+                                     allowances)
         verdict = getattr(decision, "verdict", "deny")
         journal.append("tool.call", {
             "tool": name, "args": args, "gate_verdict": verdict,
-            "origin": origin})
+            "origin": origin,
+            "via_card": approved_decision is not None})
         replayed = False
-        if verdict in ("allow", "allow_with_undo"):
+        executable = verdict in ("allow", "allow_with_undo") or (
+            verdict == "require_approval"
+            and approved_decision is not None)
+        if executable:
 
             def _execute():
                 try:
@@ -2441,6 +2481,20 @@ def make_dispatch(gate, registry, journal, allowances,
             result = {"ok": False, "needs_approval": True,
                       "error": f"{name} needs your approval before I "
                                f"run it, sir."}
+            if approval_sink is not None:
+                try:
+                    card = approval_sink(name, args)
+                    if card:
+                        result["card"] = {
+                            "id": card.get("id"),
+                            "summary": card.get("summary"),
+                            "note": "Owner: HAAN ke liye /confirm "
+                                    f"{card.get('id')}, NAHI ke "
+                                    "liye /deny "
+                                    f"{card.get('id')} — ya app me "
+                                    "card par tap karein."}
+                except Exception:
+                    pass
         else:
             result = {"ok": False,
                       "error": f"gate denied {name}: "
@@ -2691,6 +2745,18 @@ TOOL_STATES = {
     "delegate_task": "creating",
     "delegate_tasks": "creating",
     "run_mission": "creating",
+    "pc_info": "working",
+    "process_list": "working",
+    "window_list": "working",
+    "disk_usage": "working",
+    "battery_status": "working",
+    "clipboard_read": "working",
+    "clipboard_write": "working",
+    "volume_get": "working",
+    "volume_set": "working",
+    "process_kill": "working",
+    "empty_recycle_bin": "working",
+    "lock_pc": "working",
 }
 
 
@@ -2703,10 +2769,10 @@ def _activity_dispatch(dispatch, activity):
     while a tool executes, then returns to thinking (the brain is
     generating again) when it finishes."""
 
-    def traced(name, args=None, origin="owner"):
+    def traced(name, args=None, origin="owner", **kwargs):
         activity.set(state_for_tool(name), tool=str(name))
         try:
-            return dispatch(name, args, origin=origin)
+            return dispatch(name, args, origin=origin, **kwargs)
         finally:
             activity.set("thinking")
 
@@ -3454,11 +3520,14 @@ def build_app(data_dir, *, chain=None, modules=None,
         refused_exc = ()
     pass_decision = skills_mod is not _defaults
     activity = Activity()
+    from .confirmations import ConfirmationBook
+    _card_book = ConfirmationBook(data_dir)
     dispatch = _activity_dispatch(
         make_dispatch(gate, registry, journal, allowances,
                       pass_decision=pass_decision,
                       refused_exc=refused_exc, ledger=ledger,
-                      session_id=session_id),
+                      session_id=session_id,
+                      approval_sink=_card_book.add),
         activity)
     tool_schemas = registry.advertised_tools(allowances)
     # The ONE rules file (the owner's standing order): the brain's
@@ -4082,6 +4151,26 @@ class ChatApp:
                     "TAREEKA hisse me jud gaya. Naya asar agle "
                     "start se hoga (rules shuru me padhe jate "
                     "hain).")
+        if text == "/confirm" or text.startswith("/confirm "):
+            parts_cmd = text.split(None, 1)
+            return self.confirm_card(
+                parts_cmd[1].strip() if len(parts_cmd) > 1 else "",
+                approve=True)
+        if text == "/deny" or text.startswith("/deny "):
+            parts_cmd = text.split(None, 1)
+            return self.confirm_card(
+                parts_cmd[1].strip() if len(parts_cmd) > 1 else "",
+                approve=False)
+        if text == "/cards":
+            pending = self.pending_confirmations()
+            if not pending:
+                return "Koi pending confirmation card nahi hai, sir."
+            lines = ["Pending cards, sir:"]
+            for c in pending:
+                lines.append(f"🪪 {c['id']} — {c['summary']} "
+                             f"(/confirm {c['id']} | "
+                             f"/deny {c['id']})")
+            return "\n".join(lines)
         if text == "/rules":
             return ("Ye rahe mere saare rules, sir — ek hi file "
                     f"se ({self.rules_source}):\n\n"
@@ -4279,6 +4368,100 @@ class ChatApp:
 
     # -- the turn -----------------------------------------------------------
 
+    # -- confirmation cards (the owner's approval door) --------
+
+    def pending_confirmations(self):
+        from .confirmations import ConfirmationBook
+        return ConfirmationBook(self.data_dir).pending()
+
+    def confirm_card(self, card_id: str = "",
+                     approve: bool = True) -> str:
+        """The owner's verdict on a card. Approval re-evaluates
+        the gate for a FRESH one-time token and runs the tool
+        exactly once through the guarded dispatch; denial just
+        retires the card. Either way the card can never be
+        used again."""
+        from .confirmations import ConfirmationBook
+        book = ConfirmationBook(self.data_dir)
+        if not card_id:
+            pending = book.pending()
+            if not pending:
+                return "Koi pending card nahi hai, sir."
+            card_id = pending[-1]["id"]
+        if not approve:
+            if book.deny(card_id):
+                self.journal.append("confirm.denied",
+                                    {"id": card_id})
+                return (f"Card {card_id} radd kar diya, sir — "
+                        "woh kaam nahi chalega.")
+            return f"Card {card_id} pending nahi mila, sir."
+        card = book.take(card_id)
+        if card is None:
+            return (f"Card {card_id} nahi chala, sir — ya woh "
+                    "pehle hi tay ho chuka hai, ya uski miyad "
+                    "(1 ghanta) khatm ho gayi. Hukum dobara "
+                    "dijiye, naya card ban jayega.")
+        decision = self.gate.evaluate(
+            card["tool"], card["args"], ifc.OWNER_ORIGIN,
+            self.allowances)
+        if getattr(decision, "verdict", "") != "require_approval":
+            return (f"Ab is kaam ko approval ki zaroorat nahi "
+                    f"rahi ({getattr(decision, 'verdict', '?')}) "
+                    "— kuch nahi chalaya, sir.")
+        result = self.parts.dispatch(
+            card["tool"], card["args"],
+            approved_decision=decision)
+        ok = _result_ok(result)
+        self.journal.append("confirm.executed",
+                            {"id": card_id, "tool": card["tool"],
+                             "ok": ok})
+        if ok:
+            detail = result.get("result", result)
+            return (f"Ho gaya, sir — {card['tool']} chal gaya "
+                    f"(card {card_id}).\n"
+                    f"{str(detail)[:400]}")
+        return (f"Card manzoor tha, par {card['tool']} chal "
+                f"nahi paya, sir: "
+                f"{str(result.get('error', result))[:300]}")
+
+    def _brain_for(self, text: str):
+        """Route-then-specialize for the main turn: a cached
+        sibling brain that sees only the domains this message
+        calls for (plus the always-on core). No signal → the
+        full brain. The choice is journaled, never silent."""
+        from .router import route_schemas, routed_domains
+        try:
+            schemas = self.registry.advertised_tools(
+                self.allowances)
+            subset = route_schemas(text, schemas)
+        except Exception:
+            return self.brain
+        if not subset:
+            return self.brain
+        cache = getattr(self, "_routed_brains", None)
+        if cache is None:
+            cache = self._routed_brains = {}
+        key = frozenset(t["name"] for t in subset)
+        if key not in cache:
+            if len(cache) >= 24:      # bounded, like everything
+                cache.clear()
+            cache[key] = self.brain.with_schemas(subset)
+            try:
+                self.journal.append("brain.route", {
+                    "domains": routed_domains(text),
+                    "shown": len(subset), "total": len(schemas),
+                    "where": "turn"})
+            except Exception:
+                pass
+        clone = cache[key]
+        # The clone froze the chain it was born with; the app's
+        # chain can be swapped under it (fault injection in the
+        # eval harness, a model switch in production). Sync it
+        # every turn — the view is the clone's, the chain is
+        # always the app's current one.
+        clone.chain = self.brain.chain
+        return clone
+
     def turn(self, user_text: str) -> str:
         text = str(user_text)
         if _is_stopped(self.data_dir):
@@ -4310,8 +4493,9 @@ class ChatApp:
             self.last_provider = "fast-path"
         else:
             rows_before = len(self.goodput.to_rows())
-            result = self.brain.respond(self._brain_history(), text,
-                                        correction=bool(correction))
+            result = self._brain_for(text).respond(
+                self._brain_history(), text,
+                correction=bool(correction))
             reply = str(result.reply)
             stopped_reason = str(
                 getattr(result, "stopped_reason", "completed"))

@@ -213,6 +213,12 @@ class Brain:
                  persona: str = PERSONA,
                  protocol: str = PROTOCOL):
         self.chain = chain
+        self._init_kwargs = {
+            "soft_cap_tokens": soft_cap_tokens,
+            "hard_budget_tokens": hard_budget_tokens,
+            "max_rounds": max_rounds,
+            "max_tool_calls": max_tool_calls,
+            "persona": persona, "protocol": protocol}
         self.views = tool_views(tool_schemas)
         # Simultaneity's safety map: which tools may run side by
         # side. A round of independent, non-destructive calls
@@ -384,6 +390,18 @@ class Brain:
             text = ifc_mod.mark_outside(text, key)
         return (f'<tool_output tool="{name}" origin="tool:{name}" '
                 f'trust="untrusted">\n{text}\n</tool_output>')
+
+    def with_schemas(self, schemas) -> "Brain":
+        """A sibling brain that SEES only `schemas` — same
+        chain, dispatch, journal, memory, persona and protocol.
+        Route-then-specialize lives here: the view narrows per
+        turn; dispatch (and the gate behind it) never does."""
+        clone = Brain(self.chain, schemas, self.dispatch,
+                      self.journal, self.memory,
+                      pairs_path=self.pairs_path,
+                      **self._init_kwargs)
+        clone.spotlight_key = getattr(self, "spotlight_key", b"")
+        return clone
 
     def _is_destructive(self, name: str) -> bool:
         """Fail-safe: a tool the brain cannot vouch for (not in

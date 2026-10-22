@@ -112,17 +112,25 @@ class ToolView:
     description: str = ""
     parameters: Dict[str, Any] = field(default_factory=dict)
 
-    def openai(self, desc_cap: Optional[int] = None) -> Dict[str, Any]:
+    def openai(self, desc_cap: Optional[int] = None,
+               compact: bool = False,
+               names_only: bool = False) -> Dict[str, Any]:
         desc = self.description or ""
         if desc_cap is not None and len(desc) > desc_cap:
             desc = desc[:desc_cap].rstrip()
+        if names_only:
+            params = {"type": "object", "properties": {}}
+        else:
+            params = self.parameters or \
+                {"type": "object", "properties": {}}
+            if compact:
+                params = compact_schema(params)
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": desc,
-                "parameters": self.parameters or
-                {"type": "object", "properties": {}},
+                "parameters": params,
             },
         }
 
@@ -137,7 +145,13 @@ def tool_view(schema: Any) -> ToolView:
     name = fn.get("name") or schema.get("name") or ""
     if not name:
         raise ValueError(f"tool schema has no name: {schema!r}")
-    params = fn.get("parameters") or fn.get("args_schema") or {}
+    # v4's advertised tools carry their JSON schema under
+    # "schema" — read it, or the model is shown EMPTY argument
+    # schemas for every tool (a latent defect found by the
+    # 2026-10-22 budget investigation: the pipeline survived
+    # on tool names + the gate's corrective error paths).
+    params = fn.get("parameters") or fn.get("args_schema") \
+        or fn.get("schema") or schema.get("schema") or {}
     return ToolView(name=str(name),
                     description=str(fn.get("description") or ""),
                     parameters=params if isinstance(params, dict) else {})
@@ -145,6 +159,30 @@ def tool_view(schema: Any) -> ToolView:
 
 def tool_views(schemas: Sequence[Any]) -> List[ToolView]:
     return [tool_view(s) for s in (schemas or [])]
+
+
+def compact_schema(params: Dict[str, Any]) -> Dict[str, Any]:
+    """The schema diet: keep the shape a caller needs — property
+    names, their types, and what's required — and drop the
+    trimmings (length bounds, enums, nested descriptions). A
+    valid JSON Schema still; roughly half the tokens."""
+    if not isinstance(params, dict):
+        return {"type": "object", "properties": {}}
+    props = {}
+    for key, spec in (params.get("properties") or {}).items():
+        if isinstance(spec, dict):
+            entry = {"type": spec.get("type", "string")}
+            if spec.get("type") == "array" and \
+                    isinstance(spec.get("items"), dict):
+                entry["items"] = {
+                    "type": spec["items"].get("type", "string")}
+            props[key] = entry
+        else:
+            props[key] = {"type": "string"}
+    out: Dict[str, Any] = {"type": "object", "properties": props}
+    if params.get("required"):
+        out["required"] = list(params["required"])
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -203,11 +241,13 @@ def messages_cost(messages: Sequence[Dict[str, Any]],
     for msg in messages:
         total += estimate_tokens(_content_text(msg.get("content", "")))
         if msg.get("tool_calls"):
-            total += estimate_tokens(json.dumps(msg["tool_calls"],
-                                                ensure_ascii=False, default=str))
+            total += estimate_tokens(json.dumps(
+                msg["tool_calls"], ensure_ascii=False, default=str,
+                separators=(",", ":")))
     if tools:
-        total += estimate_tokens(json.dumps(tools, ensure_ascii=False,
-                                            default=str))
+        total += estimate_tokens(json.dumps(
+            tools, ensure_ascii=False, default=str,
+            separators=(",", ":")))
     return total
 
 
@@ -278,13 +318,15 @@ class PromptBuilder:
     # -- internals ------------------------------------------------------
 
     def _attempt(self, history: List[Dict[str, Any]], user_text: str,
-                 memory_lines: Sequence[str], desc_cap: Optional[int]):
+                 memory_lines: Sequence[str], desc_cap: Optional[int],
+                 compact: bool = False, names_only: bool = False):
         system = render_system(self.views, desc_cap, memory_lines,
                                self.persona, self.protocol)
         messages = [{"role": "system", "content": system}]
         messages.extend(history)
         messages.append({"role": "user", "content": user_text})
-        tools = [v.openai(desc_cap) for v in self.views]
+        tools = [v.openai(desc_cap, compact, names_only)
+                 for v in self.views]
         return messages, tools, messages_cost(messages, tools)
 
     def _droppable(self, history: List[Dict[str, Any]]) -> int:
@@ -311,6 +353,17 @@ class PromptBuilder:
             if est <= self.soft_cap:
                 return AssembledPrompt(messages, tools, est, actions)
 
+        # (a2) the schema diet — argument schemas in compact form
+        # (names + types + required; trimmings dropped). Cheaper
+        # than touching memory or history, so it comes first.
+        if self.views and est > self.soft_cap:
+            messages, tools, est = self._attempt(
+                hist, user_text, memory_lines, TOOL_DESC_CAP,
+                compact=True)
+            actions.append("tool schemas compacted (names + types)")
+            if est <= self.soft_cap:
+                return AssembledPrompt(messages, tools, est, actions)
+
         # (b) trim the history middle, halving what is droppable.
         while est > self.soft_cap and self._droppable(hist) > 0:
             n_drop = max(1, self._droppable(hist) // 2)
@@ -319,7 +372,8 @@ class PromptBuilder:
             del hist[start:start + n_drop]
             actions.append(f"trimmed {n_drop} history message(s) from the middle")
             messages, tools, est = self._attempt(
-                hist, user_text, memory_lines, TOOL_DESC_CAP)
+                hist, user_text, memory_lines, TOOL_DESC_CAP,
+                compact=True)
             if est <= self.soft_cap:
                 return AssembledPrompt(messages, tools, est, actions,
                                        dropped=len(dropped_msgs))
@@ -327,6 +381,7 @@ class PromptBuilder:
         # (c) summarize: still over the soft cap with only head+tail
         # left — fold everything except the head and the freshest two
         # messages into ONE summary covering all of it.
+        summary = None
         if est > self.soft_cap and dropped_msgs:
             keep_last = hist[-2:] if len(hist) > self.keep_head + 2 else []
             extra = hist[self.keep_head:len(hist) - len(keep_last)] \
@@ -336,15 +391,72 @@ class PromptBuilder:
             hist = (hist[:self.keep_head]
                     + [{"role": "system", "content": summary}]
                     + keep_last)
+            dropped_count = len(all_dropped)
             actions.append(f"summarized {len(all_dropped)} history "
                            "message(s) into one summary")
             messages, tools, est = self._attempt(
-                hist, user_text, memory_lines, TOOL_DESC_CAP)
-            return self._finish(messages, tools, est, actions,
-                                len(all_dropped), summary)
+                hist, user_text, memory_lines, TOOL_DESC_CAP,
+                compact=True)
+        else:
+            dropped_count = len(dropped_msgs)
+
+        # (d) last resort — degrade, never go silent: truncate the
+        # longest retained history bodies, then let the memory
+        # excerpts go entirely. The system prefix and the owner's
+        # current words are never touched. A thinner memory of the
+        # conversation beats the PromptBudgetError silence this
+        # case-bank was built to guard against.
+        if est > self.hard_budget:
+            trimmed = [dict(m) for m in hist]
+            changed = False
+            for m in trimmed:
+                body = str(m.get("content", ""))
+                if len(body) > 600:
+                    m["content"] = body[:600] + " […]"
+                    changed = True
+            if changed:
+                actions.append("truncated long history message "
+                               "bodies (last resort)")
+                messages, tools, est = self._attempt(
+                    trimmed, user_text, memory_lines,
+                    TOOL_DESC_CAP, compact=True)
+            if est > self.hard_budget and memory_lines:
+                actions.append("dropped memory excerpts "
+                               "(last resort)")
+                messages, tools, est = self._attempt(
+                    trimmed, user_text, (), TOOL_DESC_CAP,
+                    compact=True)
+
+        # (e) the names-only floor — the state this pipeline
+        # provably ran in before schemas were wired: every tool
+        # still named and callable, argument shapes carried by
+        # the gate's corrective errors. Reached only when the
+        # alternative is refusing the turn outright; a routed
+        # (specialized) turn essentially never gets here.
+        if est > self.hard_budget and self.views:
+            actions.append("tool payload reduced to names-only "
+                           "(final floor before refusing)")
+            messages, tools, est = self._attempt(
+                trimmed, user_text, (), TOOL_DESC_CAP,
+                names_only=True)
+
+        # (f) fold the head too: everything except the freshest
+        # two messages goes into the summary. The head was kept
+        # as an anchor by design — but at this floor the choice
+        # is the anchor or the answer, and the case-bank's whole
+        # lesson is that silence is the only unacceptable one.
+        if est > self.hard_budget and len(trimmed) > 2:
+            folded = summarize_dropped(trimmed[:-2])
+            hist_f = [{"role": "system", "content": folded}] \
+                + trimmed[-2:]
+            actions.append("folded all but the last two messages "
+                           "into the summary (final floor)")
+            messages, tools, est = self._attempt(
+                hist_f, user_text, (), TOOL_DESC_CAP,
+                names_only=True)
 
         return self._finish(messages, tools, est, actions,
-                            len(dropped_msgs), None)
+                            dropped_count, summary)
 
     def _finish(self, messages, tools, est, actions, dropped, summary):
         if est > self.hard_budget:

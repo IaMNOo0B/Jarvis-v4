@@ -425,6 +425,18 @@ def op_browser_snapshot(max_chars: int = 12000):
             "text": out["text"], "truncated": out["truncated"]}
 
 
+def _fingerprint(session) -> str:
+    """A cheap page fingerprint (URL + visible-text length):
+    the action-verdict's yardstick. A click that changes
+    neither moved nothing the eye can see."""
+    try:
+        return str(session.evaluate(
+            "location.href + '|' + (document.body ? "
+            "document.body.innerText.length : 0)") or "")
+    except Exception:
+        return ""
+
+
 def op_browser_click_ref(ref: str, confirm: bool = False):
     """Click the element a snapshot tagged. Risk is classified
     BEFORE the click: a high-risk click without confirm=True is
@@ -458,15 +470,24 @@ def op_browser_click_ref(ref: str, confirm: bool = False):
                         "error": "yeh click risky hai (paisa ya "
                                  "commitment wala) — owner se confirm "
                                  "karke confirm=True ke saath bhejo"}
+            fp_before = _fingerprint(session)
             clicked = session.evaluate(
                 f"document.querySelector('[data-jarvis-ref=\"{ref}\""
                 "]).click(); 'clicked'")
             time.sleep(0.6)
             _refresh_current(session)
+            fp_after = _fingerprint(session)
         except (WSError, OSError) as exc:
             return {"error": f"browser_click_ref failed: {exc}"}
     return {"clicked": info.get("label", ""), "risk": risk,
-            "url": _current["url"], "title": _current["title"]}
+            "url": _current["url"], "title": _current["title"],
+            "effect": {"changed": bool(fp_before)
+                       and fp_before != fp_after,
+                       "note": "click ke baad page badla"
+                       if fp_before != fp_after else
+                       "click ke baad page me koi dikhne wala "
+                       "badlav nahi aaya — click shayad kahin "
+                       "aur gaya ya page waisa hi raha"}}
 
 
 def op_browser_screenshot():
@@ -521,16 +542,24 @@ def op_browser_click(text: str):
     with _lock:
         try:
             session = _ensure_session()
+            fp_before = _fingerprint(session)
             clicked = session.evaluate(script)
             time.sleep(0.6)
             _refresh_current(session)
+            fp_after = _fingerprint(session)
         except (WSError, OSError) as exc:
             return {"error": f"browser_click failed: {exc}"}
     if clicked is None:
         return {"error": f"browser_click failed: '{text}' likha "
                          "koi button/link page par nahi mila"}
     return {"clicked": clicked, "url": _current["url"],
-            "title": _current["title"]}
+            "title": _current["title"],
+            "effect": {"changed": bool(fp_before)
+                       and fp_before != fp_after,
+                       "note": "click ke baad page badla"
+                       if fp_before != fp_after else
+                       "click ke baad page me koi dikhne wala "
+                       "badlav nahi aaya"}}
 
 
 def op_browser_type(text: str, into: str = ""):
