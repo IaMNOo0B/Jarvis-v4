@@ -550,7 +550,7 @@ class Brain:
             if parallel_ok:
                 from concurrent.futures import ThreadPoolExecutor
                 with ThreadPoolExecutor(
-                        max_workers=min(4, len(to_run))) as pool:
+                        max_workers=min(16, len(to_run))) as pool:
                     futures = {
                         pool.submit(self._execute, p["call"]): idx
                         for idx, p in to_run}

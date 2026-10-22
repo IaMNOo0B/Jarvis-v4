@@ -250,6 +250,34 @@ DELEGATE_MANIFEST = {
                                            "minLength": 1}},
                    "required": ["task"],
                    "additionalProperties": False},
+    }, {
+        "name": "delegate_tasks",
+        "op": "delegate_tasks",
+        "permission": "tasks.delegate",
+        "schema": {"type": "object",
+                   "properties": {
+                       "tasks": {"type": "array",
+                                 "items": {"type": "string"}}},
+                   "required": ["tasks"],
+                   "additionalProperties": False},
+    }],
+}
+
+
+MISSION_MANIFEST = {
+    "name": "core.mission",
+    "version": "1.0.0",
+    "tools": [{
+        "name": "run_mission",
+        "op": "run_mission",
+        "permission": "tasks.delegate",
+        "schema": {"type": "object",
+                   "properties": {
+                       "goal": {"type": "string", "minLength": 1},
+                       "max_steps": {"type": "integer",
+                                     "minimum": 1, "maximum": 25}},
+                   "required": ["goal"],
+                   "additionalProperties": False},
     }],
 }
 
@@ -1415,6 +1443,243 @@ def _run_delegated(parts, data_dir, task_id: str, task: str) -> None:
         pass
 
 
+def _fleet_for(holder: dict, parts):
+    """The app's shared Fleet (many-hands engine), built lazily
+    from config fleet.workers (default 32, ceiling 300)."""
+    fleet = holder.get("fleet")
+    if fleet is None:
+        from .fleet import Fleet
+        workers = 32
+        cfg = getattr(parts, "config", None)
+        if cfg is not None:
+            try:
+                workers = int(cfg.get("fleet", "workers", 32))
+            except Exception:
+                workers = 32
+        fleet = Fleet(workers)
+        holder["fleet"] = fleet
+    return fleet
+
+
+def _run_batch(parts, data_dir, batch_id: str, tasks, fleet):
+    """A jhund of work orders through the fleet: every job runs
+    _delegated_summary quietly (NO per-job notification — the
+    owner asked not to be pestered), each lands in the task
+    log, and ONE summary notification closes the batch."""
+    results = fleet.run_many(
+        tasks, lambda t: _delegated_summary(parts, t))
+    ok_count = 0
+    failures = []
+    for i, (task, res) in enumerate(zip(tasks, results)):
+        if res.get("ok"):
+            ok_count += 1
+            summary = str(res.get("result", ""))[:400]
+            status = "done"
+        else:
+            summary = str(res.get("error", ""))[:400]
+            status = "failed"
+            failures.append(f"{task[:60]} — {summary[:80]}")
+        _task_log(data_dir, {"id": f"{batch_id}-{i}",
+                             "task": task[:500], "status": status,
+                             "ts": time.time(),
+                             "result": summary})
+    lines = [f"Batch khatm: {ok_count}/{len(tasks)} kaam safal."]
+    lines += [f"✗ {f}" for f in failures[:3]]
+    if len(tasks) > 1:
+        lines.append(f"(fleet peak concurrency: "
+                     f"{fleet.peak})")
+    _notify(data_dir, "Batch report", "\n".join(lines),
+            kind="batch")
+    try:
+        parts.journal.append("task.batch_done",
+                             {"id": batch_id, "ok": ok_count,
+                              "total": len(tasks)})
+    except Exception:
+        pass
+
+
+def _delegate_tasks_op(holder: dict, data_dir: Path):
+    def delegate_tasks(tasks):
+        parts = holder.get("parts")
+        if parts is None:
+            return {"ok": False,
+                    "error": "delegation is not wired yet, sir."}
+        if _is_stopped(data_dir):
+            return {"ok": False,
+                    "error": "Band hoon, sir — pehle /resume "
+                             "kahiye."}
+        clean = [str(t).strip() for t in (tasks or [])
+                 if str(t).strip()]
+        if not clean:
+            return {"ok": False, "error": "Khali jhund, sir."}
+        clean = clean[:300]
+        batch_id = uuid.uuid4().hex[:8]
+        fleet = _fleet_for(holder, parts)
+        threading.Thread(target=_run_batch,
+                         args=(parts, data_dir, batch_id, clean,
+                               fleet),
+                         daemon=True,
+                         name=f"jarvis-batch-{batch_id}").start()
+        return {"ok": True, "batch_id": batch_id,
+                "count": len(clean),
+                "note": "Poora jhund peeche chal raha hai, sir — "
+                        "sirf ant me EK report milegi."}
+    return delegate_tasks
+
+
+def _mission_check(parts, goal: str, log) -> dict:
+    """The mission's judge: a no-tools Brain reads the goal and
+    the step log and rules done / continue / stuck / owner with
+    a stated confidence (which the RLCD calibrator then scores
+    the mission against). Any failure defaults to continue at
+    0.5 — the loop's own budget is the backstop."""
+    from .brain import Brain
+    steps = "\n".join(f"{s['step']}. {s['summary']}"
+                      for s in log[-6:])
+    prompt = (
+        f"MISSION GOAL: {goal}\nAb tak ke kadam:\n{steps}\n"
+        "Judge strictly: goal pura hua to done; kaam baki hai "
+        "to continue; raasta band ya asambhav to stuck; faisla "
+        "sirf OWNER kar sakta ho to owner.\n"
+        'Reply ONLY with JSON: {"state": "done|continue|stuck|'
+        'owner", "confidence": 0.0, "note": "ek chhoti line"}')
+    try:
+        brain = Brain(parts.chain, [], parts.dispatch,
+                      parts.journal, parts.memory)
+        out = brain.respond([], prompt)
+        parsed = _json_from_reply(str(out.reply))
+        if isinstance(parsed, dict) and parsed.get("state") in (
+                "done", "continue", "stuck", "owner"):
+            conf = parsed.get("confidence", 0.5)
+            try:
+                conf = max(0.0, min(1.0, float(conf)))
+            except (TypeError, ValueError):
+                conf = 0.5
+            return {"state": parsed["state"], "confidence": conf,
+                    "note": str(parsed.get("note", ""))[:300]}
+    except Exception:
+        pass
+    return {"state": "continue", "confidence": 0.5, "note": ""}
+
+
+def _run_mission_app(parts, data_dir, mission_id: str,
+                     goal: str, max_steps: int) -> None:
+    """Autopilot, app-side: worker = the delegated brain,
+    judge = _mission_check, conscience = the RLCD calibrator
+    (every 'aage badho' decision is recorded with the judge's
+    confidence, gated by the calibration policy, and resolved
+    when the mission lands). ONE notification at the end —
+    beech me koi 'yeh hua woh hua' nahi."""
+    from .autopilot import run_mission
+    decision_ids: list = []
+    cal = getattr(parts, "calibrator", None)
+
+    def step_fn(g, log, n):
+        ctx = "; ".join(s["summary"] for s in log[-3:])
+        work = (f"MISSION kadam {n}. GOAL: {g}"
+                + (f"\nAb tak: {ctx}" if ctx else "")
+                + "\nSirf AGla ek asal kadam lo aur use pura "
+                  "karo. Ant me us kadam ka saar ek-do line me "
+                  "batao.")
+        return _delegated_summary(parts, work)
+
+    def on_step(n, verdict, entry):
+        if cal is None:
+            return
+        conf = verdict.get("confidence", 0.5)
+        try:
+            row = cal.record(
+                "mission",
+                f"mission '{goal[:60]}' kadam {n} ke baad aage "
+                "badhna sahi hai", conf)
+            decision_ids.append(
+                row["id"] if isinstance(row, dict) else row)
+            if cal.policy("mission", conf)["action"] == "ask" \
+                    and verdict.get("state") == "continue":
+                verdict["state"] = "owner"
+                verdict["note"] = (
+                    "calibration kehta hai is raaste par "
+                    "bharosa kam hai — owner ka faisla chahiye")
+        except Exception:
+            pass
+
+    try:
+        outcome = run_mission(
+            goal, step_fn,
+            lambda g, log: _mission_check(parts, g, log),
+            max_steps=max_steps,
+            should_stop=lambda: _is_stopped(data_dir),
+            on_step=on_step)
+    except Exception as exc:
+        outcome = {"goal": goal, "state": "stuck",
+                   "note": f"mission crash: "
+                           f"{type(exc).__name__}: {exc}",
+                   "steps": [], "steps_taken": 0}
+    if cal is not None and decision_ids:
+        try:
+            if outcome["state"] == "done":
+                for did in decision_ids:
+                    cal.resolve(did, True)
+            elif outcome["state"] == "stuck":
+                for did in decision_ids:
+                    cal.resolve(did, False)
+        except Exception:
+            pass
+    _task_log(data_dir, {"id": mission_id, "kind": "mission",
+                         "task": goal[:500],
+                         "status": outcome["state"],
+                         "ts": time.time(),
+                         "result": (f"{outcome['steps_taken']} "
+                                    f"kadam — "
+                                    f"{outcome['note']}")[:500],
+                         "steps": outcome["steps"]})
+    icons = {"done": "✅", "stuck": "⛔", "owner": "🙋",
+             "budget": "⏳", "stopped": "⏸"}
+    _notify(data_dir, f"Mission {outcome['state']}",
+            f"{icons.get(outcome['state'], '•')} Goal: "
+            f"{goal[:120]}\nKadam: {outcome['steps_taken']} — "
+            f"{outcome['note']}", kind="mission")
+    try:
+        parts.journal.append("mission.done",
+                             {"id": mission_id,
+                              "state": outcome["state"],
+                              "steps": outcome["steps_taken"]})
+    except Exception:
+        pass
+
+
+def _mission_op(holder: dict, data_dir: Path):
+    def run_mission_tool(goal: str, max_steps: int = 10):
+        parts = holder.get("parts")
+        if parts is None:
+            return {"ok": False,
+                    "error": "mission engine wired nahi hai, "
+                             "sir."}
+        if _is_stopped(data_dir):
+            return {"ok": False,
+                    "error": "Band hoon, sir — pehle /resume "
+                             "kahiye."}
+        goal = str(goal).strip()
+        if not goal:
+            return {"ok": False, "error": "Khali goal, sir."}
+        mission_id = uuid.uuid4().hex[:8]
+        _task_log(data_dir, {"id": mission_id, "kind": "mission",
+                             "task": goal[:500],
+                             "status": "running",
+                             "ts": time.time()})
+        threading.Thread(target=_run_mission_app,
+                         args=(parts, data_dir, mission_id, goal,
+                               int(max_steps)),
+                         daemon=True,
+                         name=f"jarvis-mission-{mission_id}").start()
+        return {"ok": True, "mission_id": mission_id,
+                "note": "Mission chal raha hai, sir — JARVIS "
+                        "khud kadam-dar-kadam goal tak jayega. "
+                        "Beech me tang nahi karunga; sirf ant me "
+                        "ya asal rukawat par khabar dunga."}
+    return run_mission_tool
+
+
 def _delegate_op(holder: dict, data_dir: Path):
     """The delegate_task tool op. `holder` receives the AppParts
     after build_app assembles them (the op is registered before
@@ -2424,6 +2689,8 @@ TOOL_STATES = {
     "email_send": "sending", "email_draft": "writing",
     "telegram_send": "sending", "delegate_team": "creating",
     "delegate_task": "creating",
+    "delegate_tasks": "creating",
+    "run_mission": "creating",
 }
 
 
@@ -2999,10 +3266,23 @@ def build_app(data_dir, *, chain=None, modules=None,
             registry.register(DELEGATE_MANIFEST,
                               ops={"delegate_task":
                                    _delegate_op(parts_holder,
-                                                data_dir)})
+                                                data_dir),
+                                   "delegate_tasks":
+                                   _delegate_tasks_op(
+                                       parts_holder, data_dir)})
             registry.approve(DELEGATE_MANIFEST["name"])
         except Exception as exc:  # a sibling got there first, etc.
             journal.append("chat.delegate_skill_skipped",
+                           {"error": f"{type(exc).__name__}: {exc}"})
+    if hasattr(registry, "register") and hasattr(registry, "approve"):
+        try:
+            registry.register(MISSION_MANIFEST,
+                              ops={"run_mission":
+                                   _mission_op(parts_holder,
+                                               data_dir)})
+            registry.approve(MISSION_MANIFEST["name"])
+        except Exception as exc:
+            journal.append("chat.mission_skill_skipped",
                            {"error": f"{type(exc).__name__}: {exc}"})
     if hasattr(registry, "register") and hasattr(registry, "approve"):
         try:
