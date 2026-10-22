@@ -782,6 +782,31 @@ def op_open_app(name: str):
                      "chaaron raaste band mile, sir"}
 
 
+def op_open_app_legacy(name: str):
+    """The ORIGINAL open_app, preserved exactly as it first
+    shipped (the owner's version doctrine: upgrades never
+    delete — the old tool stays, callable forever). Two plain
+    routes: os.startfile, then a direct spawn. The current
+    open_app keeps these as its first two routes and adds
+    PowerShell + AppsFolder after them; this legacy tool is
+    the untouched original for when the plain way is wanted
+    — and it is open_app's registered fallback route."""
+    if sys.platform == "win32":
+        try:
+            os.startfile(name)  # noqa: S606 — owner's own machine
+            return {"launched": name}
+        except (OSError, AttributeError):
+            try:
+                subprocess.Popen([name])  # noqa: S603 — same
+                return {"launched": name}
+            except OSError as exc:
+                return {"error": f"open_app failed to launch "
+                                 f"{name!r}: {exc}"}
+    return {"error": f"driver not present on this OS "
+                     f"({sys.platform}): open_app can only "
+                     f"launch {name!r} on Windows"}
+
+
 # -- the PC domain library (jarvis/pc.py) -------------------------
 
 def op_pc_info():
@@ -1216,6 +1241,14 @@ PC_MANIFEST = {
                     "properties": {"name": {"type": "string", "minLength": 1}},
                     "required": ["name"],
                     "additionalProperties": False}},
+        {"name": "open_app_legacy",
+         "op": "open_app_legacy",
+         "permission": "pc.control",
+         "undoable": True,
+         "schema": {"type": "object",
+                    "properties": {"name": {"type": "string", "minLength": 1}},
+                    "required": ["name"],
+                    "additionalProperties": False}},
         _pc_tool("pc_info"),
         _pc_tool("process_list",
                  {"name": {"type": "string"}}),
@@ -1293,6 +1326,7 @@ def build_default_registry(gate=None, journal=None, memory=None) -> SkillRegistr
                            "browser_click_ref": op_browser_click_ref})
     registry.register(PC_MANIFEST, ops={
         "open_app": op_open_app,
+        "open_app_legacy": op_open_app_legacy,
         "pc_info": op_pc_info,
         "process_list": op_process_list,
         "window_list": op_window_list,

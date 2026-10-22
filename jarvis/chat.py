@@ -2566,8 +2566,8 @@ def make_dispatch(gate, registry, journal, allowances,
         except Exception:
             guarded = set()
 
-    def dispatch(name, args=None, origin="owner",
-                 approved_decision=None):
+    def _dispatch_once(name, args=None, origin="owner",
+                       approved_decision=None):
         args = dict(args or {})
         if approved_decision is not None:
             # The owner approved this exact call on a card: the
@@ -2621,7 +2621,7 @@ def make_dispatch(gate, registry, journal, allowances,
                 except Exception:
                     pass
         else:
-            result = {"ok": False,
+            result = {"ok": False, "gate_denied": True,
                       "error": f"gate denied {name}: "
                                f"{getattr(decision, 'reason', '')}"}
         if not isinstance(result, dict):
@@ -2632,7 +2632,67 @@ def make_dispatch(gate, registry, journal, allowances,
             entry["idempotent_replay"] = True
         journal.append("tool.result", entry)
         return result
+
+    def dispatch(name, args=None, origin="owner",
+                 approved_decision=None, _depth=0):
+        """One call, with the owner's route doctrine on top:
+        the latest route runs first; on an honest failure the
+        preserved older/alternate route is TRIED — never
+        silently (the result carries served_by/fallback_from,
+        and both attempts are journaled). Gate denials and
+        approval pauses never fall back: a refusal is a
+        decision, not a failure. Depth-capped, so a chain
+        (scrape -> fetch -> tor) resolves in at most 3 hops."""
+        result = _dispatch_once(name, args, origin,
+                                approved_decision)
+        if _depth >= 2 or approved_decision is not None:
+            return result
+        if not isinstance(result, dict) or _result_ok(result):
+            return result
+        if result.get("needs_approval") or result.get("gate_denied"):
+            return result
+        fallback = FALLBACK_ROUTES.get(name)
+        if not fallback:
+            return result
+        try:
+            alt = dispatch(fallback, args, origin=origin,
+                           _depth=_depth + 1)
+        except Exception:
+            return result
+        if isinstance(alt, dict) and _result_ok(alt):
+            alt = dict(alt)
+            # In a chain (scrape -> fetch -> tor) the stamp
+            # names the route that ULTIMATELY served, and the
+            # tool the caller originally asked for.
+            alt.setdefault("served_by", fallback)
+            alt["fallback_from"] = name
+            alt["primary_error"] = str(
+                result.get("error", ""))[:200]
+            journal.append("tool.fallback", {
+                "from": name, "to": fallback, "ok": True})
+            return alt
+        merged = dict(result)
+        merged["fallback_tried"] = fallback
+        merged["fallback_error"] = str(
+            (alt or {}).get("error", ""))[:200] \
+            if isinstance(alt, dict) else ""
+        journal.append("tool.fallback", {
+            "from": name, "to": fallback, "ok": False})
+        return merged
+
     return dispatch
+
+
+# The route doctrine, as data: latest -> preserved alternate.
+# Same-argument pairs only (a fallback must be able to carry
+# the very same request). New upgrades ADD a row here; no row
+# is ever deleted — that is the owner's standing order.
+FALLBACK_ROUTES = {
+    "web_scrape": "web_fetch",
+    "web_fetch": "web_fetch_tor",
+    "web_search": "search_browser",
+    "open_app": "open_app_legacy",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -2870,6 +2930,7 @@ TOOL_STATES = {
     "delegate_task": "creating",
     "delegate_tasks": "creating",
     "run_mission": "creating",
+    "open_app_legacy": "working",
     "create_automation": "creating",
     "list_automations": "working",
     "run_automation": "working",
