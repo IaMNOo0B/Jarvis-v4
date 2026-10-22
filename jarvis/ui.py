@@ -124,12 +124,30 @@ PAGE = """<!DOCTYPE html>
   #spanel .pname { min-width:110px; color:#9fd8ff; align-self:center; }
   #spanel .pstat { color:rgba(180,210,245,.6); align-self:center; }
   #smsg { color:#ffd479; margin-top:6px; min-height:16px; }
+  /* Living HUD — a particle field + waveform ring around the
+     core, driven by JARVIS's REAL states (see the engine in
+     the script): speaking pulses, listening draws inward,
+     working swirls amber, standby merely drifts. */
+  #orbFx { position:absolute; inset:-96px; width:calc(100% + 192px);
+    height:calc(100% + 192px); pointer-events:none; z-index:1; }
+  .ring-wrap svg.ring, .ring-wrap .ticks { z-index:2; }
+  .ring-core { z-index:3; }
+  #hudTool { margin-top:4px; font-size:11px; letter-spacing:2.5px;
+    color:#ffd479; min-height:14px; text-transform:uppercase;
+    text-shadow:0 0 8px rgba(255,200,90,.5); }
+  body.speaking .ring-core { border-color:rgba(170,228,255,.85);
+    box-shadow:0 0 54px rgba(56,170,255,.6) inset, 0 0 46px rgba(56,170,255,.5); }
+  body.speaking .ring-arc { animation-duration:.9s; stroke:#aee6ff; }
+  body.listening .ring-core { border-color:rgba(140,255,190,.6);
+    box-shadow:0 0 34px rgba(90,255,170,.3) inset, 0 0 26px rgba(90,255,170,.25); }
+  body.listening .ring-arc { stroke:#8dffbe; }
 </style>
 </head>
 <body>
   <div class="stage">
     <div class="ring-wrap">
       <div class="ring-glow"></div>
+      <canvas id="orbFx" width="600" height="600"></canvas>
       <div class="ticks"></div>
       <svg class="ring" viewBox="0 0 200 200">
         <circle class="ring-track" cx="100" cy="100" r="96"></circle>
@@ -139,6 +157,7 @@ PAGE = """<!DOCTYPE html>
     </div>
     <div id="state">Standby</div>
     <div id="provider"></div>
+    <div id="hudTool"></div>
   </div>
   <div class="chat">
     <div id="cards"></div>
@@ -210,8 +229,114 @@ PAGE = """<!DOCTYPE html>
       const r = await fetch('/api/state');
       const s = await r.json();
       showState(s.activity);
+      setFx(s);
     } catch (e) { /* decoration only */ }
   }
+
+  // ---- Living HUD engine -------------------------------------
+  // Motion follows JARVIS's REAL state, never a script (the
+  // owner's truth law): speaking pulses with a voice-like
+  // envelope, listening draws the field inward, working
+  // swirls it amber, standby lets it drift and rest.
+  const fx = { mode: 'idle', amp: 0.12 };
+  const hudToolEl = document.getElementById('hudTool');
+  function setFx(s) {
+    const v = (s && s.voice) || {};
+    const a = (s && s.activity) || 'standby';
+    let mode = 'idle';
+    if (v.speaking || a === 'speaking') mode = 'speaking';
+    else if (a === 'listening' || (v.active && v.connected))
+      mode = 'listening';
+    else if (a && a !== 'standby') mode = 'busy';
+    fx.mode = mode;
+    document.body.classList.toggle('speaking', mode === 'speaking');
+    document.body.classList.toggle('listening', mode === 'listening');
+    if (hudToolEl) {
+      const tool = (mode === 'busy' || mode === 'speaking')
+        ? (s && s.tool) : '';
+      hudToolEl.textContent = tool
+        ? ('⚙ ' + String(tool).replace(/_/g, ' ')) : '';
+    }
+  }
+  async function pollFx() {
+    try {
+      const r = await fetch('/api/state');
+      setFx(await r.json());
+    } catch (e) { /* decoration only */ }
+  }
+  setInterval(pollFx, 700);
+  (function orbEngine() {
+    const cv = document.getElementById('orbFx');
+    if (!cv || !cv.getContext) return;
+    const ctx = cv.getContext('2d');
+    const W = cv.width, H = cv.height, CX = W / 2, CY = H / 2;
+    const ps = [];
+    for (let i = 0; i < 110; i++) {
+      ps.push({ a: Math.random() * Math.PI * 2,
+                r: 122 + Math.random() * 150,
+                sp: (Math.random() * 0.5 + 0.12)
+                    * (Math.random() < 0.5 ? -1 : 1),
+                sz: Math.random() * 1.9 + 0.6,
+                tw: Math.random() * Math.PI * 2 });
+    }
+    let t = 0;
+    function frame() {
+      requestAnimationFrame(frame);
+      if (document.hidden) return;
+      t += 0.016;
+      const target = fx.mode === 'speaking' ? 1
+        : fx.mode === 'listening' ? 0.45
+        : fx.mode === 'busy' ? 0.6 : 0.14;
+      const surge = fx.mode === 'speaking'
+        ? (0.55 + 0.45 * Math.sin(t * 7.3)
+             * Math.sin(t * 3.1 + 1.7)
+           + 0.25 * Math.sin(t * 13.7)) : 1;
+      fx.amp += ((target * Math.max(0.25, surge)) - fx.amp) * 0.08;
+      const amp = fx.amp;
+      ctx.clearRect(0, 0, W, H);
+      // Waveform ring: 56 bars breathing with the envelope.
+      const bars = 56, baseR = 118;
+      ctx.lineWidth = 2;
+      for (let i = 0; i < bars; i++) {
+        const ang = (i / bars) * Math.PI * 2;
+        const w = 0.5 + 0.5 * Math.sin(
+          i * 1.93 + t * (fx.mode === 'speaking' ? 9 : 2.2));
+        const len = 3 + amp * 30 * w;
+        const r1 = baseR + amp * 7 * Math.sin(ang * 3 + t * 2);
+        ctx.strokeStyle = fx.mode === 'listening'
+          ? 'rgba(140,255,190,' + (0.22 + amp * 0.5) + ')'
+          : 'rgba(96,196,255,' + (0.2 + amp * 0.55) + ')';
+        ctx.beginPath();
+        ctx.moveTo(CX + Math.cos(ang) * r1,
+                   CY + Math.sin(ang) * r1);
+        ctx.lineTo(CX + Math.cos(ang) * (r1 + len),
+                   CY + Math.sin(ang) * (r1 + len));
+        ctx.stroke();
+      }
+      // The particle field around the core.
+      const swirl = fx.mode === 'busy' ? 2.6
+        : fx.mode === 'speaking' ? 1.6 : 1;
+      for (const p of ps) {
+        p.a += 0.0016 * p.sp * swirl
+             * (fx.mode === 'listening' ? 1.4 : 1);
+        let rr = p.r + Math.sin(t * 0.9 + p.tw) * 7
+          + (fx.mode === 'listening'
+             ? -18 * (0.5 + 0.5 * Math.sin(t * 0.7 + p.tw))
+             : amp * 16 * Math.sin(p.a * 3 + t * 2.4));
+        const x = CX + Math.cos(p.a) * rr;
+        const y = CY + Math.sin(p.a) * rr * 0.98;
+        const tw = 0.35 + 0.65
+          * (0.5 + 0.5 * Math.sin(t * 2 + p.tw));
+        ctx.fillStyle = (fx.mode === 'busy' && p.sz > 2)
+          ? 'rgba(255,212,121,' + (0.75 * tw) + ')'
+          : 'rgba(140,215,255,' + (0.8 * tw) + ')';
+        ctx.beginPath();
+        ctx.arc(x, y, p.sz * (1 + amp * 0.6), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    requestAnimationFrame(frame);
+  })();
 
   function addMsg(text, who) {
     const div = document.createElement('div');
