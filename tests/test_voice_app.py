@@ -273,3 +273,23 @@ def test_manager_heard_fraction_counts_played_over_sent():
     assert manager.heard_fraction() == 0.25
     manager.on_interrupted()                     # counters reset
     assert manager.heard_fraction() is None
+
+
+def test_voice_level_reaches_status_for_the_hud():
+    """The HUD's particles dance to the REAL voice: the level
+    in status() is the measured PCM level of what JARVIS is
+    playing (speaking) or hearing (mic, once streamed) — and
+    it falls back to zero when the turn ends."""
+    manager, io, holder = make_manager()
+    manager.start()
+    assert manager.status()["level"] == 0.0
+    events = holder["session"].events
+    events.on_audio(tone(440, rate=24000))
+    assert wait_for(lambda: manager.speaking)
+    assert wait_for(lambda: manager.status()["level"] > 0.05)
+    events.on_turn_audio_end()
+    assert wait_for(lambda: not manager.speaking)
+    assert manager.status()["level"] == 0.0
+    io.mic_cb(tone(2000, amp=0.9))
+    assert wait_for(lambda: manager.status()["level"] > 0.05)
+    manager.stop()

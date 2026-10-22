@@ -60,6 +60,10 @@ class VoiceManager(VoiceEvents):
         self._play_q: queue.Queue = queue.Queue()
         self._turn_sent = 0        # bytes handed to playback this turn
         self._turn_played = 0      # bytes actually written to the speaker
+        self.level = 0.0           # last measured PCM level (mic
+                                   # while heard, speaker while
+                                   # speaking) — the HUD dances to
+                                   # the REAL voice, not a script
         self._turn_end = False
         self._tail_until = 0.0
         self._threads: list = []
@@ -160,6 +164,7 @@ class VoiceManager(VoiceEvents):
             "active": self.active,
             "connected": bool(self.session and self.session.connected),
             "speaking": self.speaking,
+            "level": round(float(self.level), 3),
             "muted": self.muted,
             "awake": bool(self.gate and self.gate.awake),
             "wake_word": bool(self.gate and self.gate.enabled),
@@ -183,7 +188,8 @@ class VoiceManager(VoiceEvents):
                 return
         if self.gate is not None and pcm_level(pcm) > 0.05:
             self.gate.note_user_speech()
-        self.session.send_audio(pcm)
+        self.level = pcm_level(pcm)   # heard audio only — the
+        self.session.send_audio(pcm)  # HUD's honest mic level
 
     # -- session events (playback side) ------------------------------------------
 
@@ -271,6 +277,7 @@ class VoiceManager(VoiceEvents):
             try:
                 self.io.write(bytes(batch))
                 self._turn_played += len(batch)
+                self.level = pcm_level(bytes(batch))
             except Exception:
                 pass
             if self.guard is not None:
@@ -280,6 +287,7 @@ class VoiceManager(VoiceEvents):
 
     def _finish_speaking(self):
         self.speaking = False
+        self.level = 0.0
         self._turn_end = False
         self._turn_sent = 0
         self._turn_played = 0

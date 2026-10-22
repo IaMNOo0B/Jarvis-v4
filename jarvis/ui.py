@@ -238,17 +238,17 @@ PAGE = """<!DOCTYPE html>
   // owner's truth law): speaking pulses with a voice-like
   // envelope, listening draws the field inward, working
   // swirls it amber, standby lets it drift and rest.
-  const fx = { mode: 'idle', amp: 0.12 };
+  const fx = { mode: 'idle', amp: 0.12, level: null };
   const hudToolEl = document.getElementById('hudTool');
   function setFx(s) {
     const v = (s && s.voice) || {};
     const a = (s && s.activity) || 'standby';
     let mode = 'idle';
     if (v.speaking || a === 'speaking') mode = 'speaking';
-    else if (a === 'listening' || (v.active && v.connected))
-      mode = 'listening';
+    else if (a === 'listening' || v.awake) mode = 'listening';
     else if (a && a !== 'standby') mode = 'busy';
     fx.mode = mode;
+    fx.level = (typeof v.level === 'number') ? v.level : null;
     document.body.classList.toggle('speaking', mode === 'speaking');
     document.body.classList.toggle('listening', mode === 'listening');
     if (hudToolEl) {
@@ -284,14 +284,22 @@ PAGE = """<!DOCTYPE html>
       requestAnimationFrame(frame);
       if (document.hidden) return;
       t += 0.016;
-      const target = fx.mode === 'speaking' ? 1
+      // A measured voice level (the app reports the real
+      // PCM level of what JARVIS says/hears) drives the
+      // dance when present; the envelope is only a resting
+      // fallback for when no level is being measured.
+      let target = fx.mode === 'speaking' ? 1
         : fx.mode === 'listening' ? 0.45
         : fx.mode === 'busy' ? 0.6 : 0.14;
       const surge = fx.mode === 'speaking'
         ? (0.55 + 0.45 * Math.sin(t * 7.3)
              * Math.sin(t * 3.1 + 1.7)
            + 0.25 * Math.sin(t * 13.7)) : 1;
-      fx.amp += ((target * Math.max(0.25, surge)) - fx.amp) * 0.08;
+      target *= Math.max(0.25, surge);
+      if (fx.level !== null
+          && (fx.mode === 'speaking' || fx.mode === 'listening'))
+        target = Math.min(1, 0.12 + fx.level * 1.7);
+      fx.amp += (target - fx.amp) * 0.08;
       const amp = fx.amp;
       ctx.clearRect(0, 0, W, H);
       // Waveform ring: 56 bars breathing with the envelope.
