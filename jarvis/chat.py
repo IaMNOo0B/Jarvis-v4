@@ -924,6 +924,408 @@ def _maybe_nudge(app) -> None:
             "tafseel hai.", kind="nudge")
 
 
+# --------------------------------------------------------------------------- #
+# Proactivity chain (Sentient Spec 2): the heartbeat mode.
+# The deterministic _maybe_nudge above REMAINS as the
+# fallback — when the chain errors, the day is not consumed
+# silently: the nudge has already spoken its plain list, and
+# the chain simply does not add a judgment on top.
+# --------------------------------------------------------------------------- #
+
+_PROACTIVE_READ_PERMS = frozenset({
+    "memory.read", "knowledge.read", "net.outbound",
+    "reminder.read"})
+_PROACTIVE_NEVER_TOOLS = frozenset({
+    "email_send", "email_draft", "telegram_send", "notify",
+    "learn_url", "track_add", "track_update",
+    "followups_due"})
+
+
+def _proactive_searcher(parts):
+    """The Unified Searcher: a fresh brain with READ-CLASS
+    tools only (the advertised dict's permission decides;
+    destructive-class and write-ish tools are excluded by
+    construction), a light effort budget, answering the
+    Formulator's questions in one compact report."""
+    def _search(questions):
+        if not questions:
+            return ""
+        from .brain import Brain
+        schemas = parts.registry.advertised_tools(
+            parts.allowances)
+        read_only = [
+            s for s in schemas
+            if s.get("permission") in _PROACTIVE_READ_PERMS
+            and not s.get("destructive")
+            and s.get("name") not in _PROACTIVE_NEVER_TOOLS]
+        brain = Brain(parts.chain, read_only,
+                      _worker_dispatch_of(parts),
+                      parts.journal, parts.memory, audit=False,
+                      max_rounds=2, max_tool_calls=8)
+        prompt = (
+            "Tum Unified Searcher ho — tum sirf PADH sakte "
+            "ho, kuch bhej/likh/mita nahi sakte. Neeche ke "
+            "sawaalon ke jawab apne read tools se dhoondo. "
+            "Har sawaal ke liye: jo mila (tareekh, naam, "
+            "source ke saath) ya saaf 'nahi mila'. Kul "
+            "report 250 shabdon ke andar.\n"
+            + "\n".join(f"{i + 1}. {q}"
+                        for i, q in enumerate(questions)))
+        out = brain.respond([], prompt)
+        return str(out.reply)[:2500]
+    return _search
+
+
+def _proactive_trigger(app):
+    """The heartbeat trigger, assembled in code from what
+    is actually waiting: due reminders, undecided cards,
+    today's failed tasks, due follow-ups. None when
+    nothing waits (the chain is not run on an empty
+    scratchpad)."""
+    bits = []
+    try:
+        from .brief import _load_reminders
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        due = 0
+        for row in _load_reminders(app.data_dir):
+            if row.get("done"):
+                continue
+            try:
+                when = datetime.fromisoformat(
+                    str(row["due"]))
+            except Exception:
+                continue
+            if when.tzinfo is None:
+                from datetime import timezone as _tz
+                when = when.replace(tzinfo=_tz.utc)
+            if (when - now).total_seconds() <= 24 * 3600:
+                due += 1
+        if due:
+            bits.append(f"{due} reminder(s) 24 ghante ke "
+                        "andar due")
+    except Exception:
+        pass
+    try:
+        from .confirmations import ConfirmationBook
+        waiting = ConfirmationBook(app.data_dir).pending()
+        if waiting:
+            bits.append(f"{len(waiting)} confirmation card "
+                        "faisle ke intezaar me")
+    except Exception:
+        pass
+    try:
+        import json as _json
+        path = Path(app.data_dir) / "tasks.jsonl"
+        today0 = time.mktime(time.strptime(
+            time.strftime("%Y-%m-%d"), "%Y-%m-%d"))
+        failed = 0
+        if path.exists():
+            for line in path.read_text(
+                    encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    row = _json.loads(line)
+                except Exception:
+                    continue
+                if row.get("status") == "failed" \
+                        and float(row.get("ts", 0)) >= today0:
+                    failed += 1
+        if failed:
+            bits.append(f"aaj {failed} background task "
+                        "fail hue")
+    except Exception:
+        pass
+    try:
+        from .tracker import due_followups
+        due = due_followups(app.data_dir)
+        if due:
+            bits.append(f"{len(due)} follow-up due")
+    except Exception:
+        pass
+    if not bits:
+        return None
+    return {"kind": "heartbeat",
+            "text": "Aaj ka check-in. Intezaar me hai: "
+                    + "; ".join(bits)}
+
+
+def _card_status(data_dir, card_id):
+    path = Path(data_dir) / "confirmations.json"
+    try:
+        rows = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(rows, list):
+        for row in rows:
+            if row.get("id") == card_id:
+                return row.get("status")
+    return None
+
+
+def _run_proactive_chain(app, trigger) -> None:
+    """One heartbeat pass of the chain, on its own thread:
+    Formulator -> Searcher -> Reasoner -> Standardizer ->
+    at most one notification (+ a card for a risky
+    action). Fully guarded — a chain failure costs one
+    journal line, never the scheduler."""
+    parts = app.parts
+
+    def _factory():
+        from .brain import Brain
+        return Brain(parts.chain, [], parts.dispatch,
+                     parts.journal, parts.memory, audit=False)
+
+    def _risky(name):
+        from .second_look import in_scope as _sl_scope
+        tools = getattr(parts.registry, "_tools", None)
+        tool = tools.get(name) if isinstance(tools, dict) \
+            else None
+        if tool is None:
+            return name in ("email_send", "telegram_send")
+        if _sl_scope(name, tool):
+            return True
+        checker = getattr(tool, "is_destructive_class", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                pass
+        return bool(getattr(tool, "destructive", False))
+
+    insights = []
+    try:
+        insights = [f"[{row['dimension']}] {row['claim']}"
+                    for row in app.user_model.insights()[:5]]
+    except Exception:
+        pass
+    try:
+        from .confirmations import ConfirmationBook
+        from .proactivity import (run_chain,
+                                  settle_card_outcomes)
+        settle_card_outcomes(
+            app.data_dir,
+            lambda cid: _card_status(app.data_dir, cid),
+            calibrator=app.calibrator)
+        run_chain(
+            data_dir=app.data_dir, trigger=trigger,
+            formulate_factory=_factory,
+            searcher=_proactive_searcher(parts),
+            reason_factory=_factory,
+            standardize_factory=_factory,
+            calibrator=app.calibrator,
+            notify=lambda t, b: _notify(
+                app.data_dir, t, b, kind="proactive"),
+            journal=app.journal,
+            card_sink=ConfirmationBook(app.data_dir).add,
+            insights=insights, action_is_risky=_risky)
+    except Exception as exc:
+        from .swallow import note as _swallow
+        _swallow(app.data_dir, "proactivity.chain", exc)
+
+
+def _run_followups_pass(app) -> None:
+    """One Follow-Up Drafter pass (Sentient Spec 3): read
+    the owner's own inboxes over IMAP, classify dropped
+    threads in code, draft for the survivors, notify.
+    Reading uses each account's filed app-password — the
+    same secret the mailer sends with."""
+    parts = app.parts
+    from .accounts import AccountBook
+    from . import mailer as _mailer
+    from .followups import run_followups
+    book = AccountBook(app.data_dir)
+    accounts = []
+    for row in book.list("email"):
+        try:
+            password = app.secrets.get(f"account-{row['id']}")
+        except Exception:
+            password = None
+        if not password:
+            continue
+        try:
+            messages = _mailer.fetch_recent(
+                row["address"], str(password), limit=40,
+                boxes=("INBOX", "[Gmail]/Sent Mail", "Sent"))
+        except Exception as exc:
+            from .swallow import note as _swallow
+            _swallow(app.data_dir, "followups.read", exc)
+            continue
+        accounts.append((row["address"], messages))
+    if not accounts:
+        return
+
+    def _factory():
+        from .brain import Brain
+        return Brain(parts.chain, [], parts.dispatch,
+                     parts.journal, parts.memory, audit=False)
+
+    cfg = app.config
+    try:
+        owner_days = float(cfg.get(
+            "followups", "waiting_on_owner_days", 3))
+        them_days = float(cfg.get(
+            "followups", "waiting_on_them_days", 5))
+    except Exception:
+        owner_days, them_days = 3.0, 5.0
+    run_followups(
+        data_dir=app.data_dir, accounts=accounts,
+        brain_factory=_factory,
+        notify=lambda t, b: _notify(
+            app.data_dir, t, b, kind="followup"),
+        journal=app.journal,
+        owner_name=str(cfg.get("owner", "name", "") or ""),
+        waiting_on_owner_days=owner_days,
+        waiting_on_them_days=them_days)
+
+
+def _maybe_followups(app) -> None:
+    """Twice a day at most: the follow-up pass, on its own
+    thread (IMAP reads must never stall the scheduler)."""
+    import json as _json
+    from pathlib import Path as _Path
+    meta_path = _Path(app.data_dir) / "meta.json"
+    try:
+        meta = _json.loads(meta_path.read_text(
+            encoding="utf-8"))
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    if time.time() - float(meta.get("followups_last", 0)) \
+            < 12 * 3600:
+        return
+    meta["followups_last"] = time.time()
+    try:
+        meta_path.write_text(_json.dumps(meta),
+                             encoding="utf-8")
+    except Exception:
+        return
+    threading.Thread(target=_run_followups_pass, args=(app,),
+                     daemon=True,
+                     name="jarvis-followups").start()
+
+
+def _maybe_skill_review(app) -> None:
+    """Spec 6's idle-session Reviewer: once a day, when the
+    owner has been quiet for 10+ minutes and the day saw
+    real tool work, look back at the session and ask
+    whether a repeatable procedure was proven (plus the
+    overlap/Merger scan). On its own thread; the day is
+    only consumed when the review actually runs."""
+    import json as _json
+    from pathlib import Path as _Path
+    meta_path = _Path(app.data_dir) / "meta.json"
+    try:
+        meta = _json.loads(meta_path.read_text(
+            encoding="utf-8"))
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    if meta.get("skill_review_day") == today:
+        return
+    last = float(getattr(app, "_last_turn_ts", 0.0) or 0.0)
+    if not last or time.time() - last < 600:
+        return
+    if len(getattr(app, "history", []) or []) < 2:
+        return
+    try:
+        seq_now = app.journal.seq()
+        since = int(meta.get("skill_review_seq", 0))
+        tool_calls = sum(
+            1 for entry in app.journal.replay(seq_now)
+            if int(entry.get("seq", 0)) > since
+            and entry.get("kind") == "tool.result")
+    except Exception:
+        return
+    if tool_calls < 3:
+        return
+    meta["skill_review_day"] = today
+    meta["skill_review_seq"] = seq_now
+    try:
+        meta_path.write_text(_json.dumps(meta),
+                             encoding="utf-8")
+    except Exception:
+        return
+
+    def _go():
+        try:
+            from . import skill_lifecycle
+            from .skillbook import SkillBook
+            transcript = "\n".join(
+                f"{m.get('role')}: "
+                f"{str(m.get('content', ''))[:240]}"
+                for m in app.history[-10:])
+            try:
+                known = {t["name"] for t in
+                         app.parts.registry.advertised_tools(
+                             app.parts.allowances)}
+            except Exception:
+                known = set()
+            skill_lifecycle.review_run(
+                skill_lifecycle.brain_factory_for(app.parts),
+                app.data_dir, transcript=transcript,
+                book=SkillBook(app.data_dir),
+                known_tools=known, journal=app.journal)
+            skill_lifecycle.check_merges(app.parts,
+                                         app.data_dir)
+        except Exception:
+            pass
+
+    threading.Thread(target=_go, daemon=True,
+                     name="jarvis-skill-review").start()
+
+
+def _maybe_proactive(app) -> None:
+    """Once a day, outside quiet hours, when something is
+    actually waiting: run the proactivity chain's
+    heartbeat mode. The deterministic _maybe_nudge stays
+    as the fallback beneath it (version coexistence)."""
+    import json as _json
+    from pathlib import Path as _Path
+    cfg = app.config
+    try:
+        quiet_start = int(cfg.get("proactivity",
+                                  "quiet_start", 23))
+        quiet_end = int(cfg.get("proactivity",
+                                "quiet_end", 7))
+    except Exception:
+        quiet_start, quiet_end = 23, 7
+    hour = time.localtime().tm_hour
+    if quiet_start <= quiet_end:
+        in_quiet = quiet_start <= hour < quiet_end
+    else:
+        in_quiet = hour >= quiet_start or hour < quiet_end
+    if in_quiet:
+        return
+    meta_path = _Path(app.data_dir) / "meta.json"
+    today = time.strftime("%Y-%m-%d")
+    try:
+        meta = _json.loads(meta_path.read_text(
+            encoding="utf-8"))
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    if meta.get("proactive_day") == today:
+        return
+    trigger = _proactive_trigger(app)
+    if trigger is None:
+        return
+    meta["proactive_day"] = today
+    try:
+        meta_path.write_text(_json.dumps(meta),
+                             encoding="utf-8")
+    except Exception:
+        return
+    threading.Thread(target=_run_proactive_chain,
+                     args=(app, trigger), daemon=True,
+                     name="jarvis-proactivity").start()
+
+
 TEAM_MANIFEST = {
     "name": "core.team",
     "version": "1.0.0",
@@ -941,12 +1343,33 @@ TEAM_MANIFEST = {
 }
 
 
+def _worker_dispatch_of(parts):
+    """The dispatch worker brains ride: parts.worker_dispatch
+    when build_app wired one (it carries the Second Look
+    "fail" marking), else the plain shared dispatch (unit
+    fakes, older parts objects)."""
+    return getattr(parts, "worker_dispatch", None) \
+        or parts.dispatch
+
+
+def _note_owner_words(parts, text) -> None:
+    """Feed the Second Look checker's owner-words context:
+    a chat turn and a delegated task's text are both the
+    owner's own words for provenance purposes."""
+    sl = getattr(parts, "second_look", None)
+    if sl is not None:
+        try:
+            sl.note_owner_text(text)
+        except Exception:
+            pass
+
+
 def _team_brain(parts, with_tools: bool):
     from .brain import Brain
     from .rules import chat_protocol
     schemas = (parts.registry.advertised_tools(parts.allowances)
                if with_tools else [])
-    return Brain(parts.chain, schemas, parts.dispatch,
+    return Brain(parts.chain, schemas, _worker_dispatch_of(parts),
                  parts.journal, parts.memory, audit=False,
                  **({"protocol": chat_protocol(parts.rules_text)}
                     if getattr(parts, "rules_text", "") else {}))
@@ -1549,6 +1972,9 @@ def start_scheduler(app) -> None:
                         app.data_dir, t, b, kind="trigger"),
                     journal=app.journal)
                 _maybe_nudge(app)
+                _maybe_proactive(app)
+                _maybe_followups(app)
+                _maybe_skill_review(app)
             except Exception as exc:
                 from .swallow import note as _swallow
                 _swallow(app.data_dir, "scheduler.loop", exc)
@@ -1718,10 +2144,12 @@ def _delegated_summary(parts, task_text: str) -> str:
     tasks, the scheduler, routines and goals."""
     from .brain import Brain
     from .rules import chat_protocol
+    _note_owner_words(parts, task_text)
     schemas = parts.registry.advertised_tools(parts.allowances)
     from .router import route_schemas
     subset = route_schemas(task_text, schemas)
-    brain = Brain(parts.chain, subset or schemas, parts.dispatch,
+    brain = Brain(parts.chain, subset or schemas,
+                  _worker_dispatch_of(parts),
                   parts.journal, parts.memory,
                   **({"protocol": chat_protocol(parts.rules_text)}
                      if getattr(parts, "rules_text", "") else {}))
@@ -1741,10 +2169,16 @@ def _delegated_summary(parts, task_text: str) -> str:
     result = brain.respond(
         [], prompt,
         rules_annex=_packs_annex(parts, task_text)[0])
-    return str(result.reply)[:900]
+    reply = str(result.reply)
+    records = list(getattr(result, "tool_calls_made", None)
+                   or [])
+    if not reply.strip() and records:
+        from .reporter import findings_line
+        reply = findings_line(records)
+    return reply[:900]
 
 
-def _delegated_run(parts, task_text: str):
+def _delegated_run(parts, task_text: str, tool_names=None):
     """(summary, stopped_reason) — the honest-status variant
     of _delegated_summary: the brain's summary TEXT rides
     first, but HOW the run ended rides beside it, so the task
@@ -1752,12 +2186,35 @@ def _delegated_run(parts, task_text: str):
     stopped short (audit 2026-10-22: _run_delegated marked
     every non-crashing run 'done', including runs whose
     tools all failed and whose summary literally said so)."""
+    summary, reason, _records, _estimate = _delegated_run_full(
+        parts, task_text, tool_names=tool_names)
+    return summary, reason
+
+
+def _delegated_run_full(parts, task_text: str, tool_names=None):
+    """(summary, stopped_reason, tool_records, prompt_estimate)
+    — the full-evidence variant: the Run Reporter (Spec 5),
+    the skill lifecycle (Spec 6) and the per-worker token
+    accounting (section 7.7) all read the run's REAL tool
+    records, never the worker's claims. `tool_names`, when
+    given, restricts the worker's advertised schemas to
+    exactly that set (the Swarm Dispatcher's minimal tool
+    assignment, Spec 4)."""
     from .brain import Brain
     from .rules import chat_protocol
+    _note_owner_words(parts, task_text)
     schemas = parts.registry.advertised_tools(parts.allowances)
-    from .router import route_schemas
-    subset = route_schemas(task_text, schemas)
-    brain = Brain(parts.chain, subset or schemas, parts.dispatch,
+    if tool_names is not None:
+        wanted = set(tool_names)
+        schemas = [s for s in schemas
+                   if s.get("name") in wanted]
+        shown = schemas
+    else:
+        from .router import route_schemas
+        subset = route_schemas(task_text, schemas)
+        shown = subset or schemas
+    brain = Brain(parts.chain, shown,
+                  _worker_dispatch_of(parts),
                   parts.journal, parts.memory,
                   **({"protocol": chat_protocol(parts.rules_text)}
                      if getattr(parts, "rules_text", "") else {}))
@@ -1770,8 +2227,20 @@ def _delegated_run(parts, task_text: str):
     result = brain.respond(
         [], prompt,
         rules_annex=_packs_annex(parts, task_text)[0])
-    return str(result.reply)[:900], str(
-        getattr(result, "stopped_reason", "completed"))
+    # Findings fallback (section 7.6): the run DID the work
+    # (tool results exist) but the model left no final
+    # answer — answer plainly from the tool records instead
+    # of surfacing an empty admission.
+    reply = str(result.reply)
+    records = list(getattr(result, "tool_calls_made", None)
+                   or [])
+    if not reply.strip() and records:
+        from .reporter import findings_line
+        reply = findings_line(records)
+    return reply[:900], str(
+        getattr(result, "stopped_reason", "completed")), \
+        records, int(getattr(result, "prompt_estimate", 0)
+                     or 0)
 
 
 def _local_summary(parts, task_text: str) -> str:
@@ -1789,8 +2258,9 @@ def _local_summary(parts, task_text: str) -> str:
         model=str(cfg.get("ollama", "model",
                           "qwen2.5:7b-instruct-q4_K_M")),
         timeout=float(cfg.get("ollama", "timeout", 120.0)))])
+    _note_owner_words(parts, task_text)
     schemas = parts.registry.advertised_tools(parts.allowances)
-    brain = Brain(chain, schemas, parts.dispatch,
+    brain = Brain(chain, schemas, _worker_dispatch_of(parts),
                   parts.journal, parts.memory,
                   **({"protocol": chat_protocol(parts.rules_text)}
                      if getattr(parts, "rules_text", "") else {}))
@@ -1804,13 +2274,71 @@ def _local_summary(parts, task_text: str) -> str:
     return str(result.reply)[:900]
 
 
+def _reporter_factory(parts):
+    """The Run Reporter's brain: a fresh no-tools brain
+    (audit=False — it answers in JSON to machinery that
+    verifies it, like every internal role)."""
+    def _factory():
+        from .brain import Brain
+        return Brain(parts.chain, [], parts.dispatch,
+                     parts.journal, parts.memory, audit=False)
+    return _factory
+
+
+def _report_for_run(parts, goal, steps, outcome) -> dict:
+    """One run's structured report (Sentient Spec 5) —
+    brain-narrated when possible, deterministic always.
+    Never raises: a run must not lose its ending to its
+    reporter."""
+    from .reporter import build_report, deterministic_report
+    try:
+        return build_report(_reporter_factory(parts),
+                            goal=goal, steps=steps,
+                            outcome=outcome)
+    except Exception:
+        try:
+            return deterministic_report(goal, steps, outcome)
+        except Exception:
+            return {"summary": str(
+                (outcome or {}).get("detail", ""))[:300]
+                or "Run khatm hua.",
+                    "done": [], "failed": [], "files": [],
+                    "links": [], "tools_used": [], "open": [],
+                    "source": "deterministic"}
+
+
+def _skill_run_hook(parts, data_dir, *, transcript: str,
+                    records, ok: bool,
+                    failure_excerpt: str = "",
+                    review: bool = False) -> None:
+    """The skill lifecycle's feed (Sentient Spec 6): every
+    finished run is evidence — which learned skills were
+    used (counted), whether the run's shape is worth
+    proposing as a new skill (Reviewer), and whether a
+    used skill stands indicted by a failure (Repairer).
+    Fully guarded: the lifecycle never breaks a run's
+    ending."""
+    try:
+        from . import skill_lifecycle
+        skill_lifecycle.on_run_finished(
+            parts, data_dir, transcript=transcript,
+            records=records, ok=ok,
+            failure_excerpt=failure_excerpt,
+            force_review=review)
+    except Exception:
+        pass
+
+
 def _run_delegated(parts, data_dir, task_id: str, task: str) -> None:
     """The Spark pattern's worker: _delegated_summary on a
     background thread; the result reaches the owner as a
     notification — the conversation that delegated it never
     blocks and never has to ask."""
+    records = []
+    estimate = 0
     try:
-        summary, reason = _delegated_run(parts, task)
+        summary, reason, records, estimate = \
+            _delegated_run_full(parts, task)
         if reason == "completed":
             status = "done"
         else:
@@ -1819,16 +2347,27 @@ def _run_delegated(parts, data_dir, task_id: str, task: str) -> None:
     except Exception as exc:
         summary = f"Task failed: {type(exc).__name__}: {exc}"
         status = "failed"
+    from .reporter import render_text, steps_from_records
+    report = _report_for_run(
+        parts, task, steps_from_records(records),
+        {"status": status, "detail": summary})
     _task_log(data_dir, {"id": task_id, "task": task[:500],
                          "status": status, "ts": time.time(),
-                         "result": summary[:500]})
-    _notify(data_dir, f"Background task {status}", summary,
-            kind="task")
+                         "result": summary[:500],
+                         "tokens": estimate,
+                         "report": report})
+    _notify(data_dir, f"Background task {status}",
+            render_text(report), kind="task")
     try:
         parts.journal.append(f"task.delegated_{status}",
                              {"id": task_id})
     except Exception:
         pass
+    _skill_run_hook(parts, data_dir, transcript=task + "\n"
+                    + summary, records=records,
+                    ok=(status == "done"),
+                    failure_excerpt=summary
+                    if status != "done" else "")
 
 
 def _fleet_for(holder: dict, parts):
@@ -1849,17 +2388,49 @@ def _fleet_for(holder: dict, parts):
     return fleet
 
 
-def _run_batch(parts, data_dir, batch_id: str, tasks, fleet):
+def _run_batch(parts, data_dir, batch_id: str, tasks, fleet,
+               runner=None):
     """A jhund of work orders through the fleet: every job runs
     _delegated_summary quietly (NO per-job notification — the
     owner asked not to be pestered), each lands in the task
-    log, and ONE summary notification closes the batch."""
-    results = fleet.run_many(
-        tasks, lambda t: _delegated_run(parts, t))
+    log, and ONE summary notification closes the batch.
+
+    `runner` (Spec 4's swarm front-end) maps one task text to
+    (summary, stopped_reason); the default is the full-
+    evidence delegated run, which also feeds the batch's
+    token accounting: a per-run token ceiling
+    (config fleet.token_budget, prompt-estimate tokens;
+    0 = no ceiling) stops LATER items from starting once
+    the budget is spent — they are marked, never silently
+    dropped (section 7.7)."""
+    all_records = []
+    spent = [0]
+    budget = 0
+    cfg = getattr(parts, "config", None)
+    if cfg is not None:
+        try:
+            budget = int(cfg.get("fleet", "token_budget", 0))
+        except Exception:
+            budget = 0
+
+    def _default_runner(task_text):
+        if budget and spent[0] >= budget:
+            return ("token budget (fleet.token_budget="
+                    f"{budget}) khatm — ye item chalaya "
+                    "nahi gaya", "budget")
+        summary, reason, records, estimate = \
+            _delegated_run_full(parts, task_text)
+        spent[0] += int(estimate or 0)
+        all_records.extend(records)
+        return summary, reason
+
+    results = fleet.run_many(tasks, runner or _default_runner)
     ok_count = 0
     failures = []
+    rep_steps = []
     for i, (task, res) in enumerate(zip(tasks, results)):
         outcome = res.get("result") if res.get("ok") else None
+        tokens = None
         if isinstance(outcome, tuple) and len(outcome) == 2 \
                 and outcome[1] == "completed":
             ok_count += 1
@@ -1875,6 +2446,10 @@ def _run_batch(parts, data_dir, batch_id: str, tasks, fleet):
             summary = str(res.get("error", ""))[:400]
             status = "failed"
             failures.append(f"{task[:60]} — {summary[:80]}")
+        rep_steps.append({
+            "label": str(task)[:60], "tool": "",
+            "ok": status == "done",
+            "error": summary if status != "done" else None})
         _task_log(data_dir, {"id": f"{batch_id}-{i}",
                              "task": task[:500], "status": status,
                              "ts": time.time(),
@@ -1884,14 +2459,124 @@ def _run_batch(parts, data_dir, batch_id: str, tasks, fleet):
     if len(tasks) > 1:
         lines.append(f"(fleet peak concurrency: "
                      f"{fleet.peak})")
+    if spent[0]:
+        lines.append(f"(tokens ≈ {spent[0]}"
+                     + (f" / budget {budget}" if budget
+                        else "") + ")")
+    # The batch's Run Report (Spec 5): one structured
+    # account over the per-item results. The DETERMINISTIC
+    # report is instant, so it tails the closing
+    # notification; the brain-narrated report (guarded,
+    # possibly slow over a cold chain) is computed after
+    # and stored with the batch's task row.
+    from .reporter import (deterministic_report, render_text)
+    _b_outcome = {"status": "done" if ok_count == len(tasks)
+                  else "partial",
+                  "detail": f"{ok_count}/{len(tasks)} kaam "
+                            "safal",
+                  "tokens": spent[0]}
+    det_report = deterministic_report(
+        f"batch of {len(tasks)} kaam", rep_steps, _b_outcome)
+    lines.append("— Report: " + render_text(det_report))
     _notify(data_dir, "Batch report", "\n".join(lines),
             kind="batch")
+    report = _report_for_run(
+        parts, f"batch of {len(tasks)} kaam", rep_steps,
+        _b_outcome)
+    _task_log(data_dir, {"id": batch_id, "kind": "batch",
+                         "task": f"batch ({len(tasks)} kaam)",
+                         "status": "done"
+                         if ok_count == len(tasks) else "partial",
+                         "ts": time.time(), "tokens": spent[0],
+                         "report": report})
     try:
         parts.journal.append("task.batch_done",
                              {"id": batch_id, "ok": ok_count,
                               "total": len(tasks)})
     except Exception:
         pass
+    _skill_run_hook(
+        parts, data_dir,
+        transcript="batch: " + "; ".join(
+            str(t)[:80] for t in tasks[:5]),
+        records=all_records,
+        ok=(ok_count == len(tasks)),
+        failure_excerpt="; ".join(failures[:3]))
+
+
+def _run_swarm(parts, data_dir, swarm_id: str,
+               request_text: str, content: str = "") -> None:
+    """The swarm pipeline (Sentient Spec 4): Extractor ->
+    Dispatcher -> the fleet, through the batch path the
+    owner already trusts. Every stage can stop the run
+    honestly — no items, no invented work; a bad plan,
+    no half-run swarm."""
+    from . import swarm as _swarm_mod
+
+    def _factory():
+        from .brain import Brain
+        return Brain(parts.chain, [], parts.dispatch,
+                     parts.journal, parts.memory, audit=False)
+
+    def _stop(title, body):
+        _notify(data_dir, title, body, kind="task")
+        try:
+            parts.journal.append("swarm.stopped",
+                                 {"id": swarm_id,
+                                  "reason": title})
+        except Exception:
+            pass
+
+    items = _swarm_mod.extract_items(_factory, request_text,
+                                     content)
+    if items is None:
+        _stop("Swarm ruka",
+              "Extractor se item list nahi ban payi, sir — "
+              "koi kaam shuru nahi hua.")
+        return
+    if not items:
+        _stop("Swarm ruka",
+              "Is baat me koi alag item mila hi nahi, sir — "
+              "koi kaam nahi chalaya gaya.")
+        return
+    tool_names = {t["name"] for t in
+                  parts.registry.advertised_tools(
+                      parts.allowances)}
+    groups = _swarm_mod.dispatch_plan(
+        _factory, request_text, items, tool_names)
+    if groups is None:
+        _stop("Swarm ruka",
+              "Dispatcher ka plan do koshishon me bhi sahi "
+              "nahi ban paya, sir — koi kaam nahi chalaya "
+              "gaya.")
+        return
+    jobs = _swarm_mod.jobs_for_groups(groups, items)
+    tools_by_text = {}
+    for job_text, job_tools in jobs:
+        tools_by_text.setdefault(job_text, job_tools)
+    try:
+        parts.journal.append("swarm.started", {
+            "id": swarm_id, "items": len(items),
+            "groups": len(groups)})
+    except Exception:
+        pass
+
+    def _runner(task_text):
+        return _delegated_run(
+            parts, task_text,
+            tool_names=tools_by_text.get(task_text))
+
+    from .fleet import Fleet
+    workers = 32
+    cfg = getattr(parts, "config", None)
+    if cfg is not None:
+        try:
+            workers = int(cfg.get("fleet", "workers", 32))
+        except Exception:
+            workers = 32
+    _run_batch(parts, data_dir, swarm_id,
+               [t for t, _tools in jobs], Fleet(workers),
+               runner=_runner)
 
 
 def _delegate_tasks_op(holder: dict, data_dir: Path):
@@ -2103,6 +2788,29 @@ def _run_mission_app(parts, data_dir, mission_id: str,
                 negative=True)
     except Exception:
         pass
+    # The mission's Run Report (Spec 5): structured,
+    # grounded in the code-side outcome — the judge's note
+    # and the step log are evidence, the report is the
+    # account the owner scans. The deterministic report is
+    # instant (it lands in the task row and tails the
+    # notification); the brain-narrated version is
+    # computed after and merged onto the same task row.
+    from .reporter import (deterministic_report,
+                           render_text as _render_report)
+    _m_steps = [{
+        "label": f"kadam {s.get('step', '?')}: "
+                 f"{str(s.get('summary', ''))[:70]}",
+        "tool": "",
+        "ok": True if outcome["state"] == "done" else None,
+        "error": None} for s in outcome["steps"]]
+    _m_outcome = {"status": outcome["state"],
+                  "detail": str(outcome["note"])[:300]}
+    if outcome.get("repairs"):
+        _m_outcome["open"] = [
+            "repair: " + str(r.get("root_cause", ""))[:120]
+            for r in outcome["repairs"][:3]]
+    det_report = deterministic_report(goal, _m_steps,
+                                      _m_outcome)
     _task_log(data_dir, {"id": mission_id, "kind": "mission",
                          "task": goal[:500],
                          "status": outcome["state"],
@@ -2110,7 +2818,8 @@ def _run_mission_app(parts, data_dir, mission_id: str,
                          "result": (f"{outcome['steps_taken']} "
                                     f"kadam — "
                                     f"{outcome['note']}")[:500],
-                         "steps": outcome["steps"]})
+                         "steps": outcome["steps"],
+                         "report": det_report})
     icons = {"done": "✅", "stuck": "⛔", "owner": "🙋",
              "budget": "⏳", "stopped": "⏸"}
     repair_note = ""
@@ -2122,7 +2831,15 @@ def _run_mission_app(parts, data_dir, mission_id: str,
     _notify(data_dir, f"Mission {outcome['state']}",
             f"{icons.get(outcome['state'], '•')} Goal: "
             f"{goal[:120]}\nKadam: {outcome['steps_taken']} — "
-            f"{outcome['note']}{repair_note}", kind="mission")
+            f"{outcome['note']}{repair_note}"
+            f"\n— Report: {_render_report(det_report)}",
+            kind="mission")
+    _brain_report = _report_for_run(parts, goal, _m_steps,
+                                    _m_outcome)
+    if _brain_report.get("source") == "brain":
+        _task_log(data_dir, {"id": mission_id,
+                             "kind": "mission",
+                             "report": _brain_report})
     try:
         parts.journal.append("mission.done",
                              {"id": mission_id,
@@ -2130,6 +2847,15 @@ def _run_mission_app(parts, data_dir, mission_id: str,
                               "steps": outcome["steps_taken"]})
     except Exception:
         pass
+    _skill_run_hook(
+        parts, data_dir,
+        transcript=goal + "\n" + "; ".join(
+            str(s.get("summary", ""))[:80]
+            for s in outcome["steps"][:6]),
+        records=[], ok=(outcome["state"] == "done"),
+        failure_excerpt=str(outcome.get("note", ""))
+        if outcome["state"] != "done" else "",
+        review=True)
 
 
 def _mission_op(holder: dict, data_dir: Path):
@@ -2562,6 +3288,31 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
                 "adhoore criteria ko nishana banaya gaya")
     if state["note"]:
         lines += ["", f"## Note\n{state['note']}"]
+    # Run Report (Spec 5): the structured account over the
+    # build's code-side facts — binding, verification,
+    # rubric — appended under the computed-confidence
+    # walkthrough, never written from the builder's claims.
+    try:
+        from .reporter import render_text as _render_rep
+        _b_steps = [{
+            "label": f"kadam {i + 1}: {str(st)[:60]}",
+            "tool": "",
+            "ok": state["step_states"][i] == "done",
+            "error": None
+            if state["step_states"][i] == "done"
+            else str(state["step_states"][i])}
+            for i, st in enumerate(plan.get("steps") or [])]
+        _b_report = _report_for_run(
+            parts, plan["goal"], _b_steps,
+            {"status": state["status"],
+             "detail": (state.get("note")
+                        or justification)[:300],
+             "files": list(binding.get("done") or [])})
+        lines += ["", "## Run report (Reporter)",
+                  _render_rep(_b_report)]
+        state["report"] = _b_report
+    except Exception:
+        pass
     store.write_walkthrough(build_id, "\n".join(lines) + "\n")
     store.save(state)
     icon = "✅" if state["status"] == "done" else "⛔"
@@ -2576,6 +3327,14 @@ def _run_build_app(parts, data_dir, build_id: str) -> None:
             "confidence": confidence})
     except Exception:
         pass
+    _skill_run_hook(
+        parts, data_dir,
+        transcript=plan["goal"] + "\n" + " | ".join(
+            summaries[:5]),
+        records=[], ok=(state["status"] == "done"),
+        failure_excerpt=str(state.get("note", ""))
+        if state["status"] != "done" else "",
+        review=True)
 
 
 def _builds_op(holder: dict, data_dir: Path):
@@ -3465,7 +4224,7 @@ def make_dispatch(gate, registry, journal, allowances,
                   pass_decision=False, refused_exc=(), ledger=None,
                   session_id="", approval_sink=None,
                   calibrator=None, degraded=False,
-                  guardrails=None):
+                  guardrails=None, second_look=None):
     """The gate-mediated dispatch every tool call flows through.
 
     Journals tool.call (with the gate verdict) and tool.result — the
@@ -3518,8 +4277,25 @@ def make_dispatch(gate, registry, journal, allowances,
                 return bool(getattr(tool, "destructive", False))
         return name in guarded
 
+    def _sl_in_scope(name) -> bool:
+        """Second Look's scope: send-class tools only
+        (jarvis/second_look.py) — the starter send set, or
+        a manifest permission of the send class."""
+        if second_look is None:
+            return False
+        from .second_look import in_scope as _sl_scope
+        tool = None
+        tools = getattr(registry, "_tools", None)
+        if isinstance(tools, dict):
+            tool = tools.get(name)
+        try:
+            return bool(_sl_scope(name, tool))
+        except Exception:
+            return False
+
     def _dispatch_once(name, args=None, origin="owner",
-                       approved_decision=None, _fact_gate=False):
+                       approved_decision=None, _fact_gate=False,
+                       _sl_mode=None):
         args = dict(args or {})
         if guardrails is not None:
             # Hookify guardrails (ECC Wave B): the owner's
@@ -3621,10 +4397,53 @@ def make_dispatch(gate, registry, journal, allowances,
             "tool": name, "args": args, "gate_verdict": verdict,
             "origin": origin,
             "via_card": approved_decision is not None})
+        # Second Look (Sentient Spec 1): after the gate's
+        # own verdict, before anything runs, a send-class
+        # call must prove its provenance (Stage A) and, on
+        # the conversational path, that it matches the
+        # owner's request (Stage B). The marking rides the
+        # dispatch wrappers the same way GateGuard's does:
+        # _sl_mode="card" only on the conversational brain's
+        # dispatch (a flag raises an approval card carrying
+        # the reason), _sl_mode="fail" on worker dispatches
+        # (Stage A only; a flag fails the step — nobody is
+        # there to answer a card). Unmarked dispatches (the
+        # owner's own execute_tool hands, card re-dispatch,
+        # automations) are exempt, exactly like the
+        # fact-gate. A card-approved call is never re-checked
+        # (approved_decision present) — the owner's tap IS
+        # the answer, and re-checking would loop forever.
+        # The checker can only ADD a question; a gate deny
+        # stands untouched (the check is skipped entirely).
+        sl_flag = None
+        if _sl_mode and approved_decision is None \
+                and verdict != "deny" and _sl_in_scope(name):
+            try:
+                sl_flag = second_look.check(
+                    name, args, mode=_sl_mode)
+            except Exception as exc:
+                sl_flag = {
+                    "stage": "A", "flags": [],
+                    "reason": "Second Look chal nahi paya "
+                              f"({type(exc).__name__}) — "
+                              "fail-closed: bina pushti ke "
+                              "ye send nahi jayega"}
+            if sl_flag is not None and _sl_mode == "fail":
+                result = {
+                    "ok": False, "second_look": sl_flag,
+                    "error": "Second Look ne is kadam ko "
+                             "roka: "
+                             + str(sl_flag.get("reason", ""))}
+                journal.append("tool.result", {
+                    "tool": name, "ok": False,
+                    "needs_approval": False,
+                    "second_look": True})
+                return result
         replayed = False
-        executable = verdict in ("allow", "allow_with_undo") or (
-            verdict == "require_approval"
-            and approved_decision is not None)
+        executable = (verdict in ("allow", "allow_with_undo")
+                      or (verdict == "require_approval"
+                          and approved_decision is not None)) \
+            and sl_flag is None
         if executable and degraded and _is_guarded(name):
             # The degraded path (jarvis.skills failed to
             # import, so _defaults is dispatching and NO gate
@@ -3655,13 +4474,35 @@ def make_dispatch(gate, registry, journal, allowances,
                     ledger, session_id, name, args, _execute, journal)
             else:
                 result = _execute()
-        elif verdict == "require_approval":
+        elif verdict == "require_approval" \
+                or sl_flag is not None:
             result = {"ok": False, "needs_approval": True,
                       "error": f"{name} needs your approval before I "
                                f"run it, sir."}
+            if sl_flag is not None:
+                # The gate may have allowed this call — the
+                # Second Look flag is the ONLY reason it now
+                # waits for the owner, and the reason rides
+                # the result AND the card itself.
+                result["second_look"] = sl_flag
+                result["error"] = (
+                    "Second Look: "
+                    + str(sl_flag.get("reason", ""))
+                    + " Isiliye pehle aapki razamandi "
+                      "chahiye, sir.")
             if approval_sink is not None:
                 try:
-                    card = approval_sink(name, args)
+                    if sl_flag is not None:
+                        try:
+                            card = approval_sink(
+                                name, args,
+                                note="Second Look: "
+                                + str(sl_flag.get(
+                                    "reason", ""))[:140])
+                        except TypeError:
+                            card = approval_sink(name, args)
+                    else:
+                        card = approval_sink(name, args)
                     if card:
                         result["card"] = {
                             "id": card.get("id"),
@@ -3684,6 +4525,20 @@ def make_dispatch(gate, registry, journal, allowances,
         if replayed:
             entry["idempotent_replay"] = True
         journal.append("tool.result", entry)
+        if second_look is not None:
+            # Feed the provenance set: destinations this
+            # result PRODUCED (record-class tools only —
+            # the checker itself refuses web content).
+            try:
+                _perm = ""
+                _tools = getattr(registry, "_tools", None)
+                if isinstance(_tools, dict) \
+                        and _tools.get(name) is not None:
+                    _perm = getattr(_tools[name], "permission",
+                                    "") or ""
+                second_look.note_result(name, _perm, result)
+            except Exception:
+                pass
         return result
 
     def _learn_outcome(name, result):
@@ -3701,7 +4556,8 @@ def make_dispatch(gate, registry, journal, allowances,
         if calibrator is None or not isinstance(result, dict):
             return
         if result.get("gate_denied") or result.get("needs_approval") \
-                or result.get("needs_facts"):
+                or result.get("needs_facts") \
+                or result.get("second_look"):
             return
         try:
             tool = registry._tools.get(name) \
@@ -3721,17 +4577,17 @@ def make_dispatch(gate, registry, journal, allowances,
 
     def dispatch(name, args=None, origin="owner",
                  approved_decision=None, _depth=0,
-                 _fact_gate=False):
+                 _fact_gate=False, _sl_mode=None):
         result = _dispatch_routed(name, args, origin,
                                   approved_decision, _depth,
-                                  _fact_gate)
+                                  _fact_gate, _sl_mode)
         if _depth == 0:
             _learn_outcome(name, result)
         return result
 
     def _dispatch_routed(name, args=None, origin="owner",
                          approved_decision=None, _depth=0,
-                         _fact_gate=False):
+                         _fact_gate=False, _sl_mode=None):
         """One call, with the owner's route doctrine on top:
         the latest route runs first; on an honest failure the
         preserved older/alternate route is TRIED — never
@@ -3742,13 +4598,15 @@ def make_dispatch(gate, registry, journal, allowances,
         (scrape -> fetch -> tor) resolves in at most 3 hops."""
         result = _dispatch_once(name, args, origin,
                                 approved_decision,
-                                _fact_gate=_fact_gate)
+                                _fact_gate=_fact_gate,
+                                _sl_mode=_sl_mode)
         if _depth >= 2 or approved_decision is not None:
             return result
         if not isinstance(result, dict) or _result_ok(result):
             return result
         if result.get("needs_approval") or result.get("gate_denied") \
-                or result.get("needs_facts"):
+                or result.get("needs_facts") \
+                or result.get("second_look"):
             return result
         fallback = FALLBACK_ROUTES.get(name)
         if not fallback:
@@ -3756,7 +4614,8 @@ def make_dispatch(gate, registry, journal, allowances,
         try:
             alt = _dispatch_routed(fallback, args, origin=origin,
                                    _depth=_depth + 1,
-                                   _fact_gate=_fact_gate)
+                                   _fact_gate=_fact_gate,
+                                   _sl_mode=_sl_mode)
         except Exception:
             return result
         if isinstance(alt, dict) and _result_ok(alt):
@@ -3942,12 +4801,13 @@ class _LearnedMemory:
 
     def __init__(self, memory, learned: LearnedStore,
                  user_model=None, calibrator=None,
-                 instincts=None):
+                 instincts=None, skills=None):
         self._memory = memory
         self._learned = learned
         self._user_model = user_model
         self._calibrator = calibrator
         self._instincts = instincts
+        self._skills = skills
 
     def __getattr__(self, name):
         return getattr(self._memory, name)
@@ -3995,6 +4855,16 @@ class _LearnedMemory:
             try:
                 lines.extend(
                     self._instincts.context_lines(query))
+            except Exception:
+                pass
+        if self._skills is not None:
+            # The skill return path (Spec 6): a learned
+            # playbook whose when_to_use matches this turn
+            # rides into the brain's context — at most 2, so
+            # procedure advises without crowding facts.
+            try:
+                lines.extend(
+                    self._skills.context_lines(query, k=2))
             except Exception:
                 pass
         lines.extend(self._memory.excerpts(query, k=k))
@@ -4129,6 +4999,8 @@ class AppParts:
     calibrator: object = None
     instincts: object = None
     guardrails: object = None
+    second_look: object = None
+    worker_dispatch: object = None
 
 
 UPGRADE_MANIFEST = {
@@ -4618,9 +5490,12 @@ def build_app(data_dir, *, chain=None, modules=None,
     calibrator = Calibrator(data_dir)
     from .instincts import InstinctBook
     instincts = InstinctBook(data_dir)
+    from .skillbook import SkillBook
+    skill_book = SkillBook(data_dir)
     memory = _LearnedMemory(memory, learned, user_model=user_model,
                             calibrator=calibrator,
-                            instincts=instincts)
+                            instincts=instincts,
+                            skills=skill_book)
     learned.scan()   # ingest anything he dropped in while JARVIS was off
 
     registry = _build_registry(modules, gate, journal, memory, data_dir)
@@ -4885,6 +5760,44 @@ def build_app(data_dir, *, chain=None, modules=None,
     _card_book = ConfirmationBook(data_dir)
     from .guardrails import GuardrailBook
     guardrail_book = GuardrailBook(data_dir)
+    # Second Look (Sentient Spec 1): the provenance checker
+    # for outgoing sends. Its Stage B brain is a fresh
+    # no-tools brain (audit=False) over the same chain; its
+    # trusted records are read LIVE (tracker rows + the
+    # trust-guarded memory facts), so a contact filed a
+    # minute ago already counts as a source.
+    brain_mod = _resolve_module(modules, "brain")
+
+    def _sl_trusted_texts():
+        texts = []
+        try:
+            from .tracker import tables as _tracker_tables
+            for _rows in _tracker_tables(data_dir).values():
+                for _row in _rows:
+                    texts.append(json.dumps(
+                        _row, ensure_ascii=False, default=str))
+        except Exception:
+            pass
+        try:
+            for _fact in memory.facts.current_facts():
+                texts.append(str(_fact.get("claim", "")))
+        except Exception:
+            pass
+        return texts
+
+    def _sl_no_dispatch(name, args=None):
+        return {"ok": False,
+                "error": "Second Look checker ke paas tools "
+                         "nahi hain"}
+
+    def _sl_brain():
+        return brain_mod.Brain(chain, [], _sl_no_dispatch,
+                               journal, memory, audit=False)
+
+    from .second_look import SecondLook
+    second_look = SecondLook(
+        journal=journal, brain_factory=_sl_brain,
+        trusted_texts=_sl_trusted_texts)
     dispatch = _activity_dispatch(
         make_dispatch(gate, registry, journal, allowances,
                       pass_decision=pass_decision,
@@ -4893,8 +5806,20 @@ def build_app(data_dir, *, chain=None, modules=None,
                       approval_sink=_card_book.add,
                       calibrator=calibrator,
                       degraded=skills_mod is _defaults,
-                      guardrails=guardrail_book),
+                      guardrails=guardrail_book,
+                      second_look=second_look),
         activity)
+
+    def _worker_dispatch(name, args=None, **kwargs):
+        # The dispatch worker brains ride (delegated, team,
+        # build steps, scheduler routines): identical to
+        # parts.dispatch except for the Second Look marking
+        # — "fail" mode (Stage A provenance only; a flag
+        # fails the step instead of raising a card nobody
+        # is present to answer).
+        return dispatch(name, args, _sl_mode="fail", **kwargs)
+
+    worker_dispatch = _worker_dispatch
     tool_schemas = registry.advertised_tools(allowances)
     # The ONE rules file (the owner's standing order): the brain's
     # protocol is built from JARVIS-RULES.txt at the repo root —
@@ -4907,8 +5832,11 @@ def build_app(data_dir, *, chain=None, modules=None,
         # to parts.dispatch except for the _fact_gate
         # marking — the GateGuard fact-gate in make_dispatch
         # keys on it (see there for why the marking cannot
-        # ride the IFC origin string).
-        return dispatch(name, args, _fact_gate=True, **kwargs)
+        # ride the IFC origin string) — and the Second Look
+        # marking (_sl_mode="card": both provenance stages,
+        # a flag raises an approval card).
+        return dispatch(name, args, _fact_gate=True,
+                        _sl_mode="card", **kwargs)
 
     brain = _resolve_module(modules, "brain").Brain(
         chain, tool_schemas, _brain_dispatch, journal, memory,
@@ -4929,7 +5857,9 @@ def build_app(data_dir, *, chain=None, modules=None,
                      instincts=instincts,
                      guardrails=guardrail_book,
                      rules_text=_rules_text,
-                     rules_source=_rules_source)
+                     rules_source=_rules_source,
+                     second_look=second_look,
+                     worker_dispatch=worker_dispatch)
     parts_holder["parts"] = parts
     return parts
 
@@ -5012,6 +5942,10 @@ class ChatApp:
         else:
             from .guardrails import GuardrailBook
             self.guardrails = GuardrailBook(self.data_dir)
+        self.second_look = getattr(parts, "second_look", None)
+        # For the skill lifecycle's idle-session review: when
+        # the owner last spoke (set at the end of turn()).
+        self._last_turn_ts = 0.0
         self.voice_manager = None
         self.history: list = []
         self.incognito = False
@@ -5099,6 +6033,41 @@ class ChatApp:
         self.voice_manager.ptt_hold(bool(held))
         return {"ok": True, "ptt_held": bool(held)}
 
+    def _dictation_polish(self, text: str) -> str:
+        """Spec 8's hook on the local voice: deterministic
+        tidy always; a tool-free LOCAL brain (Ollama only —
+        dictation never spends a cloud call) may polish
+        longer utterances, admitted only under the
+        word-preservation check in dictation.polish."""
+        from . import dictation
+        brain = getattr(self, "_dictation_brain", None)
+        if brain is None:
+            try:
+                from .brain import Brain
+                from .providers import (FallbackChain,
+                                        OllamaProvider)
+                cfg = self.parts.config
+                chain = FallbackChain([OllamaProvider(
+                    base_url=str(cfg.get(
+                        "ollama", "base_url",
+                        "http://localhost:11434")),
+                    model=str(cfg.get("ollama", "model",
+                                      "qwen2.5:7b-instruct-"
+                                      "q4_K_M")),
+                    timeout=10.0)])
+                brain = Brain(chain, [], self.parts.dispatch,
+                              self.journal, self.parts.memory,
+                              audit=False)
+            except Exception:
+                brain = False
+            self._dictation_brain = brain
+        if not brain:
+            return dictation.polish(text)
+        return dictation.polish(
+            text,
+            brain_call=lambda prompt: str(
+                brain.respond([], prompt).reply))
+
     def _make_voice_session(self, events):
         """The Live session factory the VoiceManager calls: the
         owner's filed Gemini key, the same gated tools the chat
@@ -5116,7 +6085,8 @@ class ChatApp:
                     model=str(cfg0.get("whisper_model", "base"))),
                 tts=SystemTTS(),
                 respond=self.turn,
-                ack_delay=float(cfg0.get("ack_delay_s", 0.6)))
+                ack_delay=float(cfg0.get("ack_delay_s", 0.6)),
+                polish=self._dictation_polish)
         from .prompt import PERSONA
         from .voice import LIVE_MODELS, LiveSession
         keys_mod = _load_keys_module()
@@ -5579,6 +6549,25 @@ class ChatApp:
                 f"👁 {w.get('name', w['url'])} "
                 f"[{w.get('condition', 'noteworthy')}] — {w['url']}"
                 for w in rows[-10:])
+        if text.startswith("/swarm "):
+            request = text[len("/swarm "):].strip()
+            if not request:
+                return ("Khaali swarm, sir — /swarm <kaam "
+                        "aur items> likhiye.")
+            if _is_stopped(self.data_dir):
+                return ("Band hoon, sir — pehle /resume "
+                        "kahiye.")
+            swarm_id = uuid.uuid4().hex[:8]
+            threading.Thread(
+                target=_run_swarm,
+                args=(self.parts, self.data_dir, swarm_id,
+                      request),
+                daemon=True,
+                name=f"jarvis-swarm-{swarm_id}").start()
+            return ("Swarm shuru kar diya, sir — pehle "
+                    "items niklenge, phir unke groups "
+                    "banenge, phir fleet chalega. Ant me "
+                    "EK report milegi.")
         if text == "/tasks":
             path = self.data_dir / "tasks.jsonl"
             rows = []
@@ -5589,8 +6578,12 @@ class ChatApp:
                 except Exception:
                     rows = []
             latest = {}
-            for row in rows:            # last status per task wins
-                latest[row.get("id", "")] = row
+            for row in rows:
+                # Rows MERGE per task: a later row may carry
+                # only an enrichment (a Run Report, Spec 5)
+                # for a run whose status row came first.
+                rid = row.get("id", "")
+                latest[rid] = {**latest.get(rid, {}), **row}
             if not latest:
                 return "Koi background task nahi hai, sir."
             return "\n".join(
@@ -5599,21 +6592,42 @@ class ChatApp:
                 for r in list(latest.values())[-8:])
         if text == "/rules candidates":
             from . import candidates as _cand
-            waiting = _cand.pending(self.data_dir)
-            if not waiting:
+            all_waiting = _cand.pending(self.data_dir)
+            waiting = [r for r in all_waiting
+                       if r.get("kind") != "skill"]
+            skill_waiting = [r for r in all_waiting
+                             if r.get("kind") == "skill"]
+            if not waiting and not skill_waiting:
                 return "Koi rule-salah baaki nahi hai, sir."
-            lines = ["Rule salahen (sirf salah — lagengi tab "
-                     "jab aap accept karoge), sir:"]
-            for row in waiting:
-                lines.append(f"• {row['id']} — {row['text']}")
-            lines.append("Hukum: /rules accept <id> · "
-                         "/rules drop <id>")
+            lines = []
+            if waiting:
+                lines.append("Rule salahen (sirf salah — "
+                             "lagengi tab jab aap accept "
+                             "karoge), sir:")
+                for row in waiting:
+                    lines.append(f"• {row['id']} — "
+                                 f"{row['text']}")
+                lines.append("Hukum: /rules accept <id> · "
+                             "/rules drop <id>")
+            if skill_waiting:
+                lines.append(f"({len(skill_waiting)} skill "
+                             "salah alag hai — /skills dekho.)")
             return "\n".join(lines)
         if text.startswith("/rules accept ") or \
                 text.startswith("/rules drop "):
             from . import candidates as _cand
             accepting = text.startswith("/rules accept ")
             cid = text.rsplit(" ", 1)[-1].strip()
+            if accepting:
+                target = next(
+                    (r for r in _cand.pending(self.data_dir)
+                     if r.get("id") == cid), None)
+                if target is not None \
+                        and target.get("kind") == "skill":
+                    return ("Ye ek SKILL salah hai, sir — "
+                            "rule file me nahi jayegi. Ise "
+                            f"/skills accept {cid} se book "
+                            "me dalo.")
             status = "accepted" if accepting else "dropped"
             row = _cand.decide(self.data_dir, cid, status)
             if row is None:
@@ -5639,6 +6653,130 @@ class ChatApp:
                     "TAREEKA hisse me jud gaya. Naya asar agle "
                     "start se hoga (rules shuru me padhe jate "
                     "hain).")
+        if text == "/skills":
+            from .skillbook import SkillBook
+            from . import candidates as _cand
+            book = SkillBook(self.data_dir)
+            learned = book.list()
+            waiting = [r for r in _cand.pending(self.data_dir)
+                       if r.get("kind") == "skill"]
+            if not learned and not waiting:
+                return ("Koi seekha hua skill nahi hai abhi, "
+                        "sir — kaam ke baad Reviewer salah "
+                        "bana kar bhejega, ya /skills learn "
+                        "<text> se sikhaiye.")
+            lines = []
+            if learned:
+                lines.append("Seekhe hue skills, sir:")
+                for s in learned:
+                    flag = ""
+                    if str(s.get("checks_status", "")) \
+                            .startswith("fail"):
+                        flag = " [checks FAIL]"
+                    lines.append(
+                        f"• {s['name']} — "
+                        f"{s.get('when_to_use', '')[:80]} "
+                        f"(use {s.get('uses', 0)}, sahi "
+                        f"{s.get('successes', 0)}, fail "
+                        f"{s.get('failures', 0)}){flag}")
+            if waiting:
+                lines.append("Skill salahen (accept karne par "
+                             "book me jayengi):")
+                for r in waiting:
+                    lines.append(f"• {r['id']} — {r['text']}")
+                lines.append("Hukum: /skills accept <id> · "
+                             "/skills drop <id>")
+            return "\n".join(lines)
+        if text.startswith("/skills accept ") or \
+                text.startswith("/skills drop "):
+            from . import candidates as _cand
+            from .skillbook import SkillBook, run_checks
+            accepting = text.startswith("/skills accept ")
+            cid = text.rsplit(" ", 1)[-1].strip()
+            row = next(
+                (r for r in _cand.pending(self.data_dir)
+                 if r.get("id") == cid
+                 and r.get("kind") == "skill"), None)
+            if row is None:
+                return "Woh skill salah pending nahi hai, sir."
+            _cand.decide(self.data_dir, cid,
+                         "accepted" if accepting else "dropped")
+            if not accepting:
+                return f"Skill salah {cid} hata di, sir."
+            skill = dict(row.get("skill") or {})
+            book = SkillBook(self.data_dir)
+            book.add(skill)
+            if row.get("action") == "merge":
+                for other in skill.get("merged_from") or []:
+                    if other != skill.get("name"):
+                        book.remove(other)
+            run = [c for c in skill.get("checks") or []
+                   if isinstance(c, dict) and c.get("run")]
+            note = ""
+            if run:
+                results = run_checks(run)
+                passed = all(r["ok"] for r in results)
+                book.set_checks_status(
+                    skill["name"],
+                    "passed" if passed else
+                    "failed: " + "; ".join(
+                        r["detail"] for r in results
+                        if not r["ok"])[:160])
+                note = (" Self-checks: "
+                        + ("sab pass." if passed else
+                           "KUCH FAIL — skill flag ke saath "
+                           "rakha hai, andha bharosa nahi."))
+            return (f"Skill '{skill.get('name', '')}' book "
+                    f"me aa gaya, sir.{note}")
+        if text.startswith("/skills learn "):
+            from . import skill_lifecycle
+            source = text[len("/skills learn "):].strip()
+            if not source:
+                return "Khaali text se kya seekhun, sir?"
+            try:
+                known = {t["name"] for t in
+                         self.parts.registry.advertised_tools(
+                             self.parts.allowances)}
+            except Exception:
+                known = set()
+            row = skill_lifecycle.learn_skill(
+                skill_lifecycle.brain_factory_for(self.parts),
+                self.data_dir, source_text=source,
+                source_label="owner text", known_tools=known,
+                journal=self.journal)
+            if row is None:
+                return ("Is text se koi saaf playbook nahi "
+                        "bana, sir — ya to repeatable tareeka "
+                        "nahi tha, ya drafting fail hui.")
+            return (f"Skill salah ban gayi, sir: {row['id']} "
+                    f"— /skills se dekho, /skills accept "
+                    f"{row['id']} se book me dalo.")
+        if text.startswith("/task "):
+            from . import taskparse
+            from .skill_lifecycle import brain_factory_for
+            sentence = text[len("/task "):].strip()
+            if not sentence:
+                return ("Khaali jumla hai, sir — /task "
+                        "<jumla> likhiye.")
+            parsed, problems = taskparse.parse_task(
+                brain_factory_for(self.parts), sentence,
+                tz_name=time.strftime("%Z"), now=time.time())
+            if parsed is None:
+                return ("Samajh nahi paya, sir: "
+                        + "; ".join(problems)
+                        + " — chaaho to baat-cheet me keh do, "
+                          "routine wahan se bhi banta hai.")
+            ok, detail = taskparse.create_from_parsed(
+                self.data_dir, parsed, journal=self.journal)
+            if not ok:
+                return ("Parse ho gaya par bana nahi, sir: "
+                        + detail)
+            return (f"Samajh gaya, sir — "
+                    f"'{parsed['name']}': "
+                    f"{taskparse.schedule_words(parsed['schedule'])}"
+                    f" (priority {parsed['priority']}).\n"
+                    f"Kaam: {parsed['description']}\n"
+                    f"({detail} ban gaya.)")
         if text == "/confirm" or text.startswith("/confirm "):
             parts_cmd = text.split(None, 1)
             return self.confirm_card(
@@ -5740,6 +6878,106 @@ class ChatApp:
                          "Sirf card: /rules card <name> · "
                          "Index: /rules packs")
             return "\n".join(lines)
+        if text == "/followups":
+            from .followups import FollowupStore
+            rows = FollowupStore(self.data_dir).drafts()
+            if not rows:
+                return ("Koi follow-up draft nahi hai, "
+                        "sir — koi thread intezaar me nahi "
+                        "mila.")
+            lines = ["Follow-up drafts (aapke bhejne ke "
+                     "intezaar me), sir:"]
+            for r in rows[-6:]:
+                lines.append(
+                    f"• {r['thread_id']} — "
+                    f"{str(r.get('subject', ''))[:60]} → "
+                    f"{r.get('recipient', '')}\n"
+                    f"  {str(r.get('draft', ''))[:140]}")
+            lines.append("Bhejne ke liye: /followups "
+                         "send <id> — bilkul yahi draft "
+                         "jayega.")
+            return "\n".join(lines)
+        if text.startswith("/followups send "):
+            from .followups import FollowupStore
+            store = FollowupStore(self.data_dir)
+            tid = text[len("/followups send "):].strip()
+            row = store.get_draft(tid)
+            if row is None or row.get("status") != "drafted":
+                return "Woh draft mila nahi, sir."
+            # The send is exactly one email_send with the
+            # draft unchanged — through the conversational
+            # dispatch, so the Second Look sees it too. The
+            # recipient's provenance is the thread headers,
+            # noted as a trusted record by name.
+            sl = getattr(self.parts, "second_look", None)
+            if sl is not None:
+                try:
+                    sl.note_owner_text(
+                        f"follow-up bhejo "
+                        f"{row['recipient']} ko, draft "
+                        f"bilkul yahi: {row['draft'][:200]}")
+                    sl.note_trusted_text(
+                        f"follow-up thread {tid} ka pakka "
+                        f"recipient (thread headers se): "
+                        f"{row['recipient']}")
+                except Exception:
+                    pass
+            subject = str(row.get("subject", ""))
+            if subject and not subject.lower().startswith(
+                    "re:"):
+                subject = "Re: " + subject
+            out = self.brain.dispatch("email_send", {
+                "to": row["recipient"], "subject": subject,
+                "body": row["draft"]})
+            if out.get("needs_approval"):
+                card = (out.get("card") or {}).get("id")
+                return ("Card ban gaya, sir — "
+                        + (f"/confirm {card} se email "
+                           "jayega."
+                           if card else
+                           "app me card par tap karein."))
+            if out.get("ok"):
+                store.mark_sent(tid)
+                return ("Follow-up bhej diya, sir — "
+                        f"{row['recipient']} ko, draft "
+                        "bilkul waisa hi.")
+            return ("Nahi gaya, sir: "
+                    + str(out.get("error", ""))[:200])
+        if text == "/suggest":
+            from .proactivity import SuggestionStore
+            rows = SuggestionStore(self.data_dir).recent(72)
+            if not rows:
+                return "Koi salah nahi hai abhi, sir."
+            lines = ["Meri salahen (pichhle 3 din), sir:"]
+            for r in rows[-6:]:
+                lines.append(
+                    f"• {r['id']} [{r.get('type', 'general')}"
+                    f"/{r.get('status', 'shown')}] "
+                    f"{str(r.get('suggestion', ''))[:110]}")
+            lines.append("Feedback: /suggest ok <id> · "
+                         "/suggest no <id> — salahen is "
+                         "score se seekhti hain.")
+            return "\n".join(lines)
+        if text.startswith("/suggest ok ") or \
+                text.startswith("/suggest no "):
+            from .proactivity import feedback as _sugg_fb
+            useful = text.startswith("/suggest ok ")
+            sid = text.rsplit(" ", 1)[-1].strip()
+            row = _sugg_fb(self.data_dir, sid, useful,
+                           calibrator=self.calibrator)
+            if row is None:
+                return "Woh salah mili nahi, sir."
+            if not useful:
+                return ("Note kar liya, sir — is kisam ki "
+                        "salah aage kam aayegi.")
+            if row.get("card_id"):
+                return ("Shukriya, sir — salah note kar "
+                        f"li. Uska card {row['card_id']} "
+                        "pending hai: /confirm "
+                        f"{row['card_id']} se woh kaam "
+                        "chalega.")
+            return ("Shukriya, sir — note kar liya. Agli "
+                    "salahen is se seekhengi.")
         if text == "/calibration":
             return self.calibrator.report()
         if text == "/instincts":
@@ -6331,6 +7569,10 @@ class ChatApp:
             self.journal.append("app.turn_refused_stopped", {})
             return ("Band hoon, sir — /resume kahiye jab dobara "
                     "chalana ho.")
+        # The owner's own words are the Second Look
+        # checker's primary provenance source — note them
+        # before anything else in the turn runs.
+        _note_owner_words(self.parts, text)
         # Automatic learning: anything new in data/inbox is ingested
         # before this turn is answered — no command, no ceremony.
         try:
@@ -6453,6 +7695,7 @@ class ChatApp:
             _due_reminder_notifications(self.data_dir)
         except Exception:
             pass
+        self._last_turn_ts = time.time()
         self.journal.append("assistant.reply", {
             "text": "[incognito]" if self.incognito else reply,
             "via": via, "provider": self.last_provider})

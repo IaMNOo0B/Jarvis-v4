@@ -107,10 +107,28 @@ def build_brief(data_dir, facts=(), now: Optional[datetime] = None) -> dict:
         pass
     try:
         from .candidates import pending as _pending_rules
-        waiting = _pending_rules(data_dir)
+        waiting = [r for r in _pending_rules(data_dir)
+                   if r.get("kind") != "skill"]
         if waiting:
             fyi.append(f"{len(waiting)} rule proposal(s) waiting "
                        "— /rules candidates")
+    except Exception:
+        pass
+    try:
+        from .followups import FollowupStore
+        drafts = FollowupStore(data_dir).drafts()
+        if drafts:
+            fyi.append(f"{len(drafts)} follow-up draft(s) "
+                       "ready — /followups")
+    except Exception:
+        pass
+    try:
+        from .candidates import pending as _pending_all
+        skills_waiting = [r for r in _pending_all(data_dir)
+                          if r.get("kind") == "skill"]
+        if skills_waiting:
+            fyi.append(f"{len(skills_waiting)} skill "
+                       "proposal(s) waiting — /skills")
     except Exception:
         pass
 

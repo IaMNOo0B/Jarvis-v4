@@ -49,6 +49,31 @@ def propose(data_dir, text: str, why: str = "") -> dict:
     return row
 
 
+def propose_skill(data_dir, skill: dict, why: str = "",
+                  action: str = "create") -> dict:
+    """Queue a proposed SKILL PLAYBOOK (Spec 6) in the same
+    owner-decision queue: the row carries the full playbook
+    and a kind marker, so accepting it writes into the
+    SkillBook — never into JARVIS-RULES.txt."""
+    skill = dict(skill or {})
+    name = str(skill.get("name", ""))[:80]
+    row = {"id": uuid.uuid4().hex[:8], "ts": time.time(),
+           "kind": "skill", "action": str(action)[:12],
+           "skill": skill,
+           "checks": [c for c in skill.get("checks") or []
+                      if isinstance(c, dict)],
+           "text": (f"Skill salah ({action}): {name} — "
+                    f"{str(skill.get('description', ''))}"
+                    )[:300],
+           "why": str(why).strip()[:200],
+           "status": "pending"}
+    path = _path(data_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return row
+
+
 def pending(data_dir) -> list:
     return [r for r in _rows(data_dir)
             if r.get("status") == "pending"]

@@ -81,7 +81,8 @@ class ConfirmationBook:
         except Exception:
             pass
 
-    def add(self, tool: str, args: Dict[str, Any]) -> Dict:
+    def add(self, tool: str, args: Dict[str, Any],
+            note: str = "") -> Dict:
         with self._lock:
             rows = self._rows()
             # An identical pending card (same tool, same
@@ -100,7 +101,9 @@ class ConfirmationBook:
             card = {"id": uuid.uuid4().hex[:8], "ts": now,
                     "tool": str(tool),
                     "args": dict(args or {}),
-                    "summary": card_summary(tool, args or {}),
+                    "summary": card_summary(tool, args or {})
+                    + (f" · {str(note)[:160]}" if note
+                       else ""),
                     "status": "pending"}
             rows.append(card)
             self._save(rows)

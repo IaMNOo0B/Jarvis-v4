@@ -297,11 +297,16 @@ class LocalPipelineSession:
                  tts: Optional[SystemTTS] = None,
                  respond: Optional[Callable[[str], str]] = None,
                  vad: Optional[EnergyVAD] = None,
-                 ack_delay: float = 0.6):
+                 ack_delay: float = 0.6,
+                 polish: Optional[Callable[[str], str]] = None):
         self.events = events or VoiceEvents()
         self.stt = stt
         self.tts = tts
         self.respond = respond
+        # Dictation Polisher (Spec 8): applied to STT output
+        # only — typed text (send_text) is the owner's own
+        # words and is never rewritten.
+        self.polish = polish
         self.vad = vad or EnergyVAD()
         self.ack_delay = max(0.0, float(ack_delay))
         self._ack_idx = 0
@@ -419,6 +424,12 @@ class LocalPipelineSession:
             try:
                 if kind == "audio":
                     text, _lang = self.stt.transcribe(payload)
+                    if self.polish is not None and text:
+                        try:
+                            text = self.polish(text) or text
+                        except Exception:
+                            pass    # polish kabhi voice ko
+                            # nahi rokta — kachcha text chalega.
                 else:
                     text = str(payload)
                 if not text:

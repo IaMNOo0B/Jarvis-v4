@@ -94,6 +94,32 @@ def compute_next(schedule: dict, now: float,
         if last_run:
             return None
         return at
+    if kind == "weekly":
+        # {"type": "weekly", "weekday": 0-6 (Mon=0),
+        #  "at": "HH:MM"} — added for the Task Parser
+        # (Spec 7); daily/once/interval are untouched.
+        try:
+            weekday = int(schedule.get("weekday", -1))
+        except (TypeError, ValueError):
+            return None
+        if not 0 <= weekday <= 6:
+            return None
+        at = str(schedule.get("at", "09:00"))
+        try:
+            hour, minute = (int(x) for x in at.split(":", 1))
+        except Exception:
+            return None
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            return None
+        today = datetime.fromtimestamp(now).replace(
+            hour=hour, minute=minute, second=0,
+            microsecond=0)
+        delta = (weekday - today.weekday()) % 7
+        nxt = (today + timedelta(days=delta)).timestamp()
+        if nxt <= now:
+            nxt = (today + timedelta(
+                days=delta + 7)).timestamp()
+        return nxt
     # daily at HH:MM (local time)
     at = str(schedule.get("at", "09:00"))
     try:

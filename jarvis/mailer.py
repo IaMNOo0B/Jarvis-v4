@@ -75,6 +75,112 @@ def send_email(address: str, password: str, to: str,
             "via": f"{host}:{port}"}
 
 
+def _message_body(msg) -> str:
+    """The plain-text body of a parsed message, capped —
+    the multipart walk prefers the text/plain part."""
+    try:
+        part = msg.get_body(preferencelist=("plain",))
+        if part is not None:
+            return str(part.get_content())[:4000]
+    except Exception:
+        pass
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    try:
+                        return str(
+                            part.get_content())[:4000]
+                    except Exception:
+                        continue
+            return ""
+        return str(msg.get_content())[:4000]
+    except Exception:
+        return ""
+
+
+def fetch_recent(address: str, password: str, limit: int = 40,
+                 boxes=("INBOX",), imap_factory=None) -> list:
+    """Recent messages from the account's own boxes over
+    IMAP, parsed to plain dicts: {id, box, from, to,
+    reply_to, subject, date_ts, body}. Headers ride along
+    verbatim — the follow-up classifier fixes recipients
+    from them BEFORE any model sees any text, and never
+    from a message body. A box that will not open is
+    skipped, never fatal."""
+    import imaplib
+    from email.parser import BytesParser
+    from email.policy import default as _policy
+    from email.utils import parsedate_to_datetime
+    _, (host, port) = hosts_for(address)
+    factory = imap_factory or imaplib.IMAP4_SSL
+    try:
+        server_cm = factory(host, port, timeout=30)
+    except TypeError:
+        server_cm = factory(host, port)
+    out = []
+    with server_cm as server:
+        server.login(address, password)
+        for box in boxes:
+            try:
+                status, _ = server.select(box, readonly=True)
+            except Exception:
+                continue
+            if str(status).upper() != "OK":
+                continue
+            try:
+                status, data = server.search(None, "ALL")
+            except Exception:
+                continue
+            if str(status).upper() != "OK" or not data \
+                    or not data[0]:
+                continue
+            ids = data[0].split()[-max(1, int(limit)):]
+            for mid in reversed(ids):
+                try:
+                    status, fetched = server.fetch(
+                        mid, "(RFC822)")
+                except Exception:
+                    continue
+                if str(status).upper() != "OK":
+                    continue
+                raw = None
+                for part in fetched or []:
+                    if isinstance(part, tuple) \
+                            and len(part) > 1 \
+                            and isinstance(part[1],
+                                           (bytes, bytearray)):
+                        raw = bytes(part[1])
+                        break
+                if raw is None:
+                    continue
+                try:
+                    msg = BytesParser(
+                        policy=_policy).parsebytes(raw)
+                except Exception:
+                    continue
+                date_ts = 0.0
+                try:
+                    dt = parsedate_to_datetime(
+                        str(msg.get("Date", "")))
+                    if dt is not None:
+                        date_ts = dt.timestamp()
+                except Exception:
+                    date_ts = 0.0
+                out.append({
+                    "id": str(msg.get("Message-ID")
+                              or f"{box}:{mid.decode('ascii', 'ignore')}"),
+                    "box": box,
+                    "from": str(msg.get("From", "")),
+                    "to": str(msg.get("To", "")),
+                    "reply_to": str(msg.get("Reply-To", "")),
+                    "subject": str(msg.get("Subject", "")),
+                    "date_ts": date_ts,
+                    "body": _message_body(msg),
+                })
+    return out
+
+
 def draft_email(address: str, password: str, to: str,
                 subject: str, body: str,
                 imap_factory=None) -> dict:
