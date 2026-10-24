@@ -21,11 +21,15 @@ D. A functionCall is NEVER sent bare: signature-less calls
 """
 
 import json
+import socket
+
+import pytest
 
 from jarvis.chat import ChatApp
 from jarvis.prompt import tool_views
 from jarvis.providers import (FallbackChain, GeminiProvider,
-                              OllamaProvider, _gemini_payload)
+                              OllamaProvider, ProviderTimeout,
+                              _gemini_payload)
 
 
 class Script:
@@ -289,3 +293,35 @@ def test_gemini_retries_once_on_400_with_stripped_history():
     parts = [p for c in second for p in c["parts"]]
     assert not any("functionCall" in p for p in parts)
     assert not any("functionResponse" in p for p in parts)
+
+
+# -- E: a stalled rung must not burn every rung's timeout --------
+
+def test_gemini_timeout_fails_fast_to_next_provider():
+    # A rung that burned a FULL timeout proves the provider
+    # stalled: the chain falls through now instead of after one
+    # timeout per rung. (A fast timeout still advances — see
+    # test_gemini_ladder_advances_on_timeout.)
+    calls = []
+    clock = [0.0]
+
+    def advancing_clock():
+        value = clock[0]
+        clock[0] += 100.0
+        return value
+
+    def stalling_transport(url, body, headers, timeout):
+        calls.append(url)
+        if len(calls) == 1:
+            raise socket.timeout("timed out")
+        return 200, _gemini_body([{"text": "late"}])
+
+    provider = GeminiProvider("AIzaTESTKEY",
+                              models=["gemini-2.5-flash",
+                                      "gemini-2.0-flash"],
+                              transport=stalling_transport,
+                              clock=advancing_clock)
+    with pytest.raises(ProviderTimeout):
+        provider.complete([{"role": "user", "content": "hi"}],
+                          tools=None)
+    assert len(calls) == 1

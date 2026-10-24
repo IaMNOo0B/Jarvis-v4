@@ -42,6 +42,7 @@ import argparse
 import json
 import sys
 import threading
+import time
 import traceback
 import urllib.request
 import webbrowser
@@ -430,7 +431,7 @@ PAGE = """<!DOCTYPE html>
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
-      providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned + (s.build ? ' · build ' + s.build : '')) : '';
+      providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned + (s.turn_ms ? ' · ' + (s.turn_ms / 1000).toFixed(1) + 's' : '') + (s.build ? ' · build ' + s.build : '')) : '';
       setBadge(s.notifications || 0);
       renderCards(s.confirmations || []);
       renderBuilds(s.builds || []);
@@ -754,7 +755,8 @@ def _boot_state_payload(boot: BootState) -> dict:
             "tool": "", "voice": {"active": False},
             "ptt": False, "confirmations": [], "builds": [],
             "incognito": False, "notifications": unread,
-            "boot": boot.state, "build": BUILD_STAMP}
+            "boot": boot.state, "turn_ms": 0,
+            "build": BUILD_STAMP}
 
 
 def build_server(app: ChatApp = None, host: str = "127.0.0.1",
@@ -856,6 +858,9 @@ def build_server(app: ChatApp = None, host: str = "127.0.0.1",
                                  "notifications":
                                      _unread_count(app.data_dir),
                                  "boot": boot.state,
+                                 "turn_ms":
+                                     round(getattr(app, "last_turn_ms",
+                                                   0.0)),
                                  "build": BUILD_STAMP})
                 return
             app = boot.app
@@ -1059,6 +1064,7 @@ def build_server(app: ChatApp = None, host: str = "127.0.0.1",
                 return
             with lock:
                 app.activity.set("thinking")
+                t0 = time.monotonic()
                 try:
                     if text.startswith("/"):
                         reply = app.handle_command(text)
@@ -1087,8 +1093,20 @@ def build_server(app: ChatApp = None, host: str = "127.0.0.1",
                             "speaking") else "listening")
                     else:
                         app.activity.set("listening")
+                    app.last_turn_ms = (time.monotonic() - t0) * 1000.0
+            # Plain brain replies are spoken when voice is on
+            # (2026-10-24: chat replies were text-only, so
+            # voice-on looked like "listens but never speaks").
+            # Command outputs are not spoken: a /diagnose dump
+            # read aloud helps nobody.
+            if not text.startswith("/"):
+                try:
+                    app.speak_chat_reply(reply)
+                except Exception:
+                    pass
             self._json(200, {"reply": reply,
-                             "provider": app.last_provider})
+                             "provider": app.last_provider,
+                             "turn_ms": round(app.last_turn_ms)})
 
     return ThreadingHTTPServer((host, port), Handler)
 

@@ -252,6 +252,32 @@ class VoiceManager(VoiceEvents):
     def on_turn_audio_end(self):
         self._turn_end = True
 
+    def speak_text(self, text: str, tts=None) -> bool:
+        """Speak text through the playback queue (chat replies
+        when voice is on). Sentence by sentence, like the local
+        pipeline's reply speech, so the first sentence plays
+        while the rest is still being made. Returns False when
+        voice is not active or synthesis fails — never pretends
+        to have spoken."""
+        if not self.active or self.io is None:
+            return False
+        from .local_voice import (SPEAKER_RATE, SystemTTS,
+                                  chunk_pcm, clean_for_speech,
+                                  split_sentences)
+        engine = tts or SystemTTS()
+        cleaned = clean_for_speech(str(text or ""))
+        if not cleaned:
+            return False
+        try:
+            for sentence in split_sentences(cleaned):
+                pcm = engine.speak(sentence)
+                for piece in chunk_pcm(pcm, ms=50, rate=SPEAKER_RATE):
+                    self.on_audio(piece)
+        except Exception:
+            return False
+        self.on_turn_audio_end()
+        return True
+
     def on_interrupted(self):
         self._drain_play_queue()
         self._turn_end = False

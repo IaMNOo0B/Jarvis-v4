@@ -180,6 +180,24 @@ DIAGNOSE_MANIFEST = {
     }],
 }
 
+VOICE_MANIFEST = {
+    # 2026-10-24: the brain had no way to check voice state, so
+    # when the owner asked why JARVIS never speaks it improvised
+    # "I am a text-based assistant" and then excused itself
+    # instead of diagnosing. The tool's name is the diagnosis
+    # surface; the must-diagnose rule itself lives in PERSONA
+    # (advertised tools carry no description channel).
+    "name": "core.voice",
+    "version": "1.0.0",
+    "tools": [{
+        "name": "voice_status",
+        "op": "voice_status",
+        "permission": "system.diagnose",
+        "schema": {"type": "object", "properties": {},
+                   "additionalProperties": False},
+    }],
+}
+
 
 def _diagnose_op(data_dir: Path, secrets):
     """Self-diagnosis from JARVIS's own records — no guessing: the
@@ -4944,6 +4962,7 @@ TOOL_STATES = {
     "search_all": "researching",
     "build_task": "creating",
     "watch_for_upgrades": "researching", "upgrade_report": "researching",
+    "voice_status": "working",
     "create_project": "creating", "run_code": "creating",
     "run_shell": "creating",
     "write_file": "creating", "learn_text": "creating",
@@ -5965,6 +5984,19 @@ class ChatApp:
         self.incognito = False
         self._incognito_history: list = []
         self.last_provider = "none"
+        self.last_turn_ms = 0.0
+        # The voice diagnostic tool (2026-10-24): registered here
+        # because the op closes over this app; approved like the
+        # other first-party skills so the brain sees it.
+        try:
+            self.registry.register(
+                VOICE_MANIFEST,
+                ops={"voice_status":
+                     lambda **_ignored: self.voice_status()})
+            self.registry.approve(VOICE_MANIFEST["name"])
+        except Exception as exc:
+            self.journal.append("chat.voice_skill_skipped",
+                                {"error": f"{type(exc).__name__}: {exc}"})
         # Rule packs chosen on the most recent brain turn
         # (display state for /rules; the journal is the record).
         self._last_rule_packs: list = []
@@ -6036,6 +6068,43 @@ class ChatApp:
                     "awake": False, "wake_word": False,
                     "voice": "Charon"}
         return self.voice_manager.status()
+
+    def speak_chat_reply(self, reply: str) -> bool:
+        """Speak a chat reply aloud when voice is on (2026-10-24:
+        chat replies were never spoken — the page returned text
+        only, so voice-on looked like "listens but never speaks").
+        Runs in a thread so the chat reply returns at once; the
+        speech is interruptible like any other spoken turn. A
+        live session owns speech itself and is never doubled.
+        Returns False when nothing will be spoken."""
+        manager = self.voice_manager
+        if manager is None or not manager.active:
+            return False
+        session = getattr(manager, "session", None)
+        if session is not None:
+            from .voice import LiveSession
+            if isinstance(session, LiveSession):
+                return False  # Live owns speech; never double-speak.
+        text = str(reply or "").strip()
+        if not text:
+            return False
+        threading.Thread(target=self._speak_chat_reply_worker,
+                         args=(text,), daemon=True,
+                         name="jarvis-chat-speech").start()
+        return True
+
+    def _speak_chat_reply_worker(self, text: str) -> None:
+        manager = self.voice_manager
+        if manager is None:
+            return
+        try:
+            ok = manager.speak_text(text)
+        except Exception:
+            ok = False
+        if not ok:
+            _notify(self.data_dir, "Voice",
+                    "Jawab bol nahi paya, sir — speakers ya voice "
+                    "session check karein.", kind="voice")
 
     def voice_ptt_hold(self, held: bool) -> dict:
         """Push-to-talk hold from the UI: while held, the mic

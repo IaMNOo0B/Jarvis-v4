@@ -358,7 +358,16 @@ class _HTTPProvider:
         hdrs = {"Content-Type": "application/json"}
         if headers:
             hdrs.update(headers)
-        status, raw = self._transport(url, body, hdrs, float(self.timeout))
+        try:
+            status, raw = self._transport(url, body, hdrs,
+                                          float(self.timeout))
+        except (socket.timeout, TimeoutError) as e:
+            # Converted here, not only in the default transport:
+            # a custom transport that raises raw would otherwise
+            # escape the chain's ProviderError handling entirely
+            # instead of falling through to the next provider.
+            raise ProviderTimeout(
+                f"timeout after {float(self.timeout)}s: {e}") from e
         if int(status) >= 400:
             snippet = raw[:200].decode("utf-8", "replace") \
                 if isinstance(raw, (bytes, bytearray)) else str(raw)[:200]
@@ -826,14 +835,19 @@ class GeminiProvider(_HTTPProvider):
 
     def _attempt(self, payload) -> ProviderReply:
         last_error: Optional[ProviderError] = None
+        started = self._clock()
         for model in self._rungs():
             url = (f"{self.base_url}/v1beta/models/{model}"
                    ":generateContent")
             # Per rung: every filed key gets its chance before
-            # the rung rests; ANY ProviderError (timeout,
-            # no-candidates, HTTP) advances the ladder — the
-            # old code caught only HTTP errors, so a timeout
-            # or an empty reply killed the whole provider.
+            # the rung rests; HTTP and empty-reply errors advance
+            # the ladder. A TIMEOUT advances only while it was
+            # fast: a rung that burned a full timeout proves the
+            # provider stalled, and trying the remaining rungs
+            # would burn up to 60s each (the owner's PC,
+            # 2026-10-24: every turn wasted a full minute on
+            # Gemini before Ollama answered). Fail fast then, so
+            # the chain falls through.
             for _ in range(max(1, len(self._keys))):
                 try:
                     data = self._post_json(
@@ -850,6 +864,11 @@ class GeminiProvider(_HTTPProvider):
                         self._rested_until[model] = \
                             self._clock() + rest
                     break           # next rung
+                except ProviderTimeout as e:
+                    if self._clock() - started >= self.timeout:
+                        raise
+                    last_error = e
+                    break           # next rung
                 except ProviderError as e:
                     last_error = e
                     break           # next rung
@@ -862,6 +881,7 @@ class GeminiProvider(_HTTPProvider):
         parsed response dict; raises ProviderDown when no rung
         answers."""
         last_error: Optional[ProviderError] = None
+        started = self._clock()
         for model in self._rungs():
             url = (f"{self.base_url}/v1beta/models/{model}"
                    ":generateContent")
@@ -879,6 +899,13 @@ class GeminiProvider(_HTTPProvider):
                     if rest:
                         self._rested_until[model] = \
                             self._clock() + rest
+                    break
+                except ProviderTimeout as e:
+                    # Same budget as chat: a full timeout proves
+                    # a stall; a fast one still advances.
+                    if self._clock() - started >= self.timeout:
+                        raise
+                    last_error = e
                     break
                 except ProviderError as e:
                     last_error = e
