@@ -10,6 +10,14 @@ B. Pollinations 400 ToolDescription — every advertised
 C. Ollama 400 'can't find closing }' — the round-2 payload
    must carry tool-call arguments as OBJECTS, tool results
    as role 'tool'.
+
+Plus the fourth defect, from /diagnose 2026-10-24
+(gemini 0/31, same 400): the 2026-10-22 fix only ADDED the
+signature when cached — it still SENT a bare functionCall
+when the cache missed (another provider's turn, a rebuilt
+instance), and the poisoned history then 400ed forever.
+D. A functionCall is NEVER sent bare: signature-less calls
+   ride as text, and a 400 earns one clean-slate retry.
 """
 
 import json
@@ -17,7 +25,7 @@ import json
 from jarvis.chat import ChatApp
 from jarvis.prompt import tool_views
 from jarvis.providers import (FallbackChain, GeminiProvider,
-                              OllamaProvider)
+                              OllamaProvider, _gemini_payload)
 
 
 class Script:
@@ -221,3 +229,63 @@ def test_preflight_models_check_uses_detector_resolution(tmp_path):
     # 'folder' framing.
     assert missing["ok"] is False
     assert "searched" in missing["detail"]
+
+
+# -- D: never a bare functionCall; one clean-slate retry on 400 ----
+
+def test_gemini_never_sends_a_bare_function_call():
+    # History poisoned by another provider's turn: the call id
+    # is not in Gemini's signature cache, so the old code sent
+    # it bare and Gemini 400ed — every turn after, forever.
+    poisoned = [
+        {"role": "user", "content": "waqt kya hai"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "ollama-9",
+                         "function": {"name": "time_now",
+                                      "arguments": {}}}]},
+        {"role": "tool", "name": "time_now", "content": "12:00"},
+        {"role": "user", "content": "hello"},
+    ]
+    payload = _gemini_payload(poisoned, tools=None, signatures={})
+    parts = [p for c in payload["contents"] for p in c["parts"]]
+    assert not any("functionCall" in p for p in parts)
+    assert not any("functionResponse" in p for p in parts)
+    assert any("time_now" in p.get("text", "") for p in parts)
+    # Positive control: a cached signature still rides.
+    good = _gemini_payload(poisoned, tools=None,
+                           signatures={"ollama-9": "SIG-9"})
+    parts = [p for c in good["contents"] for p in c["parts"]]
+    calls = [p for p in parts if "functionCall" in p]
+    assert len(calls) == 1
+    assert calls[0]["thoughtSignature"] == "SIG-9"
+
+
+def test_gemini_retries_once_on_400_with_stripped_history():
+    error_body = json.dumps({
+        "error": {"code": 400,
+                  "message": "Function call is missing a "
+                             "thought_signature in functionCall "
+                             "parts."}}).encode()
+    transport = Script([
+        (400, error_body),
+        (200, _gemini_body([{"text": "clean slate jawab"}])),
+    ])
+    provider = GeminiProvider("AIzaTESTKEY",
+                              models=["gemini-2.5-flash"],
+                              transport=transport)
+    poisoned = [
+        {"role": "user", "content": "waqt kya hai"},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "ollama-9",
+                         "function": {"name": "time_now",
+                                      "arguments": {}}}]},
+        {"role": "tool", "name": "time_now", "content": "12:00"},
+        {"role": "user", "content": "hello"},
+    ]
+    reply = provider.complete(poisoned, tools=None)
+    assert "clean slate jawab" in reply.text
+    assert len(transport.bodies) == 2
+    second = transport.bodies[1]["contents"]
+    parts = [p for c in second for p in c["parts"]]
+    assert not any("functionCall" in p for p in parts)
+    assert not any("functionResponse" in p for p in parts)

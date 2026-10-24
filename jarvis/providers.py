@@ -608,6 +608,44 @@ def _message_text(content) -> str:
     return str(content)
 
 
+def _strip_tool_history(messages):
+    """Messages with every tool part flattened to plain text.
+
+    The clean slate for a poisoned history: no functionCall
+    parts, no functionResponse parts, nothing Gemini can
+    reject for a missing signature — the information survives
+    as readable text."""
+    out = []
+    for msg in messages or []:
+        if not isinstance(msg, Mapping):
+            continue
+        role = str(msg.get("role") or "user")
+        if role in ("tool", "function"):
+            out.append({
+                "role": "user",
+                "content": f"[tool {msg.get('name') or 'tool'} "
+                           f"returned: {_message_text(msg.get('content'))}]"})
+            continue
+        if role == "assistant" and msg.get("tool_calls"):
+            kept = dict(msg)
+            kept.pop("tool_calls", None)
+            names = []
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, Mapping):
+                    fn = call.get("function") or call
+                    name = str(fn.get("name") or "")
+                    if name:
+                        names.append(name)
+            base = msg.get("content")
+            if isinstance(base, str) and names:
+                kept["content"] = base + " [tools called: " + \
+                    ", ".join(names) + "]"
+            out.append(kept)
+            continue
+        out.append(msg)
+    return out
+
+
 def _gemini_payload(messages, tools, signatures=None):
     """OpenAI-shaped conversation -> Gemini generateContent body.
 
@@ -619,9 +657,29 @@ def _gemini_payload(messages, tools, signatures=None):
     a thought_signature' — every Gemini tool turn died).
     The map lives on the provider instance; the signature
     never enters the shared message dicts, so no other
-    provider ever sees it."""
+    provider ever sees it.
+
+    RULE (2026-10-24, the owner's PC at gemini 0/31): a
+    functionCall is NEVER sent bare. A call whose id has no
+    cached signature — another provider's turn, a rebuilt
+    instance's empty cache, an evicted entry — rides as plain
+    text instead, and its tool response rides as plain text
+    too (an orphan functionResponse is just as rejectable).
+    Sending the bare part 400s, the turn falls through, the
+    poisoned history survives, and Gemini never answers again.
+    """
     system_texts: List[str] = []
     contents: List[Dict[str, Any]] = []
+    # Pre-scan: which tool names lost their functionCall form.
+    dropped_names = set()
+    for msg in messages or []:
+        if isinstance(msg, Mapping) and msg.get("role") == "assistant":
+            for call in msg.get("tool_calls") or []:
+                if isinstance(call, Mapping):
+                    cid = call.get("id")
+                    if not cid or not (signatures or {}).get(str(cid)):
+                        fn = call.get("function") or call
+                        dropped_names.add(str(fn.get("name") or ""))
     for msg in messages or []:
         if not isinstance(msg, Mapping):
             continue
@@ -632,12 +690,19 @@ def _gemini_payload(messages, tools, signatures=None):
                 system_texts.append(text)
             continue
         if role in ("tool", "function"):
-            contents.append({
-                "role": "user",
-                "parts": [{"functionResponse": {
-                    "name": str(msg.get("name") or "tool"),
-                    "response": {"result":
-                                 _message_text(msg.get("content"))}}}]})
+            name = str(msg.get("name") or "tool")
+            text = _message_text(msg.get("content"))
+            if name in dropped_names:
+                contents.append({
+                    "role": "user",
+                    "parts": [{"text": f"[tool {name} returned: "
+                                       f"{text}]"}]})
+            else:
+                contents.append({
+                    "role": "user",
+                    "parts": [{"functionResponse": {
+                        "name": name,
+                        "response": {"result": text}}}]})
             continue
         parts: List[Dict[str, Any]] = []
         text = _message_text(msg.get("content"))
@@ -650,15 +715,18 @@ def _gemini_payload(messages, tools, signatures=None):
                     args = fn.get("arguments")
                     if isinstance(args, str):
                         args = _parse_arguments(args)
-                    part: Dict[str, Any] = {"functionCall": {
-                        "name": str(fn.get("name") or ""),
-                        "args": args or {}}}
+                    name = str(fn.get("name") or "")
                     cid = call.get("id")
                     if signatures and cid and \
                             signatures.get(str(cid)):
-                        part["thoughtSignature"] = \
-                            signatures[str(cid)]
-                    parts.append(part)
+                        parts.append({"functionCall": {
+                            "name": name,
+                            "args": args or {}},
+                            "thoughtSignature":
+                                signatures[str(cid)]})
+                    else:
+                        parts.append({"text":
+                                      f"[tool {name} called]"})
         contents.append({"role": "model" if role == "assistant"
                          else "user",
                          "parts": parts or [{"text": ""}]})
@@ -741,6 +809,22 @@ class GeminiProvider(_HTTPProvider):
     def complete(self, messages, tools=None) -> ProviderReply:
         payload = _gemini_payload(messages, tools,
                                   self._signatures)
+        try:
+            return self._attempt(payload)
+        except ProviderHTTPError as e:
+            if e.status != 400:
+                raise
+            # Belt and braces beside the never-bare rule: if a
+            # 400 still lands (a shape this code did not foresee),
+            # one clean-slate retry with tool history flattened
+            # to text. Without it a poisoned history 400s
+            # forever and the chain never lets Gemini answer.
+            stripped = _strip_tool_history(messages)
+            payload = _gemini_payload(stripped, tools,
+                                      self._signatures)
+            return self._attempt(payload)
+
+    def _attempt(self, payload) -> ProviderReply:
         last_error: Optional[ProviderError] = None
         for model in self._rungs():
             url = (f"{self.base_url}/v1beta/models/{model}"
