@@ -50,8 +50,9 @@ from pathlib import Path
 
 from .chat import (DEFAULT_DATA_DIR, ChatApp, _due_reminder_notifications,
                    _mark_notifications_read, _maybe_auto_watch,
-                   _read_notifications, _unread_count)
+                   _maybe_self_check, _read_notifications, _unread_count)
 from .config import Config
+from .version import BUILD_STAMP
 
 ASSET_NAME = "jarvis-core.jpg"
 ASSET_PATH = "/assets/" + ASSET_NAME
@@ -429,7 +430,7 @@ PAGE = """<!DOCTYPE html>
     try {
       const r = await fetch('/api/state');
       const s = await r.json();
-      providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned) : '';
+      providerEl.textContent = s.provider ? ('brain · ' + s.provider + ' · tools ' + s.tools + ' · learned ' + s.learned + (s.build ? ' · build ' + s.build : '')) : '';
       setBadge(s.notifications || 0);
       renderCards(s.confirmations || []);
       renderBuilds(s.builds || []);
@@ -753,7 +754,7 @@ def _boot_state_payload(boot: BootState) -> dict:
             "tool": "", "voice": {"active": False},
             "ptt": False, "confirmations": [], "builds": [],
             "incognito": False, "notifications": unread,
-            "boot": boot.state}
+            "boot": boot.state, "build": BUILD_STAMP}
 
 
 def build_server(app: ChatApp = None, host: str = "127.0.0.1",
@@ -854,7 +855,8 @@ def build_server(app: ChatApp = None, host: str = "127.0.0.1",
                                  "incognito": bool(app.incognito),
                                  "notifications":
                                      _unread_count(app.data_dir),
-                                 "boot": boot.state})
+                                 "boot": boot.state,
+                                 "build": BUILD_STAMP})
                 return
             app = boot.app
             if self.path == "/api/keys":
@@ -1148,6 +1150,13 @@ def _boot_app(data_dir, boot: BootState, start_services: bool) -> None:
         _write_startup_error(data_dir, exc)
         return
     boot.mark_ready(app)
+    # Seed the back-of-mind loop at once: the four questions are
+    # answered from the first second, not only after the first
+    # scheduler tick a minute later. Never raises, never speaks.
+    try:
+        _maybe_self_check(app)
+    except Exception:
+        pass
     if start_services:
         _start_background_services(app)
 

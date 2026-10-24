@@ -16,7 +16,11 @@ It launches `python -m jarvis.ui`, and then:
 - a HUNG app (process alive but its heartbeat file —
   data/heartbeat.json, refreshed by the UI every 10 seconds —
   goes stale past 90 seconds) is terminated and restarted on the
-  same budget.
+  same budget. A heartbeat is only trusted when it was written
+  AFTER this child spawned: a stale file left by a dead run must
+  never kill a newborn (that exact trap killed every restart on
+  the owner's PC from 2026-10-22 on — the file's timestamp sat
+  at one old moment while its reported age kept growing).
 
 Running `python -m jarvis.ui` directly still works; it is simply
 unsupervised.
@@ -68,12 +72,22 @@ def heartbeat_age(data_dir, now: Optional[float] = None) -> Optional[float]:
     """Seconds since the app's last heartbeat, or None when no
     heartbeat file exists (the app may predate the supervisor —
     absence is not a hang)."""
+    ts = heartbeat_ts(data_dir)
+    if ts is None:
+        return None
+    return (time.time() if now is None else now) - ts
+
+
+def heartbeat_ts(data_dir) -> Optional[float]:
+    """The timestamp inside the heartbeat file, or None when the
+    file is missing or unreadable. The spawn rule in
+    run_supervisor compares this against the spawn moment."""
     path = Path(data_dir) / HEARTBEAT_NAME
     if not path.exists():
         return None
     try:
         row = json.loads(path.read_text(encoding="utf-8"))
-        return (time.time() if now is None else now) - float(row["ts"])
+        return float(row["ts"])
     except Exception:
         return None
 
@@ -102,16 +116,42 @@ def run_supervisor(data_dir, command: list, *,
     policy = policy or RestartPolicy()
     while True:
         _log(data_dir, f"starting: {' '.join(map(str, command))}")
+        # The spawn moment is the line between runs: only a
+        # heartbeat written after it belongs to this child. A
+        # file left by a dead run is ignored, however old — it
+        # must never kill a newborn on the first poll.
+        spawn_ts = clock()
         child = spawn(command)
         hung = False
+        fresh_seen = False
         while True:
             code = child.poll()
             if code is not None:
                 break
-            age = heartbeat_age(data_dir, now=clock())
-            if age is not None and age > heartbeat_timeout_s:
-                _log(data_dir, f"heartbeat stale ({age:.0f}s) — "
-                               f"terminating hung app")
+            hb_ts = heartbeat_ts(data_dir)
+            now = clock()
+            if hb_ts is not None and hb_ts >= spawn_ts:
+                fresh_seen = True
+                if now - hb_ts > heartbeat_timeout_s:
+                    _log(data_dir, f"heartbeat stale "
+                                   f"({now - hb_ts:.0f}s) — "
+                                   f"terminating hung app")
+                    hung = True
+                    try:
+                        child.terminate()
+                    except Exception:
+                        pass
+                    try:
+                        code = child.wait(timeout=5)
+                    except Exception:
+                        code = -1
+                    break
+            elif not fresh_seen and \
+                    now - spawn_ts > heartbeat_timeout_s + 60.0:
+                # No heartbeat ever arrived: the child hung
+                # before its heartbeat thread started.
+                _log(data_dir, "no heartbeat since spawn — "
+                               "terminating hung app")
                 hung = True
                 try:
                     child.terminate()

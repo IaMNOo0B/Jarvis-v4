@@ -1279,6 +1279,19 @@ def _maybe_skill_review(app) -> None:
                      name="jarvis-skill-review").start()
 
 
+def _maybe_self_check(app) -> None:
+    """Self-grounding loop, one tick: JARVIS asks itself who it
+    is, where it is, where it came from, and what it must do —
+    and records only when an answer changed. A program
+    self-check, never a sentience claim: every answer is a fact
+    (see jarvis/selfcheck.py). Failures never break the tick."""
+    try:
+        from .selfcheck import maybe_self_check
+        maybe_self_check(app)
+    except Exception:
+        pass
+
+
 def _maybe_proactive(app) -> None:
     """Once a day, outside quiet hours, when something is
     actually waiting: run the proactivity chain's
@@ -1975,6 +1988,7 @@ def start_scheduler(app) -> None:
                 _maybe_proactive(app)
                 _maybe_followups(app)
                 _maybe_skill_review(app)
+                _maybe_self_check(app)
             except Exception as exc:
                 from .swallow import note as _swallow
                 _swallow(app.data_dir, "scheduler.loop", exc)

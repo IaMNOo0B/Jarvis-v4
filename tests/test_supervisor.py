@@ -1,6 +1,10 @@
 """Process supervisor: clean exits are final, crashes restart on
-a bounded budget, a stale heartbeat marks a hung app."""
+a bounded budget, a stale heartbeat marks a hung app — but only
+a heartbeat written after this child spawned. A stale file left
+by a dead run must never kill a newborn (2026-10-24: that trap
+killed every restart on the owner's PC from 2026-10-22 on)."""
 
+import json
 import time
 
 from jarvis.supervisor import (RestartPolicy, heartbeat_age,
@@ -71,19 +75,65 @@ def test_crashes_restart_until_the_budget_ends(tmp_path):
 
 
 def test_hung_app_is_terminated_and_restarted(tmp_path):
-    write_heartbeat(tmp_path)                    # already stale soon
+    # The child writes its OWN fresh heartbeat at spawn; time
+    # then passes past the timeout, so it is a real hang.
+    now = [5000.0]
+
+    def clock():
+        value = now[0]
+        now[0] += 100.0
+        return value
+
     stale = _Child([None])                       # never exits
     good = _Child([0])
-    now = [time.time() + 1000]                   # heartbeat is ancient
     spawned = []
 
     def spawn(command):
+        (tmp_path / "heartbeat.json").write_text(
+            json.dumps({"pid": 9, "ts": now[0]}), encoding="utf-8")
         child = [stale, good][len(spawned)]
         spawned.append(child)
         return child
 
     code = run_supervisor(tmp_path, ["app"], spawn=spawn,
-                          sleep=lambda s: None,
-                          clock=lambda: now[0], poll_s=0)
+                          sleep=lambda s: None, clock=clock, poll_s=0)
     assert stale.terminated is True
+    assert code == 0 and len(spawned) == 2
+
+
+def test_stale_heartbeat_from_a_dead_run_does_not_kill(tmp_path):
+    # The trap from 2026-10-22: a heartbeat file left by a dead
+    # run sat at one old timestamp while every new supervisor
+    # read it, saw a huge age, and killed the newborn at once.
+    (tmp_path / "heartbeat.json").write_text(
+        json.dumps({"pid": 1, "ts": 1000.0}), encoding="utf-8")
+    code, spawned = _run([_Child([0])], tmp_path)
+    assert code == 0 and len(spawned) == 1
+    assert spawned[0].terminated is False
+    log = (tmp_path / "supervisor.log").read_text(encoding="utf-8")
+    assert "terminating hung app" not in log
+
+
+def test_child_that_never_writes_a_heartbeat_is_killed(tmp_path):
+    # No heartbeat at all: not an instant kill, but not forever
+    # either — past the timeout plus grace it is hung at boot.
+    now = [5000.0]
+
+    def clock():
+        value = now[0]
+        now[0] += 100.0
+        return value
+
+    stuck = _Child([None])
+    good = _Child([0])
+    spawned = []
+
+    def spawn(command):
+        child = [stuck, good][len(spawned)]
+        spawned.append(child)
+        return child
+
+    code = run_supervisor(tmp_path, ["app"], spawn=spawn,
+                          sleep=lambda s: None, clock=clock, poll_s=0)
+    assert stuck.terminated is True
     assert code == 0 and len(spawned) == 2
